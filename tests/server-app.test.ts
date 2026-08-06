@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { describe, it } from "node:test";
+import { createAudioFrame } from "../src/core/audio.js";
 import type { GlossarySpec } from "../src/core/glossary.js";
 import type {
   EventCursor,
@@ -74,6 +75,7 @@ function snapshot(sessionId: string, spec: SessionSpec): SessionSnapshot {
   };
 }
 
+
 class FakeRelay implements GuardedDuplexRelay {
   readonly opened: SessionSpec[] = [];
   readonly commanded: Array<{ sessionId: string; command: RelayCommand }> = [];
@@ -103,7 +105,37 @@ class FakeRelay implements GuardedDuplexRelay {
   }
 }
 
+interface TrackingEventStream {
+  returned: boolean;
+  resolve?: (result: IteratorResult<SessionEvent>) => void;
+}
+
+class TrackingRelay extends FakeRelay {
+  readonly streams: TrackingEventStream[] = [];
+
+  override events(
+    _sessionId: string,
+    _after: EventCursor = 0,
+    _signal?: AbortSignal,
+  ): AsyncIterable<SessionEvent> {
+    const stream: TrackingEventStream = { returned: false };
+    this.streams.push(stream);
+    const iterator: AsyncIterator<SessionEvent> = {
+      next: () => new Promise<IteratorResult<SessionEvent>>((resolve) => {
+        stream.resolve = resolve;
+      }),
+      return: async () => {
+        stream.returned = true;
+        stream.resolve?.({ done: true, value: undefined });
+        return { done: true, value: undefined };
+      },
+    };
+    return { [Symbol.asyncIterator]: () => iterator };
+  }
+}
+
 async function openFakeSession(relay: FakeRelay): Promise<void> {
+
   await relay.open({
     sideA: { language: "en-US" },
     sideB: { language: "zh-TW" },
@@ -114,7 +146,7 @@ async function openFakeSession(relay: FakeRelay): Promise<void> {
 class FakeGlossaryRegistry implements GlossaryRegistry {
   readonly imports: ImportGlossaryRequest[] = [];
 
-  async importCsv(request: ImportGlossaryRequest): Promise<GlossaryImportResult> {
+  async importFile(request: ImportGlossaryRequest): Promise<GlossaryImportResult> {
     this.imports.push(request);
     return { version: glossary.version, hash: "hash-v1", spec: glossary };
   }
@@ -238,16 +270,18 @@ describe("server application", () => {
     }
   });
 
-  it("imports CSV glossaries and returns a version reference", async () => {
+  it("imports glossary files and returns a version reference", async () => {
     const { app, glossaries } = await fixture();
     try {
+      const csv = "id,source,target_exact\n1,spindle,main shaft";
       const response = await app.inject({
         method: "POST",
         url: "/api/glossaries",
         headers: OPERATOR_HEADERS,
         payload: {
           name: "Factory terms",
-          csv: "id,source,target_exact\n1,spindle,main shaft",
+          fileName: "factory-terms.csv",
+          contentsBase64: Buffer.from(csv).toString("base64"),
           sourceLanguage: "en-US",
           targetLanguage: "zh-TW",
           approvedBy: "Glossary owner",
@@ -260,6 +294,8 @@ describe("server application", () => {
         id: "factory",
       });
       assert.equal(glossaries.imports[0]?.name, "Factory terms");
+      assert.equal(glossaries.imports[0]?.fileName, "factory-terms.csv");
+      assert.equal(glossaries.imports[0]?.contentsBase64, Buffer.from(csv).toString("base64"));
     } finally {
       await app.close();
     }
@@ -322,6 +358,29 @@ describe("server application", () => {
       });
       assert.equal(recovered.statusCode, 200);
       assert.deepEqual(recovered.json(), response.json());
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("allows the keyless local evaluation profile to pin a glossary", async () => {
+    const { app, relay } = await fixture();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        headers: OPERATOR_HEADERS,
+        payload: {
+          languages: { A: "en-US", B: "zh-TW" },
+          translationProfileId: "local_eval",
+          glossaryVersion: "factory-v1",
+          recordingConsent: true,
+        },
+      });
+
+      assert.equal(response.statusCode, 201);
+      assert.equal(relay.opened[0]?.profile, "local_eval");
+      assert.equal(relay.opened[0]?.glossary, glossary);
     } finally {
       await app.close();
     }
@@ -407,8 +466,10 @@ describe("server application", () => {
       assert.deepEqual(capabilities.json().translationProfiles, [
         "native_live_baseline",
         "glossary_controlled",
+        "local_eval",
         "deterministic_test",
       ]);
+      assert.deepEqual(capabilities.json().glossaryImportFormats, ["csv", "xlsx"]);
       assert.deepEqual(capabilities.json().audio, {
         encoding: "pcm_s16le",
         sampleRateHz: 24000,
@@ -418,6 +479,44 @@ describe("server application", () => {
     } finally {
       await app.close();
     }
+  });
+
+  it("exposes fake telephony capability without a browser media route", async () => {
+    const app = await createServerApp({
+      relay: new FakeRelay(),
+      glossaries: new FakeGlossaryRegistry(),
+      mediaProfile: "fake_telephony",
+      access: testAccess(),
+    });
+    await app.ready();
+    try {
+      const capabilities = await app.inject({
+        method: "GET",
+        url: "/api/capabilities",
+        headers: OPERATOR_HEADERS,
+      });
+      assert.deepEqual(capabilities.json().mediaProfiles, ["fake_telephony"]);
+      assert.equal(
+        app.hasRoute({
+          method: "GET",
+          url: "/ws/media/:sessionId/:side",
+        }),
+        false,
+      );
+    } finally {
+      await app.close();
+    }
+
+    await assert.rejects(
+      createServerApp({
+        relay: new FakeRelay(),
+        glossaries: new FakeGlossaryRegistry(),
+        mediaProfile: "fake_telephony",
+        browserMedia: new FakeBrowserMedia(),
+        access: testAccess(),
+      }),
+      /must not expose the browser media gateway/u,
+    );
   });
 
   it("reports degraded status when evidence recording is degraded", async () => {
@@ -529,6 +628,214 @@ describe("server application", () => {
     assert.equal(lowConfidence.type, "terminology_alert");
   });
 
+  it("scopes participant event streams to their lane and side", async () => {
+    const { app, relay, access } = await fixture();
+    await openFakeSession(relay);
+    relay.eventsForSession = [
+      {
+        cursor: 1,
+        sessionId: "session-1",
+        timestampMonoMs: 101,
+        lane: null,
+        generation: null,
+        type: "session_state",
+        previousStatus: "waiting",
+        status: "ready",
+      },
+      {
+        cursor: 2,
+        sessionId: "session-1",
+        timestampMonoMs: 102,
+        lane: null,
+        generation: null,
+        type: "participant_state",
+        side: "A",
+        connected: true,
+      },
+      {
+        cursor: 3,
+        sessionId: "session-1",
+        timestampMonoMs: 103,
+        lane: null,
+        generation: null,
+        type: "participant_state",
+        side: "B",
+        connected: true,
+      },
+      {
+        cursor: 4,
+        sessionId: "session-1",
+        timestampMonoMs: 104,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "source_transcript",
+        text: "from A",
+        final: true,
+      },
+      {
+        cursor: 5,
+        sessionId: "session-1",
+        timestampMonoMs: 105,
+        lane: "B_TO_A",
+        generation: 1,
+        type: "source_transcript",
+        text: "from B",
+        final: true,
+      },
+      {
+        cursor: 6,
+        sessionId: "session-1",
+        timestampMonoMs: 106,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "target_transcript",
+        text: "to B",
+        final: true,
+      },
+      {
+        cursor: 7,
+        sessionId: "session-1",
+        timestampMonoMs: 107,
+        lane: "B_TO_A",
+        generation: 1,
+        type: "target_transcript",
+        text: "to A",
+        final: true,
+      },
+      {
+        cursor: 8,
+        sessionId: "session-1",
+        timestampMonoMs: 108,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "generation_cut",
+        previousGeneration: 0,
+        reason: "barge_in",
+      },
+      {
+        cursor: 9,
+        sessionId: "session-1",
+        timestampMonoMs: 109,
+        lane: "B_TO_A",
+        generation: 1,
+        type: "generation_cut",
+        previousGeneration: 0,
+        reason: "barge_in",
+      },
+      {
+        cursor: 10,
+        sessionId: "session-1",
+        timestampMonoMs: 110,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "glossary_bound",
+        glossaryHash: "hash-a",
+        entryIds: ["a"],
+      },
+      {
+        cursor: 11,
+        sessionId: "session-1",
+        timestampMonoMs: 111,
+        lane: "B_TO_A",
+        generation: 1,
+        type: "glossary_bound",
+        glossaryHash: "hash-b",
+        entryIds: ["b"],
+      },
+      {
+        cursor: 12,
+        sessionId: "session-1",
+        timestampMonoMs: 112,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "glossary_authorized",
+        glossaryHash: "hash-a",
+        text: "to B",
+        guaranteedTargetExact: ["to B"],
+      },
+      {
+        cursor: 13,
+        sessionId: "session-1",
+        timestampMonoMs: 113,
+        lane: "B_TO_A",
+        generation: 1,
+        type: "glossary_authorized",
+        glossaryHash: "hash-b",
+        text: "to A",
+        guaranteedTargetExact: ["to A"],
+      },
+      {
+        cursor: 14,
+        sessionId: "session-1",
+        timestampMonoMs: 114,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "alert",
+        alert: { code: "lane-a", message: "lane A", retryable: false },
+      },
+      {
+        cursor: 15,
+        sessionId: "session-1",
+        timestampMonoMs: 115,
+        lane: "B_TO_A",
+        generation: 1,
+        type: "alert",
+        alert: { code: "lane-b", message: "lane B", retryable: false },
+      },
+      {
+        cursor: 16,
+        sessionId: "session-1",
+        timestampMonoMs: 116,
+        lane: null,
+        generation: null,
+        type: "alert",
+        alert: { code: "operator-only", message: "operator", retryable: true },
+      },
+      {
+        cursor: 17,
+        sessionId: "session-1",
+        timestampMonoMs: 117,
+        lane: "A_TO_B",
+        generation: 1,
+        type: "audio_playout",
+        frame: createAudioFrame({
+          sessionId: "session-1",
+          lane: "A_TO_B",
+          generation: 1,
+          sequence: 0,
+          capturedAtMs: 117,
+          pcm16le: new Uint8Array(960),
+        }),
+        latencyMs: 42,
+      },
+    ];
+    try {
+      const tokenA = access.issueParticipantAccess("session-1", "A");
+      const tokenB = access.issueParticipantAccess("session-1", "B");
+      const a = await openAndCollect(
+        app,
+        "/ws/events/session-1?access=" + encodeURIComponent(tokenA),
+        8,
+      );
+      const b = await openAndCollect(
+        app,
+        "/ws/events/session-1?access=" + encodeURIComponent(tokenB),
+        8,
+      );
+      const cursors = (messages: readonly string[]) =>
+        messages.map((message) => (JSON.parse(message) as { cursor: number }).cursor);
+      assert.deepEqual(cursors(a.messages), [1, 2, 4, 7, 9, 10, 13, 15]);
+      assert.deepEqual(cursors(b.messages), [1, 3, 5, 6, 8, 11, 12, 14]);
+      for (const message of [...a.messages, ...b.messages]) {
+        assert.notEqual((JSON.parse(message) as { type: string }).type, "latency");
+      }
+      a.socket.terminate();
+      b.socket.terminate();
+    } finally {
+      await app.close();
+    }
+  });
+
   it("streams mapped events and delegates exact-side media sockets", async () => {
     const { app, relay, media, access } = await fixture();
     await openFakeSession(relay);
@@ -615,6 +922,35 @@ describe("server application", () => {
         data: { active: false, recording: false },
       });
       assert.equal(parsed.some((event) => event.type === "recording_state" && event.data.active), false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("cancels event iterators on participant close and reconnect", async () => {
+    const relay = new TrackingRelay();
+    const glossaries = new FakeGlossaryRegistry();
+    const media = new FakeBrowserMedia();
+    const access = testAccess();
+    const app = await createServerApp({ relay, glossaries, mediaProfile: "browser_pair", browserMedia: media, access });
+    await app.ready();
+    await openFakeSession(relay);
+    try {
+      const path = "/ws/events/session-1?access=" +
+        encodeURIComponent(access.issueParticipantAccess("session-1", "A"));
+      const first = await app.injectWS(path);
+      const firstClosed = once(first, "close");
+      first.terminate();
+      await firstClosed;
+      assert.equal(relay.streams.length, 1);
+      assert.equal(relay.streams[0]?.returned, true);
+
+      const second = await app.injectWS(path);
+      const secondClosed = once(second, "close");
+      second.terminate();
+      await secondClosed;
+      assert.equal(relay.streams.length, 2);
+      assert.equal(relay.streams.every((stream) => stream.returned), true);
     } finally {
       await app.close();
     }

@@ -267,6 +267,15 @@ describe("executable benchmark manifest", () => {
       () => validateExecutableBenchmarkManifest(badGates),
       /Gate semantics mismatch/u,
     );
+    const badSuiteIdentity = withManifestHash({
+      ...originalBody,
+      suiteId: "rehashed-but-not-canonical",
+      seed: "rehashed-but-not-canonical",
+    });
+    assert.throws(
+      () => validateExecutableBenchmarkManifest(badSuiteIdentity),
+      /canonical manifest semantics mismatch/u,
+    );
 
     const firstArm = original.arms[0];
     assert.ok(firstArm);

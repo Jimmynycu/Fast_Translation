@@ -96,6 +96,7 @@ class TextFake implements ControlledTextTranslationPort {
 }
 
 class TtsFake implements ControlledTtsPort {
+  readonly outputFormat = CANONICAL_AUDIO;
   spoken: string[] = [];
   async *synthesize(input: { readonly text: string; readonly signal?: AbortSignal }) {
     this.spoken.push(input.text);
@@ -117,6 +118,21 @@ function transcript(text: string, confidence?: number): ControlledTranscriptionE
     ...(confidence === undefined ? {} : { confidence }),
   };
 }
+
+test("rejects a TTS adapter whose bytes are not canonical 24 kHz mono PCM16LE", () => {
+  const tts = new TtsFake();
+  Object.defineProperty(tts, "outputFormat", {
+    value: { ...CANONICAL_AUDIO, sampleRateHz: 16_000 },
+  });
+  assert.throws(
+    () => new ControlledTranslationAdapter({
+      transcriber: new TranscriptFake(transcript("spindle")),
+      translator: new TextFake((text) => text),
+      tts,
+    }),
+    /24 kHz mono PCM16LE/u,
+  );
+});
 
 test("restores target_exact before streaming canonical audio", async () => {
   const transcriber = new TranscriptFake(transcript("Inspect the spindle today.", 0.99));
@@ -235,6 +251,42 @@ test("translation failure falls back to speaking source text", async () => {
   assert.ok(events.some((event) => event.type === "audio"));
 });
 
+test("cancellation during text translation emits no fallback alert, target, or audio", async () => {
+  const controller = new AbortController();
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const translator: ControlledTextTranslationPort = {
+    async translate(input) {
+      markStarted?.();
+      return new Promise<string>((_resolve, reject) => {
+        input.signal?.addEventListener(
+          "abort",
+          () => reject(input.signal?.reason ?? new Error("aborted")),
+          { once: true },
+        );
+      });
+    },
+  };
+  const tts = new TtsFake();
+  const adapter = new ControlledTranslationAdapter({
+    transcriber: new TranscriptFake(transcript("Inspect the spindle.")),
+    translator,
+    tts,
+    now: () => 10,
+  });
+  const collecting = collect(adapter.translate({
+    ...request(),
+    signal: controller.signal,
+  }));
+  await started;
+  controller.abort(new Error("barge-in"));
+  const events = await collecting;
+
+  assert.deepEqual(tts.spoken, []);
+  assert.equal(events.some((event) => event.type === "error"), false);
+  assert.equal(events.some((event) => event.type === "target_transcript_delta"), false);
+  assert.equal(events.some((event) => event.type === "audio"), false);
+});
 test("deterministic adapter echoes frames and honors cancel", async () => {
   const adapter = new DeterministicTranslationAdapter({ now: () => 12 });
   const events = await collect(adapter.translate(request()));

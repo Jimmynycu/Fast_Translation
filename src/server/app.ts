@@ -14,6 +14,7 @@ import {
   TRANSLATION_PROFILES,
   type GuardedDuplexRelay,
   type Lane,
+  type MediaProfile,
   type RelayCommand,
   type SessionEvent,
   type SessionSnapshot,
@@ -36,7 +37,7 @@ export interface GlossaryImportResult {
 }
 
 export interface GlossaryRegistry {
-  importCsv(request: ImportGlossaryRequest): Promise<GlossaryImportResult>;
+  importFile(request: ImportGlossaryRequest): Promise<GlossaryImportResult>;
   get(version: string): Promise<GlossarySpec | undefined>;
 }
 
@@ -59,7 +60,8 @@ export type EvidenceHealth = "healthy" | "degraded";
 export interface ServerAppOptions {
   readonly relay: GuardedDuplexRelay;
   readonly glossaries: GlossaryRegistry;
-  readonly browserMedia: BrowserMediaGateway;
+  readonly mediaProfile?: MediaProfile;
+  readonly browserMedia?: BrowserMediaGateway;
   readonly access: ServerAccessControl;
   readonly webRoot?: string;
   readonly logger?: FastifyServerOptions["logger"];
@@ -132,6 +134,28 @@ function laneSides(event: SessionEvent): Readonly<{
     sourceSide: sourceForLane(event.lane),
     targetSide: destinationForLane(event.lane),
   };
+}
+
+function isParticipantEventVisible(event: SessionEvent, side: Side): boolean {
+  switch (event.type) {
+    case "session_opened":
+    case "session_state":
+    case "session_closed":
+      return true;
+    case "participant_state":
+      return event.side === side;
+    case "source_transcript":
+    case "glossary_bound":
+      return event.lane !== null && sourceForLane(event.lane) === side;
+    case "target_transcript":
+    case "generation_cut":
+    case "glossary_authorized":
+      return event.lane !== null && destinationForLane(event.lane) === side;
+    case "alert":
+      return event.lane !== null && destinationForLane(event.lane) === side;
+    case "audio_playout":
+      return false;
+  }
 }
 
 function isTerminologyAlert(event: Extract<SessionEvent, { type: "alert" }>): boolean {
@@ -293,6 +317,15 @@ function safeSocketError(socket: BrowserMediaSocket, code: string, message: stri
 }
 
 export async function createServerApp(options: ServerAppOptions): Promise<FastifyInstance> {
+  const mediaProfile = options.mediaProfile ?? "browser_pair";
+  if (mediaProfile === "browser_pair" && options.browserMedia === undefined) {
+    throw new TypeError("browser_pair media requires a browser media gateway");
+  }
+  if (mediaProfile === "fake_telephony" && options.browserMedia !== undefined) {
+    throw new TypeError(
+      "fake_telephony media must not expose the browser media gateway",
+    );
+  }
   const fastifyOptions = {
     bodyLimit: MAX_HTTP_BODY_BYTES,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
@@ -362,10 +395,10 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
   app.get("/api/capabilities", async (request) => {
     requireOperator(options.access, request.headers.authorization);
     return {
-      mediaProfiles: ["browser_pair"],
+      mediaProfiles: [mediaProfile],
       translationProfiles,
       defaultTranslationProfile,
-      glossaryImportFormats: ["csv"],
+      glossaryImportFormats: ["csv", "xlsx"],
       recording: true,
       audio: {
         encoding: "pcm_s16le",
@@ -381,7 +414,7 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
     const body = parse(importGlossaryRequestSchema, request.body);
     let imported: GlossaryImportResult;
     try {
-      imported = await options.glossaries.importCsv(body);
+      imported = await options.glossaries.importFile(body);
     } catch (error: unknown) {
       throw new ApiError(
         422,
@@ -408,12 +441,13 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
     }
     if (
       body.glossaryVersion !== undefined &&
-      body.translationProfileId !== "glossary_controlled"
+      body.translationProfileId !== "glossary_controlled" &&
+      body.translationProfileId !== "local_eval"
     ) {
       throw new ApiError(
         422,
         "glossary_profile_mismatch",
-        "A glossary version can only be used with the glossary_controlled profile",
+        "A glossary version requires a glossary-controlled translation profile",
       );
     }
     const glossary =
@@ -462,10 +496,11 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
       const browserSocket = socket as unknown as BrowserMediaSocket;
       const afterText = request.query.after;
       const after = afterText === undefined ? 0 : Number(afterText);
-      if (!options.access.acceptsEventAccess(
+      const eventAccess = options.access.resolveEventAccess(
         queryAccess(request.query.access),
         request.params.sessionId,
-      )) {
+      );
+      if (eventAccess === undefined) {
         safeSocketError(browserSocket, "unauthorized", "A valid access token is required");
         socket.close(1008, "Unauthorized");
         return;
@@ -477,69 +512,100 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
         return;
       }
 
+      const eventController = new AbortController();
+      let eventIterator: AsyncIterator<SessionEvent> | undefined;
+      let socketClosed = false;
+      const onSocketClose = (): void => {
+        socketClosed = true;
+        eventController.abort();
+        void Promise.resolve(eventIterator?.return?.()).catch(() => undefined);
+      };
+      socket.once("close", onSocketClose);
+
       void (async () => {
         try {
-          for await (const event of options.relay.events(request.params.sessionId, after)) {
-            if (socket.readyState !== socket.OPEN) break;
+          eventIterator = options.relay
+            .events(request.params.sessionId, after, eventController.signal)
+            [Symbol.asyncIterator]();
+          while (!socketClosed) {
+            const next = await eventIterator.next();
+            if (next.done || socketClosed) break;
+            const event = next.value;
+            if (
+              eventAccess.kind === "participant" &&
+              !isParticipantEventVisible(event, eventAccess.side)
+            ) {
+              continue;
+            }
+            if (socketClosed || socket.readyState !== socket.OPEN) break;
             socket.send(JSON.stringify(mapSessionEvent(event)));
             const recordingState = mapRecordingStateEvent(event);
             if (recordingState !== undefined) {
               socket.send(JSON.stringify(recordingState));
             }
           }
-          if (socket.readyState === socket.OPEN) socket.terminate();
+          if (!socketClosed && socket.readyState === socket.OPEN) socket.terminate();
         } catch (error: unknown) {
+          if (socketClosed || eventController.signal.aborted) return;
           safeSocketError(
             browserSocket,
             error instanceof RelaySessionError ? error.code : "event_stream_failed",
             error instanceof Error ? error.message : "The event stream failed",
           );
           if (socket.readyState === socket.OPEN) socket.close(1011, "Event stream failed");
+        } finally {
+          socketClosed = true;
+          eventController.abort();
+          await Promise.resolve(eventIterator?.return?.()).catch(() => undefined);
+          browserSocket.off?.("close", onSocketClose);
         }
       })();
     },
   );
 
-  app.get<{ Params: { sessionId: string; side: string }; Querystring: { access?: unknown } }>(
-    "/ws/media/:sessionId/:side",
-    { websocket: true },
-    (socket, request) => {
-      const parsedSide = sideSchema.safeParse(request.params.side);
-      if (!parsedSide.success) {
-        socket.close(1008, "Side must be A or B");
-        return;
-      }
-      const browserSocket = socket as unknown as BrowserMediaSocket;
-      const side = parsedSide.data;
-      if (!options.access.acceptsMediaAccess(
-        queryAccess(request.query.access),
-        request.params.sessionId,
-        side,
-      )) {
-        safeSocketError(browserSocket, "unauthorized", "A valid participant access token is required");
-        socket.close(1008, "Unauthorized");
-        return;
-      }
-      try {
-        const session = options.relay.snapshot(request.params.sessionId);
-        if (session.status === "closing" || session.status === "closed") {
-          throw new Error("Participant media cannot attach to a terminal session");
+  if (options.browserMedia !== undefined) {
+    const browserMedia = options.browserMedia;
+    app.get<{ Params: { sessionId: string; side: string }; Querystring: { access?: unknown } }>(
+      "/ws/media/:sessionId/:side",
+      { websocket: true },
+      (socket, request) => {
+        const parsedSide = sideSchema.safeParse(request.params.side);
+        if (!parsedSide.success) {
+          socket.close(1008, "Side must be A or B");
+          return;
         }
-        options.browserMedia.attach(request.params.sessionId, side, browserSocket);
-      } catch (error: unknown) {
-        safeSocketError(
-          browserSocket,
-          "media_attach_rejected",
-          error instanceof Error ? error.message : "Participant media attachment was rejected",
-        );
-        socket.close(1008, "Media attachment rejected");
-        return;
-      }
-      socket.once("close", () => {
-        options.browserMedia.detach(request.params.sessionId, side, browserSocket);
-      });
-    },
-  );
+        const browserSocket = socket as unknown as BrowserMediaSocket;
+        const side = parsedSide.data;
+        if (!options.access.acceptsMediaAccess(
+          queryAccess(request.query.access),
+          request.params.sessionId,
+          side,
+        )) {
+          safeSocketError(browserSocket, "unauthorized", "A valid participant access token is required");
+          socket.close(1008, "Unauthorized");
+          return;
+        }
+        try {
+          const session = options.relay.snapshot(request.params.sessionId);
+          if (session.status === "closing" || session.status === "closed") {
+            throw new Error("Participant media cannot attach to a terminal session");
+          }
+          browserMedia.attach(request.params.sessionId, side, browserSocket);
+        } catch (error: unknown) {
+          safeSocketError(
+            browserSocket,
+            "media_attach_rejected",
+            error instanceof Error ? error.message : "Participant media attachment was rejected",
+          );
+          socket.close(1008, "Media attachment rejected");
+          return;
+        }
+        socket.once("close", () => {
+          browserMedia.detach(request.params.sessionId, side, browserSocket);
+        });
+      },
+    );
+  }
 
   return app;
 }

@@ -10,9 +10,17 @@ const PARTICIPANT_TOKEN_CONTEXT = "fast-translation/participant-access/v1";
 const MINIMUM_SECRET_BYTES = 32;
 const MAXIMUM_PRESENTED_TOKEN_LENGTH = 512;
 
+export type EventAccessScope =
+  | Readonly<{ kind: "operator" }>
+  | Readonly<{ kind: "participant"; side: Side }>;
+
 export interface ServerAccessControl {
   acceptsOperatorAuthorization(authorization: string | undefined): boolean;
   issueParticipantAccess(sessionId: string, side: Side): string;
+  resolveEventAccess(
+    access: string | undefined,
+    sessionId: string,
+  ): EventAccessScope | undefined;
   acceptsEventAccess(access: string | undefined, sessionId: string): boolean;
   acceptsMediaAccess(
     access: string | undefined,
@@ -57,15 +65,27 @@ export function createServerAccessControl(
   const acceptsOperatorToken = (presented: string | undefined): boolean =>
     secureTokenEquals(presented, options.operatorToken);
 
+  const resolveEventAccess = (
+    access: string | undefined,
+    sessionId: string,
+  ): EventAccessScope | undefined => {
+    if (acceptsOperatorToken(access)) return { kind: "operator" };
+    for (const side of ["A", "B"] as const) {
+      if (secureTokenEquals(access, participantToken(sessionId, side))) {
+        return { kind: "participant", side };
+      }
+    }
+    return undefined;
+  };
+
   return Object.freeze({
     acceptsOperatorAuthorization(authorization: string | undefined) {
       return acceptsOperatorToken(bearerToken(authorization));
     },
     issueParticipantAccess: participantToken,
+    resolveEventAccess,
     acceptsEventAccess(access: string | undefined, sessionId: string) {
-      return acceptsOperatorToken(access) ||
-        secureTokenEquals(access, participantToken(sessionId, "A")) ||
-        secureTokenEquals(access, participantToken(sessionId, "B"));
+      return resolveEventAccess(access, sessionId) !== undefined;
     },
     acceptsMediaAccess(access: string | undefined, sessionId: string, side: Side) {
       return secureTokenEquals(access, participantToken(sessionId, side));

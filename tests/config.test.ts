@@ -22,6 +22,24 @@ describe("loadConfig", () => {
     assert.match(config.operatorToken, /^[A-Za-z0-9_-]{43}$/u);
   });
 
+  it("loads the controlled local evaluation profile without provider credentials", () => {
+    const config = loadConfig({
+      TRANSLATION_PROFILE: "local_eval",
+      LOCAL_EVAL_TRANSCRIPT_A_TO_B: "Verify the mistake proofing fixture.",
+      LOCAL_EVAL_TRANSCRIPT_B_TO_A: "請確認防呆治具。",
+      LOCAL_EVAL_CONFIDENCE: "0.91",
+      LOCAL_EVAL_TRANSLATION_MODE: "preserve",
+      EVIDENCE_PROFILE: "in_memory",
+    });
+
+    assert.equal(config.translationProfile, "local_eval");
+    assert.equal(config.openaiApiKey, undefined);
+    assert.equal(config.localEvalTranscriptAToB, "Verify the mistake proofing fixture.");
+    assert.equal(config.localEvalTranscriptBToA, "請確認防呆治具。");
+    assert.equal(config.localEvalConfidence, 0.91);
+    assert.equal(config.localEvalTranslationMode, "preserve");
+  });
+
   it("accepts a strong configured operator token and rejects weak values", () => {
     const operatorToken = "operator-" + "x".repeat(32);
     const config = loadConfig({

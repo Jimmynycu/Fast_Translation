@@ -568,4 +568,9 @@ export function validateExecutableBenchmarkManifest(
   )) {
     throw new Error("Every latency pairing key must include all three distinct arms");
   }
+  const { manifestSha256: _canonicalManifestHash, ...canonicalBody } =
+    EXECUTABLE_BENCHMARK_MANIFEST;
+  if (sha256(body) !== sha256(canonicalBody)) {
+    throw new Error("canonical manifest semantics mismatch");
+  }
 }

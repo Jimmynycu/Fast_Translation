@@ -112,8 +112,42 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   throw new Error("condition was not reached");
 }
 
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function sentEvents(socket: FakeWebSocket): Array<Record<string, unknown>> {
   return socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>);
+}
+function pendingAsyncIterable<T>(): {
+  readonly iterable: AsyncIterable<T>;
+  readonly nextStarted: () => boolean;
+  readonly returnCount: () => number;
+  readonly releaseNext: (result: IteratorResult<T>) => void;
+} {
+  let nextStarted = false;
+  let returnCount = 0;
+  let resolveNext: ((result: IteratorResult<T>) => void) | undefined;
+  const iterable: AsyncIterable<T> = {
+    [Symbol.asyncIterator]: () => ({
+      next: (): Promise<IteratorResult<T>> => {
+        nextStarted = true;
+        return new Promise<IteratorResult<T>>((resolve) => {
+          resolveNext = resolve;
+        });
+      },
+      return: async (): Promise<IteratorResult<T>> => {
+        returnCount += 1;
+        return { done: true, value: undefined as never };
+      },
+    }),
+  };
+  return {
+    iterable,
+    nextStarted: () => nextStarted,
+    returnCount: () => returnCount,
+    releaseNext: (result) => resolveNext?.(result),
+  };
 }
 
 test("native realtime adapter uses the translation contract and canonicalizes output", async () => {
@@ -862,4 +896,593 @@ test("TTS requests raw PCM and yields the response body as streaming chunks", as
   });
   assert.equal(tts.sampleRateHz, 24_000);
   assert.equal(tts.format, "pcm16");
+});
+
+test("realtime adapters close sockets that never open and report retryable connect timeouts", async () => {
+  const nativeSocket = new FakeWebSocket();
+  const native = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    connectTimeoutMs: 10,
+    webSocketFactory: () => nativeSocket,
+  });
+  const nativeOutput = await collect(
+    native.translate({
+      frames: oneFrame(10),
+      context: {
+        sessionId: "session-1",
+        lane: "A_TO_B",
+        generation: 10,
+        sourceLanguage: "en",
+        targetLanguage: "zh-TW",
+        profile: "native_live_baseline",
+      },
+      signal: new AbortController().signal,
+    }),
+  );
+  assert.equal(nativeOutput.length, 1);
+  assert.equal(nativeOutput[0]?.type, "error");
+  if (nativeOutput[0]?.type === "error") {
+    assert.equal(nativeOutput[0].error.code, "OPENAI_REALTIME_CONNECT_TIMEOUT");
+    assert.equal(nativeOutput[0].error.retryable, true);
+    assert.doesNotMatch(nativeOutput[0].error.message, /test-key/u);
+  }
+  assert.equal(nativeSocket.closes.length, 1);
+
+  const transcriptionSocket = new FakeWebSocket();
+  const transcriber = new OpenAILiveTranscribeAdapter({
+    apiKey: "test-key",
+    connectTimeoutMs: 10,
+    webSocketFactory: () => transcriptionSocket,
+  });
+  const transcriptionOutput = await collect(
+    transcriber.transcribe({
+      events: (async function* () {})(),
+      context: {
+        sessionId: "session-1",
+        lane: "A_TO_B",
+        generation: 11,
+      },
+      signal: new AbortController().signal,
+    }),
+  );
+  assert.equal(transcriptionOutput.length, 1);
+  assert.equal(transcriptionOutput[0]?.type, "error");
+  if (transcriptionOutput[0]?.type === "error") {
+    assert.equal(
+      transcriptionOutput[0].error.code,
+      "OPENAI_TRANSCRIBE_CONNECT_TIMEOUT",
+    );
+    assert.equal(transcriptionOutput[0].error.retryable, true);
+  }
+  assert.equal(transcriptionSocket.closes.length, 1);
+});
+
+test("live transcription bounds commit acknowledgement and transcript completion", async () => {
+  const ref: GenerationRef = {
+    sessionId: "session-1",
+    lane: "A_TO_B",
+    generation: 12,
+  };
+  async function* inputs(): AsyncIterable<LiveTranscriptionInput> {
+    yield { type: "audio", frame: frame(12) };
+    yield { type: "speech_end", ...ref, turnId: "turn-timeout" };
+  }
+
+  const neverCommitted = new FakeWebSocket();
+  let commitConnected = false;
+  const commitAdapter = new OpenAILiveTranscribeAdapter({
+    apiKey: "test-key",
+    commitTimeoutMs: 10,
+    completionTimeoutMs: 100,
+    webSocketFactory: () => {
+      commitConnected = true;
+      return neverCommitted;
+    },
+  });
+  const commitOutputPromise = collect(
+    commitAdapter.transcribe({
+      events: inputs(),
+      context: ref,
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => commitConnected);
+  neverCommitted.emitOpen();
+  await waitUntil(() =>
+    sentEvents(neverCommitted).some(
+      (event) => event.type === "input_audio_buffer.commit",
+    ),
+  );
+  const commitOutput = await commitOutputPromise;
+  assert.equal(commitOutput.length, 1);
+  assert.equal(commitOutput[0]?.type, "error");
+  if (commitOutput[0]?.type === "error") {
+    assert.equal(
+      commitOutput[0].error.code,
+      "OPENAI_TRANSCRIBE_COMMIT_TIMEOUT",
+    );
+    assert.equal(commitOutput[0].error.retryable, true);
+  }
+  assert.equal(neverCommitted.closes.length, 1);
+
+  const neverCompleted = new FakeWebSocket();
+  let completionConnected = false;
+  const completionAdapter = new OpenAILiveTranscribeAdapter({
+    apiKey: "test-key",
+    commitTimeoutMs: 100,
+    completionTimeoutMs: 10,
+    webSocketFactory: () => {
+      completionConnected = true;
+      return neverCompleted;
+    },
+  });
+  const completionOutputPromise = collect(
+    completionAdapter.transcribe({
+      events: inputs(),
+      context: ref,
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => completionConnected);
+  neverCompleted.emitOpen();
+  await waitUntil(() =>
+    sentEvents(neverCompleted).some(
+      (event) => event.type === "input_audio_buffer.commit",
+    ),
+  );
+  neverCompleted.emitMessage({
+    type: "input_audio_buffer.committed",
+    item_id: "item-timeout",
+  });
+  const completionOutput = await completionOutputPromise;
+  assert.equal(completionOutput.length, 1);
+  assert.equal(completionOutput[0]?.type, "error");
+  if (completionOutput[0]?.type === "error") {
+    assert.equal(
+      completionOutput[0].error.code,
+      "OPENAI_TRANSCRIBE_COMPLETION_TIMEOUT",
+    );
+    assert.equal(completionOutput[0].error.retryable, true);
+  }
+  assert.equal(neverCompleted.closes.length, 1);
+});
+
+test("native realtime bounds provider session-close completion", async () => {
+  const socket = new FakeWebSocket();
+  let connected = false;
+  const adapter = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    closeTimeoutMs: 10,
+    webSocketFactory: () => {
+      connected = true;
+      return socket;
+    },
+  });
+  const outputPromise = collect(
+    adapter.translate({
+      frames: oneFrame(13),
+      context: {
+        sessionId: "session-1",
+        lane: "A_TO_B",
+        generation: 13,
+        sourceLanguage: "en",
+        targetLanguage: "zh-TW",
+        profile: "native_live_baseline",
+      },
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => connected);
+  socket.emitOpen();
+  await waitUntil(() =>
+    sentEvents(socket).some((event) => event.type === "session.close"),
+  );
+
+  const output = await outputPromise;
+  assert.equal(output.length, 1);
+  assert.equal(output[0]?.type, "error");
+  if (output[0]?.type === "error") {
+    assert.equal(output[0].error.code, "OPENAI_REALTIME_CLOSE_TIMEOUT");
+    assert.equal(output[0].error.retryable, true);
+  }
+  assert.equal(socket.closes.length, 1);
+});
+
+test("REST translation aborts and reports a retryable timeout when fetch or response body stalls", async () => {
+  for (const stage of ["fetch", "body"] as const) {
+    let operationSignal: AbortSignal | null | undefined;
+    const translator = new OpenAITextTranslator({
+      apiKey: "text-key",
+      model: "translation-model",
+      requestTimeoutMs: 10,
+      fetch: async (_url, init) => {
+        operationSignal = init?.signal;
+        if (stage === "fetch") {
+          return await new Promise<Response>(() => undefined);
+        }
+        return new Response(
+          new ReadableStream<Uint8Array>({ start() {} }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+
+    await assert.rejects(
+      translator.translate({
+        text: "hello",
+        sourceLanguage: "en",
+        targetLanguage: "zh-TW",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof OpenAIAdapterError);
+        assert.equal(error.code, "timeout");
+        assert.equal(error.retryable, true);
+        assert.doesNotMatch(error.message, /text-key|hello/u);
+        return true;
+      },
+    );
+    assert.equal(operationSignal?.aborted, true);
+  }
+});
+
+test("TTS aborts a stalled fetch and cancels a stalled response body", async () => {
+  let fetchSignal: AbortSignal | null | undefined;
+  const stalledFetch = new OpenAITtsAdapter({
+    apiKey: "tts-key",
+    fetchTimeoutMs: 10,
+    fetch: async (_url, init) => {
+      fetchSignal = init?.signal;
+      return await new Promise<Response>(() => undefined);
+    },
+  });
+  await assert.rejects(
+    collect(stalledFetch.synthesize({ text: "hello" })),
+    (error: unknown) => {
+      assert.ok(error instanceof OpenAIAdapterError);
+      assert.equal(error.code, "timeout");
+      assert.equal(error.retryable, true);
+      return true;
+    },
+  );
+  assert.equal(fetchSignal?.aborted, true);
+
+  let cancelCount = 0;
+  const stalledBody = new OpenAITtsAdapter({
+    apiKey: "tts-key",
+    bodyTimeoutMs: 10,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {},
+          cancel() {
+            cancelCount += 1;
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  await assert.rejects(
+    collect(stalledBody.synthesize({ text: "hello" })),
+    (error: unknown) => {
+      assert.ok(error instanceof OpenAIAdapterError);
+      assert.equal(error.code, "timeout");
+      assert.equal(error.retryable, true);
+      return true;
+    },
+  );
+  assert.equal(cancelCount, 1);
+});
+
+test("deadline cleanup clears successful timers and cancels abandoned TTS bodies", async () => {
+  let successfulSignal: AbortSignal | null | undefined;
+  const translator = new OpenAITextTranslator({
+    apiKey: "text-key",
+    model: "translation-model",
+    requestTimeoutMs: 10,
+    fetch: async (_url, init) => {
+      successfulSignal = init?.signal;
+      return new Response(JSON.stringify({ output_text: "done" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  assert.equal(
+    await translator.translate({
+      text: "hello",
+      sourceLanguage: "en",
+      targetLanguage: "zh-TW",
+    }),
+    "done",
+  );
+  await delay(25);
+  assert.equal(successfulSignal?.aborted, false);
+
+  let cancelCount = 0;
+  const tts = new OpenAITtsAdapter({
+    apiKey: "tts-key",
+    bodyTimeoutMs: 100,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(Uint8Array.of(1, 2));
+          },
+          cancel() {
+            cancelCount += 1;
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  const iterator = tts.synthesize({ text: "hello" })[Symbol.asyncIterator]();
+  assert.deepEqual(await iterator.next(), {
+    done: false,
+    value: Uint8Array.of(1, 2),
+  });
+  await iterator.return?.();
+  assert.equal(cancelCount, 1);
+});
+
+test("generation cancellation stays silent while provider deadlines are armed", async () => {
+  const liveRef: GenerationRef = {
+    sessionId: "session-1",
+    lane: "A_TO_B",
+    generation: 14,
+  };
+  const liveSocket = new FakeWebSocket();
+  let liveConnected = false;
+  const transcriber = new OpenAILiveTranscribeAdapter({
+    apiKey: "test-key",
+    commitTimeoutMs: 10,
+    completionTimeoutMs: 10,
+    webSocketFactory: () => {
+      liveConnected = true;
+      return liveSocket;
+    },
+  });
+  const liveOutputPromise = collect(
+    transcriber.transcribe({
+      events: (async function* (): AsyncIterable<LiveTranscriptionInput> {
+        yield { type: "audio", frame: frame(14) };
+        yield { type: "speech_end", ...liveRef, turnId: "cancelled-turn" };
+      })(),
+      context: liveRef,
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => liveConnected);
+  liveSocket.emitOpen();
+  await waitUntil(() =>
+    sentEvents(liveSocket).some(
+      (event) => event.type === "input_audio_buffer.commit",
+    ),
+  );
+  await transcriber.cancel(liveRef);
+  assert.deepEqual(await liveOutputPromise, []);
+  assert.equal(liveSocket.closes.length, 1);
+
+  const nativeRef: GenerationRef = {
+    sessionId: "session-1",
+    lane: "A_TO_B",
+    generation: 15,
+  };
+  const nativeSocket = new FakeWebSocket();
+  let nativeConnected = false;
+  const native = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    closeTimeoutMs: 10,
+    webSocketFactory: () => {
+      nativeConnected = true;
+      return nativeSocket;
+    },
+  });
+  const nativeOutputPromise = collect(
+    native.translate({
+      frames: oneFrame(15),
+      context: {
+        ...nativeRef,
+        sourceLanguage: "en",
+        targetLanguage: "zh-TW",
+        profile: "native_live_baseline",
+      },
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => nativeConnected);
+  nativeSocket.emitOpen();
+  await waitUntil(() =>
+    sentEvents(nativeSocket).some((event) => event.type === "session.close"),
+  );
+  await native.cancel(nativeRef);
+  assert.deepEqual(await nativeOutputPromise, []);
+  assert.equal(nativeSocket.closes.length, 1);
+
+  await delay(25);
+  assert.equal(liveSocket.closes.length, 1);
+  assert.equal(nativeSocket.closes.length, 1);
+});
+test("realtime cancellation returns upstream iterators and suppresses late sends", async () => {
+  const liveSocket = new FakeWebSocket();
+  let liveConnected = false;
+  const livePending = pendingAsyncIterable<LiveTranscriptionInput>();
+  const liveRef: GenerationRef = {
+    sessionId: "session-1",
+    lane: "A_TO_B",
+    generation: 16,
+  };
+  const transcriber = new OpenAILiveTranscribeAdapter({
+    apiKey: "test-key",
+    webSocketFactory: () => {
+      liveConnected = true;
+      return liveSocket;
+    },
+  });
+  const liveOutputPromise = collect(
+    transcriber.transcribe({
+      events: livePending.iterable,
+      context: liveRef,
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => liveConnected);
+  liveSocket.emitOpen();
+  await waitUntil(() => livePending.nextStarted());
+  const liveSentBeforeCancel = liveSocket.sent.length;
+  await transcriber.cancel(liveRef);
+  await waitUntil(() => livePending.returnCount() === 1);
+  livePending.releaseNext({ done: false, value: { type: "audio", frame: frame(16) } });
+  await delay(0);
+  assert.equal(liveSocket.sent.length, liveSentBeforeCancel);
+  assert.deepEqual(await liveOutputPromise, []);
+
+  const nativeSocket = new FakeWebSocket();
+  let nativeConnected = false;
+  const nativePending = pendingAsyncIterable<ReturnType<typeof frame>>();
+  const nativeRef: GenerationRef = {
+    sessionId: "session-1",
+    lane: "A_TO_B",
+    generation: 17,
+  };
+  const native = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    webSocketFactory: () => {
+      nativeConnected = true;
+      return nativeSocket;
+    },
+  });
+  const nativeOutputPromise = collect(
+    native.translate({
+      frames: nativePending.iterable,
+      context: {
+        ...nativeRef,
+        sourceLanguage: "en",
+        targetLanguage: "zh-TW",
+        profile: "native_live_baseline",
+      },
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => nativeConnected);
+  nativeSocket.emitOpen();
+  await waitUntil(() => nativePending.nextStarted());
+  const nativeSentBeforeCancel = nativeSocket.sent.length;
+  await native.cancel(nativeRef);
+  await waitUntil(() => nativePending.returnCount() === 1);
+  nativePending.releaseNext({ done: false, value: frame(17) });
+  await delay(0);
+  assert.equal(nativeSocket.sent.length, nativeSentBeforeCancel);
+  assert.deepEqual(await nativeOutputPromise, []);
+});
+
+test("REST adapters cancel non-2xx and stalled response bodies", async () => {
+  let textRejectedCancelCount = 0;
+  const textRejected = new OpenAITextTranslator({
+    apiKey: "text-key",
+    model: "translation-model",
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {},
+          cancel() {
+            textRejectedCancelCount += 1;
+          },
+        }),
+        { status: 500 },
+      ),
+  });
+  await assert.rejects(
+    textRejected.translate({
+      text: "hello",
+      sourceLanguage: "en",
+      targetLanguage: "zh-TW",
+    }),
+    (error: unknown) => error instanceof OpenAIAdapterError && error.code === "provider_error",
+  );
+  assert.equal(textRejectedCancelCount, 1);
+
+  let textStalledCancelCount = 0;
+  const textStalled = new OpenAITextTranslator({
+    apiKey: "text-key",
+    model: "translation-model",
+    requestTimeoutMs: 10,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {},
+          cancel() {
+            textStalledCancelCount += 1;
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+  await assert.rejects(
+    textStalled.translate({
+      text: "hello",
+      sourceLanguage: "en",
+      targetLanguage: "zh-TW",
+    }),
+    (error: unknown) => error instanceof OpenAIAdapterError && error.code === "timeout",
+  );
+  assert.equal(textStalledCancelCount, 1);
+
+  let ttsRejectedCancelCount = 0;
+  const ttsRejected = new OpenAITtsAdapter({
+    apiKey: "tts-key",
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {},
+          cancel() {
+            ttsRejectedCancelCount += 1;
+          },
+        }),
+        { status: 500 },
+      ),
+  });
+  await assert.rejects(
+    collect(ttsRejected.synthesize({ text: "hello" })),
+    (error: unknown) => error instanceof OpenAIAdapterError && error.code === "provider_error",
+  );
+  assert.equal(ttsRejectedCancelCount, 1);
+});
+
+test("native realtime treats socket close before session.closed as a failure", async () => {
+  const socket = new FakeWebSocket();
+  let connected = false;
+  const adapter = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    closeTimeoutMs: 100,
+    webSocketFactory: () => {
+      connected = true;
+      return socket;
+    },
+  });
+  const outputPromise = collect(
+    adapter.translate({
+      frames: oneFrame(18),
+      context: {
+        sessionId: "session-1",
+        lane: "A_TO_B",
+        generation: 18,
+        sourceLanguage: "en",
+        targetLanguage: "zh-TW",
+        profile: "native_live_baseline",
+      },
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => connected);
+  socket.emitOpen();
+  await waitUntil(() =>
+    sentEvents(socket).some((event) => event.type === "session.close"),
+  );
+  socket.emitClose();
+  const output = await outputPromise;
+  assert.deepEqual(output.map((event) => event.type), ["error"]);
+  assert.equal(output[0]?.type, "error");
+  if (output[0]?.type === "error") {
+    assert.equal(output[0].error.code, "OPENAI_REALTIME_CONNECTION");
+  }
 });

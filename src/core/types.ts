@@ -6,9 +6,13 @@ export type Side = (typeof SIDES)[number];
 export const LANES = ["A_TO_B", "B_TO_A"] as const;
 export type Lane = (typeof LANES)[number];
 
+export const MEDIA_PROFILES = ["browser_pair", "fake_telephony"] as const;
+export type MediaProfile = (typeof MEDIA_PROFILES)[number];
+
 export const TRANSLATION_PROFILES = [
   "native_live_baseline",
   "glossary_controlled",
+  "local_eval",
   "deterministic_test",
 ] as const;
 export type TranslationProfile = (typeof TRANSLATION_PROFILES)[number];
@@ -28,12 +32,22 @@ export interface SessionSpec {
 
 export type SessionStatus = "waiting" | "ready" | "active" | "paused" | "closing" | "closed";
 
-export interface ParticipantEndpointGrant {
+export interface BrowserParticipantEndpointGrant {
   readonly kind: "browser_link";
   readonly side: Side;
   readonly url: string;
   readonly qrDataUrl: string;
 }
+
+export interface TelephonyTestParticipantEndpointGrant {
+  readonly kind: "telephony_test";
+  readonly side: Side;
+  readonly address: string;
+}
+
+export type ParticipantEndpointGrant =
+  | BrowserParticipantEndpointGrant
+  | TelephonyTestParticipantEndpointGrant;
 
 export interface GlossaryReference {
   readonly id: string;
@@ -149,7 +163,7 @@ export interface GuardedDuplexRelay {
   open(spec: SessionSpec): Promise<SessionSnapshot>;
   snapshot(sessionId: string): SessionSnapshot;
   command(sessionId: string, command: RelayCommand): Promise<void>;
-  events(sessionId: string, after?: EventCursor): AsyncIterable<SessionEvent>;
+  events(sessionId: string, after?: EventCursor, signal?: AbortSignal): AsyncIterable<SessionEvent>;
 }
 
 export interface GenerationRef {
@@ -270,6 +284,7 @@ export interface EvidenceAudioRecord {
   readonly type: "audio";
   readonly sessionId: string;
   readonly track: EvidenceAudioTrack;
+  readonly timelineAtMonoMs: number;
   readonly frame: AudioFrame;
 }
 export type EvidenceRecord = EvidenceSessionEventRecord | EvidenceAudioRecord;

@@ -88,6 +88,48 @@ test("imports canonical columns from the first XLSX worksheet", async () => {
 });
 
 
+test("rejects duplicate normalized CSV headers before values can be overwritten", async () => {
+  const repository = await makeRepository("csv-duplicate-headers");
+  await assert.rejects(
+    repository.import({
+      id: "duplicate-csv",
+      version: "v1",
+      sourceLanguage: "en",
+      targetLanguage: "zh-TW",
+      approval,
+      fileName: "terms.csv",
+      contents: new TextEncoder().encode([
+        "id,source,aliases,target exact,target-exact",
+        "term-1,Spindle,,主軸,錯誤值",
+      ].join("\n")),
+    }),
+    /duplicate normalized column target_exact/u,
+  );
+  assert.equal(await repository.has("duplicate-csv", "v1"), false);
+});
+
+test("rejects duplicate normalized XLSX headers before values can be overwritten", async () => {
+  const repository = await makeRepository("xlsx-duplicate-headers");
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("Manufacturing Terms");
+  sheet.addRow(["id", "source", "aliases", "target exact", "target-exact"]);
+  sheet.addRow(["term-1", "Spindle", "", "主軸", "錯誤值"]);
+
+  await assert.rejects(
+    repository.import({
+      id: "duplicate-xlsx",
+      version: "v1",
+      sourceLanguage: "en",
+      targetLanguage: "zh-TW",
+      approval,
+      fileName: "terms.xlsx",
+      contents: new Uint8Array(await workbook.xlsx.writeBuffer()),
+    }),
+    /duplicate normalized column target_exact/u,
+  );
+  assert.equal(await repository.has("duplicate-xlsx", "v1"), false);
+});
+
 test("rejects a glossary whose automatic reverse direction is ambiguous", async () => {
   const repository = await makeRepository("reverse-conflict");
   await assert.rejects(

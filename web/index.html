@@ -100,7 +100,7 @@
               <div><p class="step-label">Optional</p><h2>Terminology</h2></div>
               <span id="glossary-status" class="quiet-badge">Not imported</span>
             </div>
-            <p class="panel-copy">Upload a UTF-8 CSV before creating the room. Protected names and terms will be monitored during the call.</p>
+            <p class="panel-copy">Upload a CSV or XLSX before creating the room. Protected names and terms will be monitored during the call.</p>
             <label class="field">
               <span>Glossary name</span>
               <input id="glossary-name" name="glossaryName" value="Demo terminology" required />
@@ -111,9 +111,9 @@
               <small>Importing records an explicit customer-owner approval.</small>
             </label>
             <label id="file-drop" class="file-drop">
-              <input id="glossary-file" type="file" accept=".csv,text/csv" />
-              <span class="file-icon" aria-hidden="true">CSV</span>
-              <span><strong id="file-label">Choose a glossary</strong><small>CSV &middot; id, source, aliases, target_exact</small></span>
+              <input id="glossary-file" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+              <span class="file-icon" aria-hidden="true">CSV/XLSX</span>
+              <span><strong id="file-label">Choose a glossary</strong><small>CSV or XLSX &middot; id, source, aliases, target_exact</small></span>
             </label>
             <button id="import-glossary" class="button button-secondary button-wide" type="submit">Import glossary</button>
             <p id="glossary-error" class="form-error" role="alert" hidden></p>
@@ -237,7 +237,7 @@
             </div>
           </section>
 
-          <p class="participant-footnote">Keep this page open and your screen awake. Recording is controlled by the room operator.</p>
+          <p class="participant-footnote">Keep this page open. Screen wake protection is requested while the microphone is live. Recording is controlled by the room operator.</p>
         </div>
       </section>
     </main>

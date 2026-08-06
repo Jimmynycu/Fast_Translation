@@ -278,7 +278,10 @@ async function parseEntries(
   if (extension === ".csv") {
     const records: unknown = parse(new TextDecoder().decode(contents), {
       bom: true,
-      columns: true,
+      columns: (headers: string[]) => {
+        validateHeaders(headers);
+        return headers.map(normalizeHeader);
+      },
       skip_empty_lines: true,
       trim: true,
     });
@@ -373,7 +376,14 @@ function parseAliases(value: string, row: number): string[] {
 }
 
 function validateHeaders(headers: readonly string[]): void {
-  const available = new Set(headers.map(normalizeHeader));
+  const available = new Set<string>();
+  for (const header of headers) {
+    const normalized = normalizeHeader(header);
+    if (available.has(normalized)) {
+      throw new TypeError("glossary import has duplicate normalized column " + normalized);
+    }
+    available.add(normalized);
+  }
   for (const column of REQUIRED_COLUMNS) {
     if (!available.has(column)) {
       throw new TypeError("glossary import is missing required column " + column);

@@ -1,10 +1,35 @@
 import { z } from "zod";
 
+export const MAX_GLOSSARY_FILE_BYTES = 5_000_000;
+
+const glossaryContentsBase64Schema = z.string()
+  .min(4)
+  .max(Math.ceil(MAX_GLOSSARY_FILE_BYTES / 3) * 4)
+  .superRefine((value, context) => {
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
+      context.addIssue({ code: "custom", message: "contentsBase64 must be canonical base64" });
+      return;
+    }
+    const decoded = Buffer.from(value, "base64");
+    if (decoded.byteLength === 0 || decoded.byteLength > MAX_GLOSSARY_FILE_BYTES) {
+      context.addIssue({
+        code: "custom",
+        message: `contentsBase64 must decode to 1-${MAX_GLOSSARY_FILE_BYTES} bytes`,
+      });
+    }
+  });
+
+export function decodeGlossaryContents(contentsBase64: string): Uint8Array {
+  const encoded = glossaryContentsBase64Schema.parse(contentsBase64);
+  return Uint8Array.from(Buffer.from(encoded, "base64"));
+}
+
 export const sideSchema = z.enum(["A", "B"]);
 export const laneSchema = z.enum(["A_TO_B", "B_TO_A"]);
 export const translationProfileSchema = z.enum([
   "native_live_baseline",
   "glossary_controlled",
+  "local_eval",
   "deterministic_test",
 ]);
 
@@ -23,7 +48,9 @@ export const createSessionRequestSchema = z.object({
 
 export const importGlossaryRequestSchema = z.object({
   name: z.string().trim().min(1).max(128),
-  csv: z.string().min(1).max(5_000_000),
+  fileName: z.string().trim().min(5).max(255)
+    .regex(/^[^./\\\u0000][^/\\\u0000]*\.(?:csv|xlsx)$/iu, "fileName must be a .csv or .xlsx base name"),
+  contentsBase64: glossaryContentsBase64Schema,
   sourceLanguage: z.string().trim().min(2).max(64),
   targetLanguage: z.string().trim().min(2).max(64),
   approvedBy: z.string().trim().min(1).max(128),

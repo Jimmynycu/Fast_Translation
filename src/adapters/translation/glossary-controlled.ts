@@ -2,6 +2,7 @@ import {
   CANONICAL_AUDIO,
   createAudioFrame,
   type AudioFrame,
+  type CanonicalAudioFormat,
 } from "../../core/audio.js";
 import type { CompiledGlossary, GlossaryAlert } from "../../core/glossary.js";
 import type {
@@ -85,6 +86,7 @@ export interface ControlledTtsRequest {
 }
 
 export interface ControlledTtsPort {
+  readonly outputFormat: CanonicalAudioFormat;
   synthesize(request: ControlledTtsRequest): AsyncIterable<Uint8Array>;
 }
 
@@ -94,6 +96,14 @@ export interface ControlledTranslationAdapterOptions {
   readonly tts: ControlledTtsPort;
   readonly minimumConfidence?: number;
   readonly now?: () => number;
+}
+
+function isCanonicalTtsFormat(value: unknown): value is CanonicalAudioFormat {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return Object.entries(CANONICAL_AUDIO).every(
+    ([key, expected]) => candidate[key] === expected,
+  );
 }
 
 export class ControlledTranslationAdapter implements TranslationPort {
@@ -112,6 +122,11 @@ export class ControlledTranslationAdapter implements TranslationPort {
       minimumConfidence > 1
     ) {
       throw new TypeError("minimumConfidence must be between 0 and 1");
+    }
+    if (!isCanonicalTtsFormat(options.tts.outputFormat)) {
+      throw new TypeError(
+        "Controlled TTS must emit 24 kHz mono PCM16LE canonical audio",
+      );
     }
     this.#transcriber = options.transcriber;
     this.#translator = options.translator;
@@ -273,6 +288,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
           : { opaqueTokens: bound.bindings.map((binding) => binding.placeholder) }),
         signal,
       });
+      if (signal.aborted) return;
       if (bound === undefined || activeGlossary === undefined) {
         targetText = translated;
       } else {
@@ -295,6 +311,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
         }
       }
     } catch {
+      if (signal.aborted) return;
       targetText = event.transcript;
       yield errorEvent(
         request.context,
@@ -304,6 +321,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
         this.#now(),
       );
     }
+    if (signal.aborted) return;
 
     yield {
       type: "target_transcript_delta",

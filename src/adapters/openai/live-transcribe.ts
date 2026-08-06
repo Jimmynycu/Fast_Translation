@@ -10,6 +10,7 @@ import {
   OpenAIAdapterError,
   parseJsonObject,
   requireApiKey,
+  resolveTimeoutMs,
   sendJson,
   stringField,
   waitForOpen,
@@ -18,6 +19,9 @@ import {
 } from "./common.js";
 
 const DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime";
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_COMMIT_TIMEOUT_MS = 10_000;
+const DEFAULT_COMPLETION_TIMEOUT_MS = 30_000;
 
 export type TranscriptionDelay =
   | "minimal"
@@ -35,6 +39,9 @@ export interface OpenAILiveTranscribeAdapterOptions {
   readonly keywords?: readonly string[];
   readonly languages?: readonly string[];
   readonly delay?: TranscriptionDelay;
+  readonly connectTimeoutMs?: number;
+  readonly commitTimeoutMs?: number;
+  readonly completionTimeoutMs?: number;
   readonly now?: () => number;
 }
 
@@ -96,6 +103,11 @@ type ProviderTranscript =
       readonly text: string;
     }>;
 
+interface PendingCommit {
+  readonly turnId: string;
+  readonly timer: ReturnType<typeof setTimeout>;
+}
+
 interface ActiveTranscription {
   stop(): void;
 }
@@ -111,6 +123,9 @@ export class OpenAILiveTranscribeAdapter {
   readonly #delay: TranscriptionDelay | undefined;
   readonly #now: () => number;
   readonly #active = new Map<string, ActiveTranscription>();
+  readonly #connectTimeoutMs: number;
+  readonly #commitTimeoutMs: number;
+  readonly #completionTimeoutMs: number;
 
   constructor(options: OpenAILiveTranscribeAdapterOptions) {
     this.#apiKey = requireApiKey(options.apiKey);
@@ -123,6 +138,21 @@ export class OpenAILiveTranscribeAdapter {
     this.#languages = [...(options.languages ?? [])];
     this.#delay = options.delay;
     this.#now = options.now ?? (() => performance.now());
+    this.#connectTimeoutMs = resolveTimeoutMs(
+      options.connectTimeoutMs,
+      DEFAULT_CONNECT_TIMEOUT_MS,
+      "OpenAI transcription connectTimeoutMs",
+    );
+    this.#commitTimeoutMs = resolveTimeoutMs(
+      options.commitTimeoutMs,
+      DEFAULT_COMMIT_TIMEOUT_MS,
+      "OpenAI transcription commitTimeoutMs",
+    );
+    this.#completionTimeoutMs = resolveTimeoutMs(
+      options.completionTimeoutMs,
+      DEFAULT_COMPLETION_TIMEOUT_MS,
+      "OpenAI transcription completionTimeoutMs",
+    );
 
     for (const keyword of this.#keywords) {
       if (
@@ -174,14 +204,65 @@ export class OpenAILiveTranscribeAdapter {
 
     const events = new AsyncQueue<LiveTranscriptionEvent>();
     let lifecycle: "active" | "intentional" | "failed" = "active";
-    const waitingTurns: string[] = [];
+    const waitingTurns: PendingCommit[] = [];
     const turnByItem = new Map<string, string>();
     const incompleteItems = new Set<string>();
+    const completionTimers = new Map<
+      string,
+      ReturnType<typeof setTimeout>
+    >();
     const bufferedByItem = new Map<string, ProviderTranscript[]>();
     let inputEnded = false;
+    let inputStopRequested = false;
+    let inputReturnRequested = false;
+    let inputIterator: AsyncIterator<LiveTranscriptionInput> | undefined;
+    let wakeInputStop: (() => void) | undefined;
+    const inputStopped = new Promise<void>((resolve) => {
+      wakeInputStop = resolve;
+    });
+    const returnInputIterator = (
+      iterator: AsyncIterator<LiveTranscriptionInput>,
+    ): void => {
+      if (inputIterator === iterator) inputIterator = undefined;
+      if (inputReturnRequested) return;
+      inputReturnRequested = true;
+      try {
+        void Promise.resolve(iterator.return?.()).catch(() => undefined);
+      } catch {
+        // Upstream iterator cleanup is best effort.
+      }
+    };
+    const registerInputIterator = (
+      iterator: AsyncIterator<LiveTranscriptionInput>,
+    ): void => {
+      inputIterator = iterator;
+      if (inputStopRequested) returnInputIterator(iterator);
+    };
+    const releaseInputIterator = (
+      iterator: AsyncIterator<LiveTranscriptionInput>,
+    ): void => {
+      if (inputIterator === iterator) inputIterator = undefined;
+    };
+    const stopInput = (): void => {
+      if (inputStopRequested) return;
+      inputStopRequested = true;
+      wakeInputStop?.();
+      const iterator = inputIterator;
+      if (iterator !== undefined) returnInputIterator(iterator);
+    };
+
+    const clearTurnDeadlines = (): void => {
+      for (const pending of waitingTurns.splice(0)) {
+        clearTimeout(pending.timer);
+      }
+      for (const timer of completionTimers.values()) clearTimeout(timer);
+      completionTimers.clear();
+    };
 
     const stop = (): void => {
       if (lifecycle !== "active") return;
+      stopInput();
+      clearTurnDeadlines();
       lifecycle = "intentional";
       events.end();
       closeSocket(socket);
@@ -194,10 +275,27 @@ export class OpenAILiveTranscribeAdapter {
       closeTransport = true,
     ): void => {
       if (lifecycle !== "active") return;
+      stopInput();
+      clearTurnDeadlines();
       lifecycle = "failed";
       events.push(this.#errorEvent(ref, code, message, retryable));
       events.end();
       if (closeTransport) closeSocket(socket);
+    };
+
+    const enqueueCommit = (turnId: string): void => {
+      waitingTurns.push({
+        turnId,
+        timer: setTimeout(
+          () =>
+            fail(
+              "OPENAI_TRANSCRIBE_COMMIT_TIMEOUT",
+              "The transcription service timed out while committing audio.",
+              true,
+            ),
+          this.#commitTimeoutMs,
+        ),
+      });
     };
 
     const active: ActiveTranscription = { stop };
@@ -241,6 +339,9 @@ export class OpenAILiveTranscribeAdapter {
         turnId,
         transcript: providerEvent.text,
       });
+      const completionTimer = completionTimers.get(providerEvent.itemId);
+      if (completionTimer !== undefined) clearTimeout(completionTimer);
+      completionTimers.delete(providerEvent.itemId);
       incompleteItems.delete(providerEvent.itemId);
       maybeFinish();
     };
@@ -264,7 +365,9 @@ export class OpenAILiveTranscribeAdapter {
 
       if (type === "input_audio_buffer.committed") {
         const itemId = stringField(providerEvent, "item_id");
-        const turnId = waitingTurns.shift();
+        const pending = waitingTurns.shift();
+        if (pending !== undefined) clearTimeout(pending.timer);
+        const turnId = pending?.turnId;
         if (itemId === undefined || turnId === undefined) {
           events.push(
             this.#errorEvent(
@@ -278,6 +381,20 @@ export class OpenAILiveTranscribeAdapter {
         }
         turnByItem.set(itemId, turnId);
         incompleteItems.add(itemId);
+        const previousTimer = completionTimers.get(itemId);
+        if (previousTimer !== undefined) clearTimeout(previousTimer);
+        completionTimers.set(
+          itemId,
+          setTimeout(
+            () =>
+              fail(
+                "OPENAI_TRANSCRIBE_COMPLETION_TIMEOUT",
+                "The transcription service timed out while completing a transcript.",
+                true,
+              ),
+            this.#completionTimeoutMs,
+          ),
+        );
         const buffered = bufferedByItem.get(itemId);
         if (buffered !== undefined) {
           bufferedByItem.delete(itemId);
@@ -334,7 +451,7 @@ export class OpenAILiveTranscribeAdapter {
     request.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
-      await waitForOpen(socket, request.signal);
+      await waitForOpen(socket, request.signal, this.#connectTimeoutMs);
       sendJson(socket, {
         type: "session.update",
         session: {
@@ -359,7 +476,17 @@ export class OpenAILiveTranscribeAdapter {
         },
       });
 
-      void this.#pumpInput(request, socket, waitingTurns, events)
+      void this.#pumpInput(
+        request,
+        socket,
+        enqueueCommit,
+        events,
+        inputStopped,
+        () => inputStopRequested,
+        registerInputIterator,
+        releaseInputIterator,
+        returnInputIterator,
+      )
         .then(() => {
           if (request.signal.aborted) {
             stop();
@@ -378,11 +505,17 @@ export class OpenAILiveTranscribeAdapter {
         });
 
       for await (const event of events) yield event;
-    } catch {
+    } catch (error) {
       if (!request.signal.aborted) {
+        const timedOut =
+          error instanceof OpenAIAdapterError && error.code === "timeout";
         fail(
-          "OPENAI_TRANSCRIBE_CONNECTION",
-          "The transcription service connection failed.",
+          timedOut
+            ? "OPENAI_TRANSCRIBE_CONNECT_TIMEOUT"
+            : "OPENAI_TRANSCRIBE_CONNECTION",
+          timedOut
+            ? "The transcription service connection timed out."
+            : "The transcription service connection failed.",
           true,
         );
         for await (const event of events) yield event;
@@ -405,85 +538,120 @@ export class OpenAILiveTranscribeAdapter {
   async #pumpInput(
     request: LiveTranscriptionRequest,
     socket: WebSocketLike,
-    waitingTurns: string[],
+    enqueueCommit: (turnId: string) => void,
     events: AsyncQueue<LiveTranscriptionEvent>,
+    stopPromise: Promise<void>,
+    isStopped: () => boolean,
+    registerIterator: (iterator: AsyncIterator<LiveTranscriptionInput>) => void,
+    releaseIterator: (iterator: AsyncIterator<LiveTranscriptionInput>) => void,
+    returnIterator: (iterator: AsyncIterator<LiveTranscriptionInput>) => void,
   ): Promise<void> {
     let commitSequence = 0;
-    for await (const input of request.events) {
-      if (request.signal.aborted) return;
+    if (request.signal.aborted || isStopped()) return;
 
-      if (input.type === "audio") {
-        const frame = input.frame;
-        if (!matchesGeneration(frame, request.context)) {
+    const iterator = request.events[Symbol.asyncIterator]();
+    registerIterator(iterator);
+    let naturallyDone = false;
+    try {
+      while (!request.signal.aborted && !isStopped()) {
+        const next = await Promise.race<
+          | Readonly<{
+              readonly type: "input";
+              readonly result: IteratorResult<LiveTranscriptionInput>;
+            }>
+          | Readonly<{ readonly type: "stopped" }>
+        >([
+          Promise.resolve(iterator.next()).then((result) => ({
+            type: "input" as const,
+            result,
+          })),
+          stopPromise.then(() => ({ type: "stopped" as const })),
+        ]);
+        if (next.type === "stopped") return;
+        if (next.result.done) {
+          naturallyDone = true;
+          return;
+        }
+        if (request.signal.aborted || isStopped()) return;
+        const input = next.result.value;
+
+        if (input.type === "audio") {
+          const frame = input.frame;
+          if (!matchesGeneration(frame, request.context)) {
+            events.push(
+              this.#errorEvent(
+                request.context,
+                "OPENAI_TRANSCRIBE_GENERATION_MISMATCH",
+                "An audio frame did not belong to the active transcription generation.",
+                false,
+              ),
+            );
+            throw new OpenAIAdapterError(
+              "invalid_input",
+              "Audio generation mismatch.",
+            );
+          }
+          if (
+            frame.pcm16le.byteLength !== CANONICAL_AUDIO.bytesPerFrame ||
+            frame.format.encoding !== CANONICAL_AUDIO.encoding ||
+            frame.format.sampleRateHz !== CANONICAL_AUDIO.sampleRateHz ||
+            frame.format.channels !== CANONICAL_AUDIO.channels
+          ) {
+            events.push(
+              this.#errorEvent(
+                request.context,
+                "OPENAI_TRANSCRIBE_AUDIO_FORMAT",
+                "An audio frame was not canonical 24 kHz mono PCM16.",
+                false,
+              ),
+            );
+            throw new OpenAIAdapterError(
+              "invalid_input",
+              "Unsupported audio format.",
+            );
+          }
+          if (request.signal.aborted || isStopped()) return;
+          sendJson(socket, {
+            type: "input_audio_buffer.append",
+            audio: encodePcm16(frame.pcm16le),
+          });
+          continue;
+        }
+
+        if (!matchesGeneration(input, request.context)) {
           events.push(
             this.#errorEvent(
               request.context,
               "OPENAI_TRANSCRIBE_GENERATION_MISMATCH",
-              "An audio frame did not belong to the active transcription generation.",
+              "A speech boundary did not belong to the active transcription generation.",
               false,
             ),
           );
           throw new OpenAIAdapterError(
             "invalid_input",
-            "Audio generation mismatch.",
+            "Speech boundary generation mismatch.",
           );
         }
-        if (
-          frame.pcm16le.byteLength !== CANONICAL_AUDIO.bytesPerFrame ||
-          frame.format.encoding !== CANONICAL_AUDIO.encoding ||
-          frame.format.sampleRateHz !== CANONICAL_AUDIO.sampleRateHz ||
-          frame.format.channels !== CANONICAL_AUDIO.channels
-        ) {
-          events.push(
-            this.#errorEvent(
-              request.context,
-              "OPENAI_TRANSCRIBE_AUDIO_FORMAT",
-              "An audio frame was not canonical 24 kHz mono PCM16.",
-              false,
-            ),
-          );
+        if (input.turnId.length === 0) {
           throw new OpenAIAdapterError(
             "invalid_input",
-            "Unsupported audio format.",
+            "A transcription turn ID is required.",
           );
         }
+
+        if (request.signal.aborted || isStopped()) return;
+        enqueueCommit(input.turnId);
         sendJson(socket, {
-          type: "input_audio_buffer.append",
-          audio: encodePcm16(frame.pcm16le),
+          type: "input_audio_buffer.commit",
+          event_id: "commit_" + commitSequence.toString(10),
         });
-        continue;
+        commitSequence += 1;
       }
-
-      if (!matchesGeneration(input, request.context)) {
-        events.push(
-          this.#errorEvent(
-            request.context,
-            "OPENAI_TRANSCRIBE_GENERATION_MISMATCH",
-            "A speech boundary did not belong to the active transcription generation.",
-            false,
-          ),
-        );
-        throw new OpenAIAdapterError(
-          "invalid_input",
-          "Speech boundary generation mismatch.",
-        );
-      }
-      if (input.turnId.length === 0) {
-        throw new OpenAIAdapterError(
-          "invalid_input",
-          "A transcription turn ID is required.",
-        );
-      }
-
-      waitingTurns.push(input.turnId);
-      sendJson(socket, {
-        type: "input_audio_buffer.commit",
-        event_id: "commit_" + commitSequence.toString(10),
-      });
-      commitSequence += 1;
+    } finally {
+      if (naturallyDone) releaseIterator(iterator);
+      else returnIterator(iterator);
     }
   }
-
   #errorEvent(
     ref: GenerationRef,
     code: string,

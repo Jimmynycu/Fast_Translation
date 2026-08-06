@@ -1,3 +1,9 @@
+import {
+  endpointGrantPresentation,
+  glossaryUploadContents,
+} from "./public/browser-contract.js";
+import { MediaSocketSupervisor } from "./public/media-socket-supervisor.js";
+
 const $ = (id) => document.getElementById(id);
 
 const params = new URLSearchParams(window.location.search);
@@ -38,6 +44,7 @@ const state = {
 
 const PROFILE_LABELS = {
   glossary_controlled: "Glossary controlled",
+  local_eval: "Local glossary evaluation",
   native_live_baseline: "Native live baseline",
   deterministic_test: "Deterministic test",
 };
@@ -252,37 +259,58 @@ function renderJoinCards(grants) {
   ["A", "B"].forEach((side) => {
     const grant = grants.find((item) => item.side === side);
     if (!grant) return;
+    let endpoint;
+    try {
+      endpoint = endpointGrantPresentation(grant, window.location.href);
+    } catch (error) {
+      addFeedItem(
+        $("pipeline-feed"),
+        "Endpoint unavailable",
+        error instanceof Error ? error.message : String(error),
+        true,
+      );
+      return;
+    }
     const fragment = $("join-card-template").content.cloneNode(true);
     const card = fragment.querySelector(".join-card");
     const sideBadge = card.querySelector(".side");
     sideBadge.textContent = side;
     sideBadge.classList.add(side === "A" ? "side-a" : "side-b");
-    card.querySelector(".join-copy strong").textContent = "Phone " + side;
-    card.querySelector(".join-language").textContent = languages[side];
+    card.querySelector(".join-copy strong").textContent =
+      endpoint.kind === "browser_link" ? "Phone " + side : "Telephony test " + side;
+    card.querySelector(".join-language").textContent =
+      endpoint.kind === "browser_link"
+        ? languages[side]
+        : languages[side] + " - " + endpoint.address;
 
     const image = card.querySelector(".qr-code");
-    if (grant.qrDataUrl) {
-      image.src = grant.qrDataUrl;
+    if (endpoint.qrDataUrl) {
+      image.src = endpoint.qrDataUrl;
       image.alt = "QR code for Phone " + side;
     } else {
       image.hidden = true;
     }
 
-    const url = new URL(grant.url, window.location.href).toString();
     const link = card.querySelector(".join-link");
-    link.href = url;
-    link.setAttribute("aria-label", "Open participant link for Phone " + side);
+    if (endpoint.href) {
+      link.href = endpoint.href;
+      link.setAttribute("aria-label", "Open participant link for Phone " + side);
+    } else {
+      link.hidden = true;
+    }
 
     const copy = card.querySelector(".copy-link");
+    const copyLabel = endpoint.kind === "browser_link" ? "Copy link" : "Copy address";
+    copy.textContent = copyLabel;
     copy.addEventListener("click", async () => {
       try {
-        await navigator.clipboard.writeText(url);
+        await navigator.clipboard.writeText(endpoint.copyValue);
         copy.textContent = "Copied";
       } catch {
-        copy.textContent = "Open link to copy";
+        copy.textContent = endpoint.kind === "browser_link" ? "Open link to copy" : "Copy failed";
       }
       window.setTimeout(() => {
-        copy.textContent = "Copy link";
+        copy.textContent = copyLabel;
       }, 1600);
     });
     container.append(fragment);
@@ -389,6 +417,7 @@ function updateLatency(data, envelope) {
 function updateRoomState(value) {
   const roomState = String(value || "unknown");
   const normal = roomState.toLowerCase();
+  const previousStatus = state.roomStatus;
   state.roomStatus = normal;
   $("room-state").textContent = titleCase(roomState);
   const start = $("start-session");
@@ -413,6 +442,9 @@ function updateRoomState(value) {
     end.disabled = false;
     if (route.role === "participant") {
       updateParticipantConnection(state.audio ? "Live" : "Room live", true);
+      if (previousStatus === "paused" && state.audio && state.vadActive) {
+        sendMediaControl("speech_start");
+      }
     } else {
       updateGlobalStatus("Session live", true);
     }
@@ -421,7 +453,11 @@ function updateRoomState(value) {
     pause.disabled = false;
     pause.textContent = "Resume";
     end.disabled = false;
-    if (route.role === "operator") updateGlobalStatus("Session paused", true);
+    if (route.role === "participant" && state.audio && state.vadActive) {
+      sendMediaControl("speech_end");
+    } else if (route.role === "operator") {
+      updateGlobalStatus("Session paused", true);
+    }
   } else {
     start.disabled = normal !== "ready";
     pause.disabled = true;
@@ -655,16 +691,16 @@ async function importGlossary(event) {
   clearError(error);
   const file = $("glossary-file").files[0];
   if (!file) {
-    showError(error, "Choose a CSV file first.");
+    showError(error, "Choose a CSV or XLSX file first.");
     return;
   }
 
   setLoading(button, true, "Importing...");
   try {
-    const csv = await file.text();
+    const upload = glossaryUploadContents(file.name, await file.arrayBuffer());
     const response = await postJson("/api/glossaries", {
       name: $("glossary-name").value.trim(),
-      csv,
+      ...upload,
       sourceLanguage: $("language-a").value,
       targetLanguage: $("language-b").value,
       approvedBy: $("glossary-approved-by").value.trim(),
@@ -730,9 +766,9 @@ async function createSession(event) {
   const translationProfileId = $("translation-profile").value;
   if (
     state.glossaryVersion !== null &&
-    translationProfileId !== "glossary_controlled"
+    !["glossary_controlled", "local_eval"].includes(translationProfileId)
   ) {
-    showError(error, "Select Glossary controlled to use the imported glossary.");
+    showError(error, "Select Glossary controlled or Local glossary evaluation to use the glossary.");
     return;
   }
 
@@ -902,8 +938,40 @@ function openMediaSocket(sessionId, side) {
   });
 }
 
+function currentMediaSocket() {
+  return state.audio ? state.audio.socketSupervisor.socket : null;
+}
+
+async function requestParticipantWakeLock(audio) {
+  if (
+    !navigator.wakeLock ||
+    typeof navigator.wakeLock.request !== "function" ||
+    document.visibilityState === "hidden" ||
+    audio.wakeLock
+  ) return;
+  try {
+    const sentinel = await navigator.wakeLock.request("screen");
+    if (state.audio !== audio) {
+      await sentinel.release();
+      return;
+    }
+    audio.wakeLock = sentinel;
+    sentinel.addEventListener("release", () => {
+      if (audio.wakeLock === sentinel) audio.wakeLock = null;
+    }, { once: true });
+  } catch {
+    // Wake Lock is optional and may be denied by device power policy.
+  }
+}
+
+async function releaseParticipantWakeLock(audio) {
+  const sentinel = audio.wakeLock;
+  audio.wakeLock = null;
+  if (sentinel) await sentinel.release().catch(() => {});
+}
+
 function sendMediaControl(type) {
-  const socket = state.audio && state.audio.socket;
+  const socket = currentMediaSocket();
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type }));
   }
@@ -914,15 +982,16 @@ async function stopParticipantAudio(reportStopped) {
   state.audio = null;
   if (!audio) return;
 
-  if (state.vadActive && audio.socket.readyState === WebSocket.OPEN) {
-    audio.socket.send(JSON.stringify({ type: "speech_end" }));
+  const socket = audio.socketSupervisor.socket;
+  if (state.vadActive && socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "speech_end" }));
   }
   state.vadActive = false;
   state.capturePreroll = [];
   state.pendingMediaMessages = [];
   state.captureBackpressureAlerted = false;
-  audio.socket.onclose = null;
-  if (audio.socket.readyState < WebSocket.CLOSING) audio.socket.close(1000, "Microphone stopped");
+  audio.socketSupervisor.stop(1000, "Microphone stopped");
+  await releaseParticipantWakeLock(audio);
   audio.stream.getTracks().forEach((track) => track.stop());
   audio.captureNode.disconnect();
   audio.source.disconnect();
@@ -965,7 +1034,8 @@ async function startParticipantAudio() {
   setLoading(button, true, "Requesting microphone...");
   let stream;
   let context;
-  let socket;
+  let socketSupervisor;
+  let participantAudio;
   try {
     state.pendingMediaMessages = [];
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -993,7 +1063,33 @@ async function startParticipantAudio() {
       ),
     ]);
 
-    socket = await openMediaSocket(route.sessionId, route.side);
+    socketSupervisor = new MediaSocketSupervisor({
+      connect: () => openMediaSocket(route.sessionId, route.side),
+      onOpen: (connectedSocket, detail) => {
+        if (!participantAudio) return;
+        if (state.audio !== participantAudio) {
+          connectedSocket.close(1000, "Audio session replaced");
+          return;
+        }
+        state.captureBackpressureAlerted = false;
+        clearError(error);
+        if (state.vadActive && connectedSocket.readyState === WebSocket.OPEN) {
+          connectedSocket.send(JSON.stringify({ type: "speech_start" }));
+        }
+        updateParticipantConnection(detail.reconnected ? "Live - reconnected" : "Live", true);
+      },
+      onDisconnect: () => {
+        if (state.audio === participantAudio) {
+          updateParticipantConnection("Audio reconnecting", false);
+        }
+      },
+      onRetry: (_connectionError, delayMs) => {
+        if (state.audio === participantAudio) {
+          updateParticipantConnection("Retrying audio in " + Math.ceil(delayMs / 1000) + "s", false);
+        }
+      },
+    });
+    await socketSupervisor.start();
     const captureNode = new AudioWorkletNode(context, "relay-pcm-capture", {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -1019,22 +1115,26 @@ async function startParticipantAudio() {
     silentGain.connect(context.destination);
     playoutNode.connect(context.destination);
 
-    state.audio = {
+    participantAudio = {
       context,
       stream,
-      socket,
+      socketSupervisor,
       source,
       captureNode,
       playoutNode,
       silentGain,
+      wakeLock: null,
     };
+    state.audio = participantAudio;
 
     const queuedMedia = state.pendingMediaMessages.splice(0);
     for (const queuedMessage of queuedMedia) await handleMediaMessage(queuedMessage);
 
     state.capturePreroll = [];
     const sendPcmFrame = (pcm) => {
-      if (socket.readyState !== WebSocket.OPEN || !(pcm instanceof ArrayBuffer)) return;
+      const socket = currentMediaSocket();
+      if (state.audio !== participantAudio) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN || !(pcm instanceof ArrayBuffer)) return;
       if (socket.bufferedAmount <= 24 * 1024) {
         socket.send(pcm);
         if (state.captureBackpressureAlerted) {
@@ -1051,7 +1151,7 @@ async function startParticipantAudio() {
 
     captureNode.port.addEventListener("message", (event) => {
       const message = event.data;
-      if (!state.audio) return;
+      if (state.audio !== participantAudio) return;
       if (message.type === "frame") {
         const level = Math.min(100, Math.max(2, Number(message.rms || 0) * 500));
         $("audio-meter").style.height = level + "%";
@@ -1078,12 +1178,14 @@ async function startParticipantAudio() {
 
     playoutNode.port.addEventListener("message", (event) => {
       const message = event.data || {};
+      if (state.audio !== participantAudio) return;
       if (
         !["playout_started", "playout_dropped"].includes(message.type) ||
         !Number.isSafeInteger(message.generation) ||
-        !Number.isSafeInteger(message.sequence) ||
-        socket.readyState !== WebSocket.OPEN
+        !Number.isSafeInteger(message.sequence)
       ) return;
+      const socket = currentMediaSocket();
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
       socket.send(JSON.stringify({
         type: message.type,
         generation: message.generation,
@@ -1092,20 +1194,19 @@ async function startParticipantAudio() {
     });
     playoutNode.port.start();
 
-    socket.addEventListener("close", () => {
-      if (!state.audio || state.audio.socket !== socket) return;
-      showError(error, "The live audio connection closed. Stop and rejoin.");
-      updateParticipantConnection("Audio disconnected", false);
-    });
-
     await context.resume();
+    await requestParticipantWakeLock(participantAudio);
     setLoading(button, false, "");
     $("call-idle").hidden = true;
     $("call-live").hidden = false;
-    updateParticipantConnection("Live", true);
+    const connected = Boolean(
+      socketSupervisor.socket && socketSupervisor.socket.readyState === WebSocket.OPEN,
+    );
+    updateParticipantConnection(connected ? "Live" : "Audio reconnecting", connected);
   } catch (errorValue) {
     state.audio = null;
-    if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+    if (socketSupervisor) socketSupervisor.stop();
+    if (participantAudio) await releaseParticipantWakeLock(participantAudio);
     if (stream) stream.getTracks().forEach((track) => track.stop());
     if (context) await context.close().catch(() => {});
     setPreflight("check-mic", false);
@@ -1177,13 +1278,25 @@ async function initialiseParticipant() {
   $("stop-microphone").addEventListener("click", () => void stopParticipantAudio(true));
 }
 
+document.addEventListener("visibilitychange", () => {
+  const audio = state.audio;
+  if (route.role !== "participant" || !audio || document.visibilityState !== "visible") {
+    return;
+  }
+  void audio.context.resume().catch(() => {});
+  void requestParticipantWakeLock(audio);
+});
+
 window.addEventListener("beforeunload", () => {
   state.eventsClosed = true;
   if (state.eventReconnectTimer) window.clearTimeout(state.eventReconnectTimer);
   if (state.eventSocket) state.eventSocket.close();
   if (state.audio) {
-    state.audio.stream.getTracks().forEach((track) => track.stop());
-    state.audio.socket.close();
+    const audio = state.audio;
+    state.audio = null;
+    audio.socketSupervisor.stop(1000, "Page closed");
+    audio.stream.getTracks().forEach((track) => track.stop());
+    if (audio.wakeLock) void audio.wakeLock.release().catch(() => {});
   }
 });
 

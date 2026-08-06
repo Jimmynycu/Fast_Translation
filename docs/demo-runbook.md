@@ -23,10 +23,9 @@ phones before the demo and verify the HTTPS page opens without a warning.
 
 ## 2. Install and verify
 
-Run these commands from a PowerShell window:
+Run these commands from a PowerShell window opened at the repository root:
 
 ```powershell
-Set-Location D:\Fast_Translation
 node --version
 pnpm --version
 pnpm install --frozen-lockfile
@@ -39,15 +38,26 @@ Do not continue with a two-phone demo if typecheck, tests, or build fails.
 
 ## 3. Export the common LAN configuration
 
-Replace the example hostname and certificate paths with values for the operator
-PC. Relative certificate paths are resolved from the repository root.
+Generate disposable LAN certificates inside the workspace. Replace the example IP
+with the operator PC's reachable LAN address:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\generate-lan-tls.ps1 `
+  -OutputDirectory .\work\tmp\lan-tls `
+  -DnsName fast-translation.local `
+  -IpAddress 192.168.1.50
+```
+
+Install `.\work\tmp\lan-tls\local-demo-ca.cer` as a trusted root on the PC
+and both test phones. Then export matching settings; relative certificate paths
+are resolved from the repository root:
 
 ```powershell
 $env:HOST = "0.0.0.0"
 $env:PORT = "4207"
-$env:PUBLIC_BASE_URL = "https://translator-pc.example.test:4207"
-$env:TLS_CERT_PATH = ".\certs\lan-cert.pem"
-$env:TLS_KEY_PATH = ".\certs\lan-key.pem"
+$env:PUBLIC_BASE_URL = "https://192.168.1.50:4207"
+$env:TLS_CERT_PATH = ".\work\tmp\lan-tls\server-cert.pem"
+$env:TLS_KEY_PATH = ".\work\tmp\lan-tls\server-key.pem"
 $env:MEDIA_PROFILE = "browser_pair"
 $env:GLOSSARY_DIRECTORY = ".\data\glossaries"
 $env:LOG_LEVEL = "info"
@@ -103,7 +113,30 @@ pnpm dev
 The evidence key is not an OpenAI credential, but it is still a secret. Losing it
 makes existing evidence unreadable. Do not commit it or paste it into issue logs.
 
-### C. OpenAI-backed profiles
+### C. Keyless glossary Harness with fixture transcripts
+
+This mode accepts a pinned glossary and exercises exact-term binding,
+authorization, alerts, deterministic PCM, and two-way playout without an OpenAI
+key. Each lane transcript is injected from configuration after real input audio
+arrives, so this does not evaluate acoustic STT:
+
+```powershell
+$env:TRANSLATION_PROFILE = "local_eval"
+$env:LOCAL_EVAL_TRANSCRIPT_A_TO_B = "Verify the mistake proofing fixture."
+$env:LOCAL_EVAL_TRANSCRIPT_B_TO_A = "請確認防呆治具。"
+$env:LOCAL_EVAL_CONFIDENCE = "0.99"
+$env:LOCAL_EVAL_TRANSLATION_MODE = "preserve"
+$env:EVIDENCE_PROFILE = "in_memory"
+$env:OPENAI_API_KEY = ""
+Remove-Item Env:EVIDENCE_KEY_BASE64 -ErrorAction SilentlyContinue
+pnpm dev
+```
+
+Set `LOCAL_EVAL_TRANSLATION_MODE=drop_placeholders` only for the deliberate
+fail-open alert test. It keeps playout continuous while recording the glossary
+control failure.
+
+### D. OpenAI-backed profiles
 
 Keep the common TLS settings, select either OpenAI startup profile, and inject the
 key only into the server process:
@@ -116,8 +149,9 @@ pnpm dev
 ```
 
 With a key present, the server registers `native_live_baseline`,
-`glossary_controlled`, and `deterministic_test`. The startup profile variable is
-validated at launch; the operator's session selection chooses the actual route.
+`glossary_controlled`, `local_eval`, and `deterministic_test`. The startup
+profile variable is validated at launch; the operator's session selection
+chooses the actual route.
 Use encrypted evidence instead of `in_memory` when the session requires a
 persistent record.
 
@@ -131,8 +165,8 @@ below with the configured `PUBLIC_BASE_URL`:
 
 ```powershell
 $operatorHeaders = @{ Authorization = "Bearer $env:OPERATOR_TOKEN" }
-Invoke-RestMethod -Uri "https://translator-pc.example.test:4207/api/health"
-Invoke-RestMethod -Headers $operatorHeaders -Uri "https://translator-pc.example.test:4207/api/capabilities" |
+Invoke-RestMethod -Uri "$env:PUBLIC_BASE_URL/api/health"
+Invoke-RestMethod -Headers $operatorHeaders -Uri "$env:PUBLIC_BASE_URL/api/capabilities" |
   ConvertTo-Json -Depth 4
 ```
 
@@ -147,11 +181,10 @@ fixed before scanning the QR codes.
    `#access=...` fragment; the bare `PUBLIC_BASE_URL` is intentionally unauthorized.
 2. Select the language spoken by Phone A, the language spoken by Phone B, and a
    translation profile advertised by `/api/capabilities`.
-3. Only for `glossary_controlled`, optionally import a glossary before creating
-   the room. After the glossary owner reviews the entries, enter that approver's
-   name and upload `examples/manufacturing-glossary.csv`, or an approved
-   replacement. The current UI accepts CSV only. A glossary version is rejected
-   for the other two profiles.
+3. For `glossary_controlled` or `local_eval`, optionally import a glossary
+   before creating the room. After the glossary owner reviews the entries, enter
+   that approver's name and upload an approved CSV or XLSX file. A glossary
+   version is rejected for `deterministic_test` and `native_live_baseline`.
 4. Confirm recording consent and click **Create translation room**.
 5. Scan the Phone A QR with the A participant and the Phone B QR with the B
    participant. Do not swap links; each link fixes its side.
@@ -171,6 +204,11 @@ For `deterministic_test`, the audible result is routed source audio and the
 captions contain deterministic labels. That proves browser capture, central
 routing, opposite-side playout, session control, and fencing only. It does not
 prove translation quality.
+
+For `local_eval`, actual input frames traverse the selected media adapter, but
+the configured lane transcript is injected. This proves glossary exact-term
+control, alert behavior, evidence, and playout without a provider key; it does
+not prove acoustic recognition or natural translated speech.
 
 For `glossary_controlled`, import the table in the Phone A language -> Phone B
 language direction. The Harness also derives Phone B -> Phone A entries by using
@@ -200,16 +238,44 @@ At session start, the controlled profile sends the pinned lane's `source` and
 `aliases` to live transcription as keyword hints, together with the lane source
 language. The reverse lane uses the automatically derived glossary.
 
-The UI sends CSV text plus name, languages, and approver metadata. The server
-creates an immutable repository version and returns the version pin used when
+The UI sends the original CSV or XLSX bytes as base64 together with filename,
+name, languages, and approver metadata. The server decodes the bounded payload,
+creates an immutable repository version, and returns the version pin used when
 the room is created. Reusing an identity/version with different content is a
 conflict rather than an overwrite.
 
-`FileGlossaryRepository` can also parse XLSX with the same headers, but no current
-HTTP or browser control exposes XLSX upload. Do not rename an XLSX file to CSV.
+CSV and XLSX share the same header contract. Duplicate names after NFKC,
+whitespace, hyphen, and case normalization are rejected before row values are
+built, preventing an approved `target_exact` column from being overwritten.
 
 The bundled CSV is a schema and routing example. Its values are not evidence of
 customer approval and must not be treated as a production glossary by default.
+
+### Provider-free TTS corpus replay
+
+This Windows-only calibration first uses an installed SAPI voice and falls back
+to an installed FFmpeg build with the `flite` filter when SAPI cannot render.
+It renders every source term and alias, then feeds the hash-pinned 24 kHz WAV
+frames through the actual test-telephony adapter, relay, glossary control,
+playout, and evidence seams:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\generate-local-eval-corpus.ps1 `
+  -InputCsv .\examples\manufacturing-glossary.csv `
+  -OutputDirectory .\work\tmp\local-eval-corpus `
+  -Language en-US
+
+pnpm local-eval:replay `
+  --manifest .\work\tmp\local-eval-corpus\manifest.json `
+  --source-language en-US `
+  --target-language zh-TW `
+  --output .\work\tmp\local-eval-corpus\replay-report.json
+```
+
+A passing report proves `target_exact` authorization, alert collection,
+canonical source/playout evidence, and test-telephony output. The manifest phrase
+is deliberately injected as the transcript, so it does not prove acoustic STT,
+OpenAI behavior, or the quality of spoken target-language audio.
 
 ## 8. Inspect evidence
 
@@ -228,9 +294,22 @@ authenticated encrypted record. Audio records carry one of `source_a`,
 `source_b`, `playout_to_a`, or `playout_to_b`; event records carry normalized
 session evidence.
 
-The repository does not currently include a decrypt/export CLI or WAV muxer. Use
-the typed `readEncryptedEvidence` API for authorized programmatic inspection.
-With `in_memory`, no evidence file is expected.
+For authorized inspection, use the same evidence key that recorded the session
+and explicitly acknowledge that the destination contains decrypted plaintext:
+
+```powershell
+$env:EVIDENCE_ENCRYPTION_KEY_BASE64 = "<same 32-byte base64 recording key>"
+$input = (Get-ChildItem .\data\evidence\*.evidence.jsonl.enc | Select-Object -First 1).FullName
+pnpm evidence:export -- --input $input --output-dir .\work\tmp\evidence-export --acknowledge-plaintext-export
+```
+
+The exporter authenticates every record before it creates the output directory;
+a wrong key therefore produces no plaintext artifact. A successful export writes
+sanitized `events.jsonl`, one mono WAV per logical track, synchronized
+`four-track.wav` in the documented track order, `export-manifest.json`, and
+`checksums.sha256`. Restrict access to the entire output directory and remove it
+under the approved retention procedure. With `in_memory`, no evidence file is
+expected.
 
 ## 9. Benchmark commands and exact workload
 
@@ -238,7 +317,7 @@ Create the workspace-local output directory and print the encoded workload:
 
 ```powershell
 New-Item -ItemType Directory -Force .\work\tmp | Out-Null
-pnpm benchmark protocol --output .\work\tmp\benchmark-protocol.json
+pnpm run benchmark -- protocol --output .\work\tmp\benchmark-protocol.json
 Get-Content .\work\tmp\benchmark-protocol.json
 ```
 
@@ -264,7 +343,7 @@ and cross-arm pairing key for all 183 runs. Discovery fixtures use
 Run the provider-free mechanism check with:
 
 ```powershell
-pnpm benchmark self-check --output .\work\tmp\benchmark-self-check.json
+pnpm run benchmark -- self-check --output .\work\tmp\benchmark-self-check.json
 Get-Content .\work\tmp\benchmark-self-check.json
 ```
 
@@ -273,12 +352,33 @@ count comes from the 20 candidate-only entries. It performs 36 distinct timed
 binder/reinsertion operations; it does not recycle 20 measurements into 36.
 Those timings are not the frozen semantic result or live acoustic latency.
 
+### Keyless canonical runner
+
+Execute all 183 manifest rows without provider credentials:
+
+```powershell
+pnpm run benchmark -- run-local --artifact-dir .\work\tmp\keyless-benchmark --approved-profile .\work\tmp\healing\approved-profile.json --owner-public-key .\work\tmp\owner-keys\owner-public-key.pem --output .\work\tmp\keyless-summary.json
+Get-Content .\work\tmp\keyless-summary.json
+```
+
+The runner persists a STARTED then terminal marker and a hashed result for every
+run, aggregate JSONL, `score.json`, `bundle.json`, and `checksums.sha256`.
+Hashes and checksums provide only self-consistency and accidental-edit detection
+inside the trusted workspace; they do not prove execution provenance. Treat a local
+PASS as a self-attested trusted-workspace mechanism result.
+
+A correct keyless summary has 41 local mechanism passes, 142 `NOT_RUN`, and zero
+failures. The eight controlled formal cases exercise real glossary bind and
+authorization, including confuser/ordinary non-binding. Local latency,
+interruption, and accelerated virtual soak observations are diagnostic only;
+both provider and product acceptance must remain `NOT_RUN`.
+
 The optional discovery command makes three live OpenAI text translation calls
 for each of the 20 built-in open-data candidate sentences:
 
 ```powershell
 $env:OPENAI_API_KEY = "<server-side OpenAI API key>"
-pnpm benchmark discover --output .\work\tmp\benchmark-discovery.json
+pnpm run benchmark -- discover --output .\work\tmp\benchmark-discovery.json
 ```
 
 Every render, rejected-candidate reason, and provider/model setting remains in
@@ -306,6 +406,42 @@ profile hash and diff hash before an immutable profile hash is created. The
 workflow never changes an active session and cannot auto-approve or hot-swap a
 profile.
 
+### Keyless healing and release rehearsal
+
+For a provider-free proof of the governance path, create the deterministic
+open-data proposal, then supply the exact hashes as an explicit Owner approval:
+
+```powershell
+pnpm run benchmark -- owner-keygen --output-directory .\work\tmp\owner-keys
+pnpm run benchmark -- healing-propose --artifact-dir .\work\tmp\healing
+$proposal = Get-Content .\work\tmp\healing\healing-proposal.json -Raw | ConvertFrom-Json
+pnpm run benchmark -- healing-approve `
+  --artifact-dir .\work\tmp\healing `
+  --proposal .\work\tmp\healing\healing-proposal.json `
+  --owner "<Glossary Owner>" `
+  --approved-at "<ISO-8601 timestamp>" `
+  --base-profile-hash $proposal.proposal.baseProfileHash `
+  --proposed-diff-hash $proposal.proposal.proposedDiffHash `
+  --owner-private-key .\work\tmp\owner-keys\owner-private-key.pem
+pnpm run benchmark -- run-local `
+  --artifact-dir .\work\tmp\keyless-benchmark `
+  --approved-profile .\work\tmp\healing\approved-profile.json `
+  --owner-public-key .\work\tmp\owner-keys\owner-public-key.pem `
+  --output .\work\tmp\keyless-summary.json
+pnpm run benchmark -- release-gate `
+  --artifact-dir .\work\tmp\release `
+  --benchmark-dir .\work\tmp\keyless-benchmark `
+  --approved-profile .\work\tmp\healing\approved-profile.json `
+  --owner-public-key .\work\tmp\owner-keys\owner-public-key.pem
+```
+
+The proposal artifact records minimize, independent reproduction, the generated
+regression, all-regression execution, and the three-surface diff. The release
+gate may report `localPocReleaseVerdict: "PASS"`; provider and product verdicts
+must still be `NOT_RUN`.
+
+The signed profile and release-gate artifacts use trust anchor `operator_supplied_test_key` and keep `customerOwnerAcceptanceVerdict` at `NOT_RUN`; customer owner key provisioning and acceptance remain an external blocker.
+
 ## 10. Troubleshooting
 
 | Symptom | Check |
@@ -314,15 +450,23 @@ profile.
 | QR opens the wrong host | Fix the root-only `PUBLIC_BASE_URL`, restart, and create a new room. Subpaths, credentials, queries, and fragments are rejected. |
 | Operator cannot start | Both participants must click **Start microphone** so both media sockets join and the session becomes ready. |
 | Profile is unavailable | Check `/api/capabilities`. Add `OPENAI_API_KEY` for OpenAI profiles and restart the process. |
-| Session rejects the glossary version | Select `glossary_controlled`; deterministic and native-baseline sessions cannot pin a glossary. |
+| Session rejects the glossary version | Select `glossary_controlled` or `local_eval`; deterministic and native-baseline sessions cannot pin a glossary. |
 | Glossary never binds | Match glossary source/target languages to the desired lane and verify all four required headers. |
+| Room returns `fake-telephony://` grants | `MEDIA_PROFILE=fake_telephony` is an in-process test seam, not a phone link. Use `browser_pair` for two phones or the replay command for keyless transport testing. |
 | No evidence file appears | `in_memory` is intentionally non-persistent. For encrypted evidence, end the room cleanly and check `EVIDENCE_DIRECTORY`. |
 | Phones cannot reach the PC | Verify LAN routing, hostname resolution, inbound firewall access to the configured port, and that `HOST` is `0.0.0.0`. |
 
 ## Acceptance warning
 
-Passing `pnpm test`, the deterministic room, or `benchmark self-check` is not a
-live provider verdict. Do not report OpenAI or Palabra PASS/CONDITIONAL_PASS until
+Passing `pnpm test`, the deterministic room, `benchmark self-check`,
+`benchmark run-local`, or the local release gate is not a live provider verdict.
+Do not report OpenAI or Palabra PASS/CONDITIONAL_PASS until
 the frozen corpus, live audio runs, forced-alignment/human review, interruptions,
 continuous soaks, and evidence-integrity checks have actually completed. No such
 acceptance bundle is included in this repository.
+
+The signed profile and release-gate artifacts identify the trust anchor as
+operator_supplied_test_key and keep customerOwnerAcceptanceVerdict at
+NOT_RUN. A local PASS is therefore only a self-attested trusted-workspace
+mechanism result; customer owner, provider, and product acceptance remain
+NOT_RUN, and customer owner key provisioning remains an external blocker.

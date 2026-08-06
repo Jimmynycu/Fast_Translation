@@ -1,14 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { ServerOptions as HttpsServerOptions } from "node:https";
-import QRCode from "qrcode";
 import { EncryptedFileEvidenceStore } from "./adapters/evidence/encrypted-file.js";
 import { InMemoryEvidenceStore } from "./adapters/evidence/in-memory.js";
 import {
   FileGlossaryRepository,
   GlossaryVersionNotFoundError,
 } from "./adapters/glossary/file-repository.js";
-import { BrowserWebSocketMediaPort } from "./adapters/media/browser-websocket.js";
 import {
   NativeRealtimeTranslateAdapter,
   OpenAILiveTranscribeAdapter,
@@ -17,9 +15,11 @@ import {
 } from "./adapters/openai/index.js";
 import { DeterministicTranslationAdapter } from "./adapters/translation/deterministic.js";
 import { ControlledTranslationAdapter } from "./adapters/translation/glossary-controlled.js";
+import { createLocalEvalTranslationAdapter } from "./adapters/translation/local-eval.js";
 import { TranslationProfileRouter } from "./adapters/translation/profile-router.js";
 import type { AppConfig } from "./config.js";
-import { ModularGuardedDuplexRelay, type EndpointGrantFactory } from "./core/relay.js";
+import type { CompiledGlossary, GlossarySpec } from "./core/glossary.js";
+import { ModularGuardedDuplexRelay } from "./core/relay.js";
 import type {
   EventCursor,
   EvidencePort,
@@ -33,22 +33,26 @@ import type {
   TranslationProfile,
 } from "./core/types.js";
 import {
+  createMediaRuntime,
+  type TelephonyTestDriver,
+} from "./media-runtime.js";
+import {
   createServerApp,
   type EvidenceHealth,
   type GlossaryImportResult,
   type GlossaryRegistry,
 } from "./server/app.js";
+import { createServerAccessControl, withAccessFragment } from "./server/access.js";
 import {
-  createServerAccessControl,
-  withAccessFragment,
-  type ServerAccessControl,
-} from "./server/access.js";
-import type { ImportGlossaryRequest } from "./server/protocol.js";
+  decodeGlossaryContents,
+  type ImportGlossaryRequest,
+} from "./server/protocol.js";
 
 export interface ApplicationComposition {
   readonly app: Awaited<ReturnType<typeof createServerApp>>;
   readonly translationProfiles: readonly TranslationProfile[];
   readonly operatorUrl: string;
+  readonly telephonyTestDriver?: TelephonyTestDriver;
 }
 
 class HealthTrackedEvidence implements EvidencePort {
@@ -140,9 +144,10 @@ export class FileGlossaryRegistry implements GlossaryRegistry {
     this.#now = now;
   }
 
-  async importCsv(request: ImportGlossaryRequest): Promise<GlossaryImportResult> {
+  async importFile(request: ImportGlossaryRequest): Promise<GlossaryImportResult> {
     const id = glossaryId(request.name);
-    const version = glossaryVersion(id, request);
+    const contents = decodeGlossaryContents(request.contentsBase64);
+    const version = glossaryVersion(id, request, contents);
     await this.#repository.import({
       id,
       version,
@@ -152,14 +157,14 @@ export class FileGlossaryRegistry implements GlossaryRegistry {
         approvedBy: request.approvedBy,
         approvedAt: this.#now().toISOString(),
       },
-      fileName: id + ".csv",
-      contents: new TextEncoder().encode(request.csv),
+      fileName: request.fileName,
+      contents,
     });
     const pinned = await this.#repository.pin(id, version);
     return Object.freeze({
       version,
       hash: pinned.hash,
-      spec: pinned.compiled,
+      spec: glossarySpec(pinned.compiled),
     });
   }
 
@@ -167,12 +172,27 @@ export class FileGlossaryRegistry implements GlossaryRegistry {
     const id = glossaryIdFromVersion(version);
     if (id === undefined) return undefined;
     try {
-      return (await this.#repository.pin(id, version)).compiled;
+      return glossarySpec((await this.#repository.pin(id, version)).compiled);
     } catch (error) {
       if (error instanceof GlossaryVersionNotFoundError) return undefined;
       throw error;
     }
   }
+}
+
+function glossarySpec(compiled: CompiledGlossary): GlossarySpec {
+  return Object.freeze({
+    id: compiled.id,
+    version: compiled.version,
+    sourceLanguage: compiled.sourceLanguage,
+    targetLanguage: compiled.targetLanguage,
+    entries: Object.freeze(compiled.entries.map((entry) => Object.freeze({
+      id: entry.id,
+      source: entry.source,
+      aliases: Object.freeze([...entry.aliases]),
+      targetExact: entry.targetExact,
+    }))),
+  });
 }
 
 function glossaryId(name: string): string {
@@ -186,7 +206,11 @@ function glossaryId(name: string): string {
   return (stem.length === 0 ? "glossary" : stem) + "-" + digest.slice(0, 12);
 }
 
-function glossaryVersion(id: string, request: ImportGlossaryRequest): string {
+function glossaryVersion(
+  id: string,
+  request: ImportGlossaryRequest,
+  contents: Uint8Array,
+): string {
   const digest = createHash("sha256")
     .update(request.sourceLanguage.normalize("NFKC").trim(), "utf8")
     .update("\0", "utf8")
@@ -194,7 +218,9 @@ function glossaryVersion(id: string, request: ImportGlossaryRequest): string {
     .update("\0", "utf8")
     .update(request.approvedBy.normalize("NFKC").trim(), "utf8")
     .update("\0", "utf8")
-    .update(request.csv, "utf8")
+    .update(request.fileName.normalize("NFKC").trim(), "utf8")
+    .update("\0", "utf8")
+    .update(contents)
     .digest("hex");
   return id + "." + digest;
 }
@@ -208,6 +234,14 @@ function glossaryIdFromVersion(version: string): string | undefined {
 function translationRouter(config: AppConfig): TranslationProfileRouter {
   const profiles = new Map<TranslationProfile, TranslationPort>([
     ["deterministic_test", new DeterministicTranslationAdapter()],
+    ["local_eval", createLocalEvalTranslationAdapter({
+      transcriptByLane: {
+        A_TO_B: config.localEvalTranscriptAToB,
+        B_TO_A: config.localEvalTranscriptBToA,
+      },
+      confidence: config.localEvalConfidence,
+      translationMode: config.localEvalTranslationMode,
+    })],
   ]);
 
   if (config.openaiApiKey !== undefined) {
@@ -266,47 +300,6 @@ function evidencePort(config: AppConfig): HealthTrackedEvidence {
   );
 }
 
-function endpointGrantFactory(
-  publicBaseUrl: URL,
-  access: ServerAccessControl,
-): EndpointGrantFactory {
-  if (
-    (publicBaseUrl.protocol !== "http:" && publicBaseUrl.protocol !== "https:") ||
-    publicBaseUrl.pathname !== "/" ||
-    publicBaseUrl.search !== "" ||
-    publicBaseUrl.hash !== "" ||
-    publicBaseUrl.username !== "" ||
-    publicBaseUrl.password !== ""
-  ) {
-    throw new TypeError(
-      "PUBLIC_BASE_URL must be an HTTP(S) origin without a path, query, credentials, or fragment",
-    );
-  }
-  return async (sessionId, side) => {
-    const participantUrl = new URL(publicBaseUrl);
-    participantUrl.hash = "";
-    participantUrl.search = "";
-    participantUrl.searchParams.set("role", "participant");
-    participantUrl.searchParams.set("sessionId", sessionId);
-    participantUrl.searchParams.set("side", side);
-    const url = withAccessFragment(
-      participantUrl,
-      access.issueParticipantAccess(sessionId, side),
-    ).toString();
-    const qrDataUrl = await QRCode.toDataURL(url, {
-      errorCorrectionLevel: "M",
-      margin: 1,
-      width: 256,
-    });
-    return {
-      kind: "browser_link",
-      side,
-      url,
-      qrDataUrl,
-    };
-  };
-}
-
 async function httpsOptions(config: AppConfig): Promise<HttpsServerOptions | undefined> {
   if (config.tlsCertPath === undefined && config.tlsKeyPath === undefined) {
     return undefined;
@@ -322,33 +315,34 @@ async function httpsOptions(config: AppConfig): Promise<HttpsServerOptions | und
 }
 
 export async function composeApplication(config: AppConfig): Promise<ApplicationComposition> {
-  if (config.mediaProfile !== "browser_pair") {
-    throw new TypeError(
-      "Media profile " + config.mediaProfile + " cannot be served by the browser application",
-    );
-  }
-
   const access = createServerAccessControl({
     operatorToken: config.operatorToken,
   });
-  const media = new BrowserWebSocketMediaPort();
+  const media = createMediaRuntime({
+    profile: config.mediaProfile,
+    publicBaseUrl: config.publicBaseUrl,
+    access,
+  });
   const translation = translationRouter(config);
   const evidence = evidencePort(config);
   const glossaries = new FileGlossaryRegistry(
     new FileGlossaryRepository({ directory: config.glossaryDirectory }),
   );
   const relay = new ManagedRelay(new ModularGuardedDuplexRelay({
-    media,
+    media: media.port,
     translation,
     evidence,
-    endpointGrant: endpointGrantFactory(config.publicBaseUrl, access),
+    endpointGrant: media.endpointGrant,
   }));
   const translationProfiles = translation.available();
   const https = await httpsOptions(config);
   const app = await createServerApp({
     relay,
     glossaries,
-    browserMedia: media,
+    mediaProfile: media.profile,
+    ...(media.browserGateway === undefined
+      ? {}
+      : { browserMedia: media.browserGateway }),
     logger: {
       level: config.logLevel,
       redact: {
@@ -368,5 +362,12 @@ export async function composeApplication(config: AppConfig): Promise<Application
     config.operatorToken,
   ).toString();
 
-  return Object.freeze({ app, translationProfiles, operatorUrl });
+  return Object.freeze({
+    app,
+    translationProfiles,
+    operatorUrl,
+    ...(media.telephonyTestDriver === undefined
+      ? {}
+      : { telephonyTestDriver: media.telephonyTestDriver }),
+  });
 }

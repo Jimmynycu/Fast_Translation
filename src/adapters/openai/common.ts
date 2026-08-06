@@ -7,16 +7,19 @@ export type OpenAIAdapterErrorCode =
   | "invalid_input"
   | "invalid_response"
   | "provider_error"
-  | "request_failed";
+  | "request_failed"
+  | "timeout";
 
 /** A deliberately small, provider-neutral error safe to show outside the adapter. */
 export class OpenAIAdapterError extends Error {
   readonly code: OpenAIAdapterErrorCode;
+  readonly retryable: boolean;
 
-  constructor(code: OpenAIAdapterErrorCode, message: string) {
+  constructor(code: OpenAIAdapterErrorCode, message: string, retryable = false) {
     super(message);
     this.name = "OpenAIAdapterError";
     this.code = code;
+    this.retryable = retryable;
   }
 }
 
@@ -173,6 +176,96 @@ export function abortedError(): OpenAIAdapterError {
   return new OpenAIAdapterError("aborted", "The OpenAI operation was cancelled.");
 }
 
+export function timeoutError(message: string): OpenAIAdapterError {
+  return new OpenAIAdapterError("timeout", message, true);
+}
+
+export function resolveTimeoutMs(
+  value: number | undefined,
+  fallback: number,
+  label: string,
+): number {
+  const timeoutMs = value ?? fallback;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > 2_147_483_647
+  ) {
+    throw new OpenAIAdapterError(
+      "configuration_error",
+      label + " must be a positive whole number of milliseconds.",
+    );
+  }
+  return timeoutMs;
+}
+
+interface DeadlineOptions {
+  readonly timeoutMs: number;
+  readonly timeoutMessage: string;
+  readonly signal?: AbortSignal;
+}
+
+type OperationOutcome<T> =
+  | Readonly<{ readonly status: "fulfilled"; readonly value: T }>
+  | Readonly<{ readonly status: "rejected"; readonly error: unknown }>
+  | Readonly<{ readonly status: "stopped" }>;
+
+export async function runWithDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: DeadlineOptions,
+): Promise<T> {
+  if (options.signal?.aborted === true) throw abortedError();
+
+  const controller = new AbortController();
+  let stopReason: "aborted" | "timeout" | undefined;
+  let wake: (() => void) | undefined;
+  const stopped = new Promise<void>((resolve) => {
+    wake = resolve;
+  });
+  const stop = (reason: "aborted" | "timeout"): void => {
+    if (stopReason !== undefined) return;
+    stopReason = reason;
+    controller.abort(
+      reason === "timeout"
+        ? timeoutError(options.timeoutMessage)
+        : options.signal?.reason,
+    );
+    wake?.();
+  };
+  const timer = setTimeout(() => stop("timeout"), options.timeoutMs);
+  const onAbort = (): void => stop("aborted");
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+
+  const result: Promise<OperationOutcome<T>> = Promise.resolve()
+    .then(() => operation(controller.signal))
+    .then(
+      (value): OperationOutcome<T> => ({ status: "fulfilled", value }),
+      (error: unknown): OperationOutcome<T> => ({ status: "rejected", error }),
+    );
+
+  try {
+    const outcome = await Promise.race<OperationOutcome<T>>([
+      result,
+      stopped.then(() => ({ status: "stopped" })),
+    ]);
+    if (stopReason === "timeout") {
+      throw timeoutError(options.timeoutMessage);
+    }
+    if (stopReason === "aborted") throw abortedError();
+    if (outcome.status === "rejected") throw outcome.error;
+    if (outcome.status === "stopped") {
+      throw new OpenAIAdapterError(
+        "request_failed",
+        "The OpenAI operation stopped unexpectedly.",
+      );
+    }
+    return outcome.value;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 export class AsyncQueue<T> implements AsyncIterable<T> {
   readonly #values: T[] = [];
   readonly #waiters: Array<{
@@ -227,44 +320,50 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
 export async function waitForOpen(
   socket: WebSocketLike,
   signal: AbortSignal,
+  timeoutMs: number,
 ): Promise<void> {
   if (signal.aborted) throw abortedError();
   if (socket.readyState === 1) return;
 
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const finish = (callback: () => void): void => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", onAbort);
-      callback();
-    };
-    const onAbort = (): void => {
-      closeSocket(socket);
-      finish(() => reject(abortedError()));
-    };
+  await runWithDeadline(
+    async (stageSignal) =>
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (callback: () => void): void => {
+          if (settled) return;
+          settled = true;
+          stageSignal.removeEventListener("abort", onAbort);
+          callback();
+        };
+        const onAbort = (): void => finish(() => reject(abortedError()));
 
-    signal.addEventListener("abort", onAbort, { once: true });
-    socket.on("open", () => finish(resolve));
-    socket.on("error", () =>
-      finish(() =>
-        reject(
-          new OpenAIAdapterError(
-            "connection_failed",
-            "The OpenAI realtime connection could not be established.",
+        stageSignal.addEventListener("abort", onAbort, { once: true });
+        socket.on("open", () => finish(resolve));
+        socket.on("error", () =>
+          finish(() =>
+            reject(
+              new OpenAIAdapterError(
+                "connection_failed",
+                "The OpenAI realtime connection could not be established.",
+              ),
+            ),
           ),
-        ),
-      ),
-    );
-    socket.on("close", () =>
-      finish(() =>
-        reject(
-          new OpenAIAdapterError(
-            "connection_failed",
-            "The OpenAI realtime connection closed before it was ready.",
+        );
+        socket.on("close", () =>
+          finish(() =>
+            reject(
+              new OpenAIAdapterError(
+                "connection_failed",
+                "The OpenAI realtime connection closed before it was ready.",
+              ),
+            ),
           ),
-        ),
-      ),
-    );
-  });
+        );
+      }),
+    {
+      signal,
+      timeoutMs,
+      timeoutMessage: "The OpenAI realtime connection timed out.",
+    },
+  );
 }

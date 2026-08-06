@@ -15,8 +15,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build:test && node --test --test-isolation=none \"dist-test/tests/*.test.js\"",
     "test:watch": "pnpm build:test && node --test --test-isolation=none --watch \"dist-test/tests/*.test.js\"",
+    "test:browser": "pnpm build:test && node scripts/run-browser-e2e.mjs",
     "keygen": "node scripts/generate-evidence-key.mjs",
-    "benchmark": "pnpm build && node --env-file-if-exists=.env dist/src/benchmark/cli.js"
+    "benchmark": "pnpm build && node --env-file-if-exists=.env dist/src/benchmark/cli.js",
+    "evidence:export": "pnpm build && node --env-file-if-exists=.env scripts/export-evidence.mjs",
+    "local-eval:replay": "pnpm build && node dist/src/local-eval/cli.js"
   },
   "dependencies": {
     "@fastify/static": "^10.1.2",
@@ -32,6 +35,7 @@
     "@types/node": "^26.1.2",
     "@types/qrcode": "^1.5.6",
     "@types/ws": "^8.18.1",
+    "playwright-core": "1.62.1",
     "typescript": "^7.0.2"
   }
 }

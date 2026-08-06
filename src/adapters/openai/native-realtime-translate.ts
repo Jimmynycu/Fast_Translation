@@ -1,4 +1,4 @@
-import { CANONICAL_AUDIO, createAudioFrame } from "../../core/audio.js";
+import { CANONICAL_AUDIO, createAudioFrame, type AudioFrame } from "../../core/audio.js";
 import type {
   GenerationRef,
   TranslationErrorEvent,
@@ -17,6 +17,7 @@ import {
   OpenAIAdapterError,
   parseJsonObject,
   requireApiKey,
+  resolveTimeoutMs,
   sendJson,
   stringField,
   waitForOpen,
@@ -26,6 +27,8 @@ import {
 
 const DEFAULT_TRANSLATION_URL =
   "wss://api.openai.com/v1/realtime/translations";
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_CLOSE_TIMEOUT_MS = 10_000;
 
 export interface NativeRealtimeTranslateAdapterOptions {
   readonly apiKey: string;
@@ -35,6 +38,8 @@ export interface NativeRealtimeTranslateAdapterOptions {
   readonly inputTranscriptionModel?: string | null;
   readonly noiseReduction?: "near_field" | "far_field" | null;
   readonly now?: () => number;
+  readonly connectTimeoutMs?: number;
+  readonly closeTimeoutMs?: number;
 }
 
 interface ActiveTranslation {
@@ -49,6 +54,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
   readonly #inputTranscriptionModel: string | null;
   readonly #noiseReduction: "near_field" | "far_field" | null;
   readonly #now: () => number;
+  readonly #connectTimeoutMs: number;
+  readonly #closeTimeoutMs: number;
   readonly #active = new Map<string, ActiveTranslation>();
 
   constructor(options: NativeRealtimeTranslateAdapterOptions) {
@@ -63,6 +70,16 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         : options.inputTranscriptionModel;
     this.#noiseReduction = options.noiseReduction ?? null;
     this.#now = options.now ?? (() => performance.now());
+    this.#connectTimeoutMs = resolveTimeoutMs(
+      options.connectTimeoutMs,
+      DEFAULT_CONNECT_TIMEOUT_MS,
+      "OpenAI realtime connectTimeoutMs",
+    );
+    this.#closeTimeoutMs = resolveTimeoutMs(
+      options.closeTimeoutMs,
+      DEFAULT_CLOSE_TIMEOUT_MS,
+      "OpenAI realtime closeTimeoutMs",
+    );
   }
 
   async *translate(
@@ -95,8 +112,46 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     const events = new AsyncQueue<TranslationEvent>();
     let lifecycle: "active" | "intentional" | "failed" | "completed" = "active";
     let providerCloseRequested = false;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
     let outputSequence = 0;
     let pendingAudio = new Uint8Array(0);
+    let inputStopRequested = false;
+    let inputReturnRequested = false;
+    let inputIterator: AsyncIterator<AudioFrame> | undefined;
+    let wakeInputStop: (() => void) | undefined;
+    const inputStopped = new Promise<void>((resolve) => {
+      wakeInputStop = resolve;
+    });
+    const returnInputIterator = (iterator: AsyncIterator<AudioFrame>): void => {
+      if (inputIterator === iterator) inputIterator = undefined;
+      if (inputReturnRequested) return;
+      inputReturnRequested = true;
+      try {
+        void Promise.resolve(iterator.return?.()).catch(() => undefined);
+      } catch {
+        // Upstream iterator cleanup is best effort.
+      }
+    };
+    const registerInputIterator = (iterator: AsyncIterator<AudioFrame>): void => {
+      inputIterator = iterator;
+      if (inputStopRequested) returnInputIterator(iterator);
+    };
+    const releaseInputIterator = (iterator: AsyncIterator<AudioFrame>): void => {
+      if (inputIterator === iterator) inputIterator = undefined;
+    };
+    const stopInput = (): void => {
+      if (inputStopRequested) return;
+      inputStopRequested = true;
+      wakeInputStop?.();
+      const iterator = inputIterator;
+      if (iterator !== undefined) returnInputIterator(iterator);
+    };
+
+    const clearCloseDeadline = (): void => {
+      if (closeTimer === undefined) return;
+      clearTimeout(closeTimer);
+      closeTimer = undefined;
+    };
 
     const emitAudioFrame = (pcm16le: Uint8Array, emittedAtMs: number): void => {
       events.push({
@@ -153,6 +208,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
 
     const complete = (): void => {
       if (lifecycle !== "active") return;
+      clearCloseDeadline();
       finishAudio();
       lifecycle = "completed";
       events.push({
@@ -167,6 +223,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
 
     const stop = (): void => {
       if (lifecycle !== "active") return;
+      stopInput();
+      clearCloseDeadline();
       lifecycle = "intentional";
       events.end();
       closeSocket(socket);
@@ -179,6 +237,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       closeTransport = true,
     ): void => {
       if (lifecycle !== "active") return;
+      stopInput();
+      clearCloseDeadline();
       lifecycle = "failed";
       events.push(this.#errorEvent(ref, code, message, retryable));
       events.end();
@@ -301,7 +361,12 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     socket.on("close", () => {
       if (lifecycle !== "active") return;
       if (providerCloseRequested) {
-        complete();
+        fail(
+          "OPENAI_REALTIME_CONNECTION",
+          "The translation service closed before acknowledging session close.",
+          true,
+          false,
+        );
         return;
       }
       fail(
@@ -313,7 +378,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     });
 
     try {
-      await waitForOpen(socket, request.signal);
+      await waitForOpen(socket, request.signal, this.#connectTimeoutMs);
       sendJson(socket, {
         type: "session.update",
         session: {
@@ -333,7 +398,16 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         },
       });
 
-      void this.#pumpInput(request, socket, events)
+      void this.#pumpInput(
+        request,
+        socket,
+        events,
+        inputStopped,
+        () => inputStopRequested,
+        registerInputIterator,
+        releaseInputIterator,
+        returnInputIterator,
+      )
         .then(() => {
           if (request.signal.aborted) {
             stop();
@@ -341,6 +415,15 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
           }
           if (lifecycle !== "active") return;
           providerCloseRequested = true;
+          closeTimer = setTimeout(
+            () =>
+              fail(
+                "OPENAI_REALTIME_CLOSE_TIMEOUT",
+                "The translation service timed out while closing the session.",
+                true,
+              ),
+            this.#closeTimeoutMs,
+          );
           sendJson(socket, { type: "session.close" });
         })
         .catch(() => {
@@ -354,11 +437,17 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       for await (const event of events) yield event;
     } catch (error) {
       if (!request.signal.aborted) {
+        const timedOut =
+          error instanceof OpenAIAdapterError && error.code === "timeout";
         fail(
-          error instanceof OpenAIAdapterError
-            ? "OPENAI_REALTIME_CONNECTION"
-            : "OPENAI_REALTIME_UNKNOWN",
-          "The translation service connection failed.",
+          timedOut
+            ? "OPENAI_REALTIME_CONNECT_TIMEOUT"
+            : error instanceof OpenAIAdapterError
+              ? "OPENAI_REALTIME_CONNECTION"
+              : "OPENAI_REALTIME_UNKNOWN",
+          timedOut
+            ? "The translation service connection timed out."
+            : "The translation service connection failed.",
           true,
         );
         for await (const event of events) yield event;
@@ -382,53 +471,87 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     request: TranslationRequest,
     socket: WebSocketLike,
     events: AsyncQueue<TranslationEvent>,
+    stopPromise: Promise<void>,
+    isStopped: () => boolean,
+    registerIterator: (iterator: AsyncIterator<AudioFrame>) => void,
+    releaseIterator: (iterator: AsyncIterator<AudioFrame>) => void,
+    returnIterator: (iterator: AsyncIterator<AudioFrame>) => void,
   ): Promise<void> {
-    for await (const frame of request.frames) {
-      if (request.signal.aborted) return;
-      if (
-        frame.sessionId !== request.context.sessionId ||
-        frame.lane !== request.context.lane ||
-        frame.generation !== request.context.generation
-      ) {
-        events.push(
-          this.#errorEvent(
-            request.context,
-            "OPENAI_REALTIME_GENERATION_MISMATCH",
-            "An audio frame did not belong to the active translation generation.",
-            false,
-          ),
-        );
-        throw new OpenAIAdapterError(
-          "invalid_input",
-          "Audio generation mismatch.",
-        );
+    if (request.signal.aborted || isStopped()) return;
+
+    const iterator = request.frames[Symbol.asyncIterator]();
+    registerIterator(iterator);
+    let naturallyDone = false;
+    try {
+      while (!request.signal.aborted && !isStopped()) {
+        const next = await Promise.race<
+          | Readonly<{
+              readonly type: "frame";
+              readonly result: IteratorResult<AudioFrame>;
+            }>
+          | Readonly<{ readonly type: "stopped" }>
+        >([
+          Promise.resolve(iterator.next()).then((result) => ({
+            type: "frame" as const,
+            result,
+          })),
+          stopPromise.then(() => ({ type: "stopped" as const })),
+        ]);
+        if (next.type === "stopped") return;
+        if (next.result.done) {
+          naturallyDone = true;
+          return;
+        }
+        if (request.signal.aborted || isStopped()) return;
+        const frame = next.result.value;
+        if (
+          frame.sessionId !== request.context.sessionId ||
+          frame.lane !== request.context.lane ||
+          frame.generation !== request.context.generation
+        ) {
+          events.push(
+            this.#errorEvent(
+              request.context,
+              "OPENAI_REALTIME_GENERATION_MISMATCH",
+              "An audio frame did not belong to the active translation generation.",
+              false,
+            ),
+          );
+          throw new OpenAIAdapterError(
+            "invalid_input",
+            "Audio generation mismatch.",
+          );
+        }
+        if (
+          frame.pcm16le.byteLength !== CANONICAL_AUDIO.bytesPerFrame ||
+          frame.format.encoding !== CANONICAL_AUDIO.encoding ||
+          frame.format.sampleRateHz !== CANONICAL_AUDIO.sampleRateHz ||
+          frame.format.channels !== CANONICAL_AUDIO.channels
+        ) {
+          events.push(
+            this.#errorEvent(
+              request.context,
+              "OPENAI_REALTIME_AUDIO_FORMAT",
+              "An audio frame was not canonical 24 kHz mono PCM16.",
+              false,
+            ),
+          );
+          throw new OpenAIAdapterError(
+            "invalid_input",
+            "Unsupported audio format.",
+          );
+        }
+        if (request.signal.aborted || isStopped()) return;
+        sendJson(socket, {
+          type: "session.input_audio_buffer.append",
+          audio: encodePcm16(frame.pcm16le),
+        });
       }
-      if (
-        frame.pcm16le.byteLength !== CANONICAL_AUDIO.bytesPerFrame ||
-        frame.format.encoding !== CANONICAL_AUDIO.encoding ||
-        frame.format.sampleRateHz !== CANONICAL_AUDIO.sampleRateHz ||
-        frame.format.channels !== CANONICAL_AUDIO.channels
-      ) {
-        events.push(
-          this.#errorEvent(
-            request.context,
-            "OPENAI_REALTIME_AUDIO_FORMAT",
-            "An audio frame was not canonical 24 kHz mono PCM16.",
-            false,
-          ),
-        );
-        throw new OpenAIAdapterError(
-          "invalid_input",
-          "Unsupported audio format.",
-        );
-      }
-      sendJson(socket, {
-        type: "session.input_audio_buffer.append",
-        audio: encodePcm16(frame.pcm16le),
-      });
+    } finally {
+      if (naturallyDone) releaseIterator(iterator);
+      else returnIterator(iterator);
     }
   }
-
   #errorEvent(
     ref: GenerationRef,
     code: string,

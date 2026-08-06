@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { z } from "zod";
+import { MEDIA_PROFILES, type MediaProfile } from "./core/types.js";
 
 const optionalSecret = z.preprocess(
   (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
@@ -26,9 +27,15 @@ const environmentSchema = z
     OPENAI_TEXT_MODEL: z.string().min(1).default("gpt-5.4-mini"),
     OPENAI_TTS_MODEL: z.string().min(1).default("gpt-4o-mini-tts"),
     OPENAI_TTS_VOICE: z.string().min(1).default("marin"),
-    MEDIA_PROFILE: z.enum(["browser_pair", "fake_telephony"]).default("browser_pair"),
+    LOCAL_EVAL_TRANSCRIPT_A_TO_B: z.string().trim().min(1).max(4_096)
+      .default("Verify the mistake proofing fixture."),
+    LOCAL_EVAL_TRANSCRIPT_B_TO_A: z.string().trim().min(1).max(4_096)
+      .default("請確認防呆治具。"),
+    LOCAL_EVAL_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.99),
+    LOCAL_EVAL_TRANSLATION_MODE: z.enum(["preserve", "drop_placeholders"]).default("preserve"),
+    MEDIA_PROFILE: z.enum(MEDIA_PROFILES).default("browser_pair"),
     TRANSLATION_PROFILE: z
-      .enum(["native_live_baseline", "glossary_controlled", "deterministic_test"])
+      .enum(["native_live_baseline", "glossary_controlled", "local_eval", "deterministic_test"])
       .default("glossary_controlled"),
     EVIDENCE_PROFILE: z.enum(["encrypted_local", "in_memory"]).default("encrypted_local"),
     EVIDENCE_DIRECTORY: z.string().min(1).default("./data/evidence"),
@@ -45,7 +52,11 @@ const environmentSchema = z
       });
     }
 
-    if (value.TRANSLATION_PROFILE !== "deterministic_test" && value.OPENAI_API_KEY === undefined) {
+    if (
+      (value.TRANSLATION_PROFILE === "native_live_baseline" ||
+        value.TRANSLATION_PROFILE === "glossary_controlled") &&
+      value.OPENAI_API_KEY === undefined
+    ) {
       context.addIssue({
         code: "custom",
         path: ["OPENAI_API_KEY"],
@@ -91,8 +102,12 @@ export type AppConfig = Readonly<{
   openaiTextModel: string;
   openaiTtsModel: string;
   openaiTtsVoice: string;
-  mediaProfile: "browser_pair" | "fake_telephony";
-  translationProfile: "native_live_baseline" | "glossary_controlled" | "deterministic_test";
+  localEvalTranscriptAToB: string;
+  localEvalTranscriptBToA: string;
+  localEvalConfidence: number;
+  localEvalTranslationMode: "preserve" | "drop_placeholders";
+  mediaProfile: MediaProfile;
+  translationProfile: "native_live_baseline" | "glossary_controlled" | "local_eval" | "deterministic_test";
   evidenceProfile: "encrypted_local" | "in_memory";
   evidenceDirectory: string;
   glossaryDirectory: string;
@@ -118,6 +133,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv, cwd = process.cwd()):
     openaiTextModel: parsed.OPENAI_TEXT_MODEL,
     openaiTtsModel: parsed.OPENAI_TTS_MODEL,
     openaiTtsVoice: parsed.OPENAI_TTS_VOICE,
+    localEvalTranscriptAToB: parsed.LOCAL_EVAL_TRANSCRIPT_A_TO_B,
+    localEvalTranscriptBToA: parsed.LOCAL_EVAL_TRANSCRIPT_B_TO_A,
+    localEvalConfidence: parsed.LOCAL_EVAL_CONFIDENCE,
+    localEvalTranslationMode: parsed.LOCAL_EVAL_TRANSLATION_MODE,
     mediaProfile: parsed.MEDIA_PROFILE,
     translationProfile: parsed.TRANSLATION_PROFILE,
     evidenceProfile: parsed.EVIDENCE_PROFILE,

@@ -29,10 +29,17 @@ This is not a carrier call. A phone is an ordinary browser endpoint. There is no
 PSTN/SIP number, inbound ring, IVR, AI greeting, DTMF, or automated language
 question in the current implementation.
 
+`createMediaRuntime` is the composition seam. `MEDIA_PROFILE=browser_pair`
+builds the browser WebSocket port and signed QR grants.
+`MEDIA_PROFILE=fake_telephony` instead builds the in-process G.711 mu-law test
+port, returns `fake-telephony://` grants, exposes a test driver, and omits the
+browser media route. Capabilities advertise only the active profile. The fake
+profile is executable but is not a live carrier.
+
 The direct-start rule is enforced by the room lifecycle: the operator creates a
-room, both browser participants connect their microphones, the Harness becomes
-ready, and the operator sends the `start` command. No conversational agent sits
-in front of either human.
+room, both participants connect through the selected media adapter, the Harness
+becomes ready, and the operator sends the `start` command. No conversational
+agent sits in front of either human.
 
 ## Central Harness responsibilities
 
@@ -50,10 +57,10 @@ in front of either human.
   flush during graceful `SIGINT`/`SIGTERM` shutdown.
 
 Fastify provides the static operator/participant UI, JSON API, event WebSocket,
-and media WebSockets. Provider details remain behind `TranslationPort`. Browser
-wire details remain behind `MediaPort`. Evidence storage remains behind
-`EvidencePort`. The core does not consume raw OpenAI, future carrier, or browser
-protocol events.
+and, for `browser_pair`, media WebSockets. Provider details remain behind
+`TranslationPort`; browser and test-telephony details remain behind `MediaPort`.
+Evidence storage remains behind `EvidencePort`. The core does not consume raw
+OpenAI, future carrier, or browser protocol events.
 
 ## Audio and duplex flow
 
@@ -101,20 +108,25 @@ records. `encrypted_local` encrypts each JSONL record independently with
 AES-256-GCM and uses a SHA-256 digest of the session ID as the filename.
 `in_memory` retains bounded cloned records only for the current process.
 
-"Four-track recording" currently means four labeled PCM frame streams in the
-evidence record. It does not mean that the server exports four WAV files, and the
-repository does not yet ship an evidence decrypt/export CLI. Evidence writes are
-bounded and fail open: an evidence problem is surfaced as a health alert without
-blocking live media.
+The runtime boundary remains four labeled PCM frame streams inside encrypted
+evidence. The separate authorized exporter authenticates every record before
+writing plaintext, aligns all tracks to a common capture origin, and emits four
+mono WAVs plus one interleaved four-channel WAV in the table order. It also emits
+sanitized events, a hash-pinned manifest, and checksums. Export requires the
+recording key plus an explicit plaintext acknowledgement. Live evidence writes
+remain bounded and fail open: an evidence problem is surfaced as a health alert
+without blocking media.
 
 ## Translation profiles
 
-The composition root always registers `deterministic_test`. If and only if
-`OPENAI_API_KEY` is present, it also registers both OpenAI-backed profiles:
+The composition root always registers `deterministic_test` and `local_eval`.
+If and only if `OPENAI_API_KEY` is present, it also registers both OpenAI-backed
+profiles:
 
 | Profile | Implementation |
 |---|---|
 | `deterministic_test` | Emits deterministic labels and returns input audio through the correct opposite-side route. It exercises the Harness but performs no language translation. |
+| `local_eval` | Accepts canonical input frames, injects declared lane transcripts, runs the same glossary binding/authorization and alert path, and emits deterministic canonical PCM. It proves Harness behavior, not acoustic STT or provider TTS. |
 | `native_live_baseline` | Connects server-side to the dedicated OpenAI realtime translation adapter and streams normalized translation events into the Harness. |
 | `glossary_controlled` | Composes live transcription, server-side text translation, glossary binding/authorization, and TTS. |
 
@@ -133,9 +145,9 @@ best available text when control or a provider fails; continuity is not a claim
 that terminology acceptance passed.
 
 The `TRANSLATION_PROFILE` environment variable participates in startup
-validation. A no-key process must set it to `deterministic_test`. The API reports
-the actually registered profiles and rejects a session request for an unavailable
-profile.
+validation. A no-key process can select `deterministic_test` or `local_eval`.
+The API reports the actually registered profiles and rejects a session request
+for an unavailable profile.
 
 ## Glossary boundary
 
@@ -143,8 +155,8 @@ There are two intentionally different import surfaces:
 
 | Surface | Current capability |
 |---|---|
-| Browser UI and `POST /api/glossaries` | UTF-8 CSV only. The request supplies a name, source language, target language, customer approver, and CSV text. The server derives repository identity/version metadata and stamps the approval time. |
-| `FileGlossaryRepository` | CSV or XLSX bytes, explicit identity/version/languages/approval metadata, immutable create-only persistence, conflict detection, hash verification, and version pinning. |
+| Browser UI and `POST /api/glossaries` | CSV or XLSX bytes carried as bounded canonical base64, plus filename, name, source language, target language, and customer approver. The server derives repository identity/version metadata and stamps the approval time. |
+| `FileGlossaryRepository` | CSV or XLSX parsing, explicit identity/version/languages/approval metadata, immutable create-only persistence, conflict detection, hash verification, and version pinning. |
 
 Both file formats use the required columns `id`, `source`, `aliases`, and
 `target_exact`. A session pins the returned immutable version; it never follows a
@@ -155,12 +167,14 @@ session. The Harness compiles both directions: the approved `source` ->
 not guessed as reverse aliases. Import compiles both directions up front and
 rejects duplicate or ambiguous reverse terms before storing the version.
 
-`glossaryVersion` is valid only when the session profile is
-`glossary_controlled`; the HTTP API rejects it for `deterministic_test` and
-`native_live_baseline` instead of advertising a glossary that those paths ignore.
+`glossaryVersion` is valid when the session profile is
+`glossary_controlled` or `local_eval`; the HTTP API rejects it for
+`deterministic_test` and `native_live_baseline` instead of advertising a
+glossary that those paths ignore.
 
-XLSX support therefore exists at the repository boundary but is not advertised
-by `/api/capabilities` and is not accepted by the current browser file picker.
+Both CSV and XLSX are advertised by `/api/capabilities` and accepted by the
+browser picker. Header names are normalized before mapping; duplicate normalized
+names are rejected before a row object can overwrite an approved value.
 
 ## TLS and credential path
 
@@ -195,31 +209,43 @@ glossary files, or evidence. `.env.example` documents the variables; the `pnpm
 dev`, `pnpm start`, and `pnpm benchmark` scripts load an optional repository-root
 `.env` through Node's `--env-file-if-exists` flag.
 
-## Future phone adapter
+## Media composition seam and future carrier
 
 The core depends on the `MediaPort` contract rather than browser or carrier
-types. A future Twilio Media Streams, SIP/RTP, or PBX adapter belongs in
-`src/adapters/media` and is selected in the composition root by configuration.
-The session core, translation profiles, glossary control, and evidence contract
-should not change.
+types. `createMediaRuntime` currently selects either the browser WebSocket
+adapter or the in-process fake-telephony adapter from one `MEDIA_PROFILE`
+value. The relay, translation profiles, glossary control, and evidence contract
+do not change.
 
-The repository includes an 8 kHz G.711 mu-law codec and a fake telephony adapter
-for contract tests. They are not a live carrier integration. Future production
-phone work must also preserve the product rule: ring/connect the two humans
-directly, with no AI greeting or IVR before the human conversation.
+The fake adapter converts 8 kHz G.711 mu-law to canonical PCM and back. Its
+test-only driver is exposed by `ApplicationComposition` only in that profile,
+so integration tests can connect both sides, signal speech, inject numbered
+frames, and inspect output. It is not a live carrier integration.
+
+A future Twilio Media Streams, SIP/RTP, or PBX adapter belongs at this seam.
+Production phone work must preserve the product rule: ring/connect the two
+humans directly, with no AI greeting or IVR before the human conversation.
 
 ## Evidence boundary and known gaps
 
 - Contract and unit tests use local fakes for provider sockets and HTTP calls.
-- The benchmark self-check is deterministic and explicitly reports
-  `acceptanceVerdict: "NOT_RUN"`.
+- The self-check and keyless runner are deterministic; provider and product
+  acceptance verdicts remain `NOT_RUN`.
+- The local TTS corpus replay hash-validates generated WAVs and exercises
+  mu-law conversion, fake telephony, relay, glossary control, playout, and
+  evidence. It injects manifest text as the transcript and therefore makes no
+  acoustic STT or natural target-speech claim.
+- The keyless runner executes the controlled arm's eight formal cases, twelve
+  local-processing latency cases, twenty interruption state-machine cases, and
+  one accelerated 10-minute virtual soak, with persistent markers and results.
+- Those observations do not include STT, provider translation, TTS, acoustic
+  playback latency, forced alignment, or human review.
 - The discovery command can call the OpenAI text endpoint, but it is not a live
   speech-to-speech acceptance run.
 - No Palabra runtime adapter or automated Palabra runner is implemented.
-- The 24-case formal terminology corpus, 36 live latency runs, 20 interruptions
-  per arm, and 10-minute soak per arm are not yet executed by the benchmark CLI.
-- TLS certificate issuance, phone trust enrollment, LAN DNS, and firewall setup
-  remain operator responsibilities.
+- A workspace-local helper issues disposable LAN test certificates; installing
+  its CA on each phone, LAN DNS/routing, and firewall setup remain operator
+  responsibilities.
 - Evidence is not a substitute for recording consent or an approved retention
   policy.
 

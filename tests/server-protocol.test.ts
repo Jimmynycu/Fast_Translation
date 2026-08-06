@@ -28,16 +28,57 @@ describe("HTTP and media protocol", () => {
     );
   });
 
-  it("accepts the browser CSV glossary upload contract", () => {
+  it("accepts the keyless controlled local evaluation profile", () => {
+    const parsed = createSessionRequestSchema.parse({
+      languages: { A: "en-US", B: "zh-TW" },
+      translationProfileId: "local_eval",
+      glossaryVersion: "factory-v1",
+      recordingConsent: true,
+    });
+
+    assert.equal(parsed.translationProfileId, "local_eval");
+    assert.equal(parsed.glossaryVersion, "factory-v1");
+  });
+
+  it("accepts the browser CSV glossary file contract", () => {
+    const csv = "id,source,aliases,target_exact";
     const request = importGlossaryRequestSchema.parse({
       name: "factory",
-      csv: "id,source,aliases,target_exact",
+      fileName: "factory.csv",
+      contentsBase64: Buffer.from(csv).toString("base64"),
       sourceLanguage: "en-US",
       targetLanguage: "zh-TW",
       approvedBy: "Glossary owner",
     });
     assert.equal(request.name, "factory");
-    assert.equal(request.sourceLanguage, "en-US");
+    assert.equal(request.fileName, "factory.csv");
+    assert.equal(Buffer.from(request.contentsBase64, "base64").toString(), csv);
+  });
+
+  it("accepts an XLSX glossary file contract", () => {
+    const request = importGlossaryRequestSchema.parse({
+      name: "factory",
+      fileName: "factory.xlsx",
+      contentsBase64: Buffer.from([1, 2, 3]).toString("base64"),
+      sourceLanguage: "en-US",
+      targetLanguage: "zh-TW",
+      approvedBy: "Glossary owner",
+    });
+    assert.equal(request.fileName, "factory.xlsx");
+  });
+
+  it("rejects malformed base64 glossary contents", () => {
+    assert.throws(
+      () => importGlossaryRequestSchema.parse({
+        name: "factory",
+        fileName: "factory.csv",
+        contentsBase64: "%%%not-base64%%%",
+        sourceLanguage: "en-US",
+        targetLanguage: "zh-TW",
+        approvedBy: "Glossary owner",
+      }),
+      /contentsBase64/u,
+    );
   });
 
   it("accepts idempotent commands with UUID command IDs", () => {

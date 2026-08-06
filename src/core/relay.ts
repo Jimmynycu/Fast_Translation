@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { destinationForLane, laneFromSource } from "./audio.js";
+import { CANONICAL_AUDIO, destinationForLane, laneFromSource } from "./audio.js";
 import { AsyncQueue } from "./async-queue.js";
 import { GenerationFence } from "./generation-fence.js";
 import { compileGlossary, reverseGlossarySpec, type CompiledGlossary } from "./glossary.js";
@@ -72,6 +72,12 @@ interface SpeechOnset {
   readonly startedAtMs: number;
 }
 
+interface PlayoutEvidenceCursor {
+  readonly generation: number;
+  readonly sequence: number;
+  readonly timelineAtMonoMs: number;
+}
+
 interface CommandExecution {
   readonly fingerprint: string;
   readonly completion: Promise<void>;
@@ -88,6 +94,8 @@ interface SessionRuntime {
   readonly fences: Record<Lane, GenerationFence>;
   readonly laneRuns: Record<Lane, LaneRun | undefined>;
   readonly playout: Record<Side, AsyncQueue<import("./audio.js").AudioFrame>>;
+  readonly playoutEvidenceCursors: Record<Side, PlayoutEvidenceCursor | undefined>;
+  readonly sourceEvidenceCursors: Record<Side, PlayoutEvidenceCursor | undefined>;
   readonly subscribers: Set<AsyncQueue<SessionEvent>>;
   readonly events: SessionEvent[];
   readonly commands: Map<string, CommandExecution>;
@@ -266,6 +274,8 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         A: new AsyncQueue(spec.maxQueueFrames ?? 25),
         B: new AsyncQueue(spec.maxQueueFrames ?? 25),
       },
+      playoutEvidenceCursors: { A: undefined, B: undefined },
+      sourceEvidenceCursors: { A: undefined, B: undefined },
       subscribers: new Set(),
       events: [],
       commands: new Map(),
@@ -358,26 +368,46 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     }
   }
 
-  events(sessionId: string, after: EventCursor = 0): AsyncIterable<SessionEvent> {
+  events(
+    sessionId: string,
+    after: EventCursor = 0,
+    signal?: AbortSignal,
+  ): AsyncIterable<SessionEvent> {
     const runtime = this.#requireSession(sessionId);
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new RelaySessionError("invalid_command", "Event cursor must be a non-negative safe integer");
     }
-    return this.#eventStream(runtime, after);
+    return this.#eventStream(runtime, after, signal);
   }
 
-  async *#eventStream(runtime: SessionRuntime, after: number): AsyncIterable<SessionEvent> {
+  async *#eventStream(
+    runtime: SessionRuntime,
+    after: number,
+    signal?: AbortSignal,
+  ): AsyncIterable<SessionEvent> {
     const queue = new AsyncQueue<SessionEvent>(this.#eventHistoryLimit);
-    for (const event of runtime.events) {
-      if (event.cursor > after && !queue.offer(event)) break;
-    }
-    if (runtime.status !== "closed") runtime.subscribers.add(queue);
-    else queue.close();
+    const onAbort = (): void => {
+      queue.close();
+    };
+    if (signal?.aborted) return;
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
-      for await (const event of queue) yield event;
+      for (const event of runtime.events) {
+        if (signal?.aborted) return;
+        if (event.cursor > after && !queue.offer(event)) break;
+      }
+      if (runtime.status !== "closed" && !signal?.aborted) runtime.subscribers.add(queue);
+      else queue.close();
+
+      for await (const event of queue) {
+        if (signal?.aborted) return;
+        yield event;
+      }
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       runtime.subscribers.delete(queue);
+      queue.close();
     }
   }
 
@@ -485,6 +515,42 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     }
   }
 
+  #sourceEvidenceTimeline(
+    runtime: SessionRuntime,
+    side: Side,
+    frame: import("./audio.js").AudioFrame,
+  ): number | undefined {
+    const previous = runtime.sourceEvidenceCursors[side];
+    if (previous !== undefined &&
+        previous.generation === frame.generation &&
+        frame.sequence <= previous.sequence) {
+      this.#emitAlert(
+        runtime,
+        frame.lane,
+        frame.generation,
+        "invalid_source_sequence",
+        "Rejected source evidence with a non-increasing frame sequence",
+        false,
+      );
+      return undefined;
+    }
+    const sequenceDistance = previous?.generation === frame.generation
+      ? frame.sequence - previous.sequence
+      : 0;
+    const timelineAtMonoMs = sequenceDistance === 0
+      ? frame.capturedAtMs
+      : Math.max(
+          frame.capturedAtMs,
+          previous!.timelineAtMonoMs +
+            sequenceDistance * CANONICAL_AUDIO.frameDurationMs,
+        );
+    runtime.sourceEvidenceCursors[side] = Object.freeze({
+      generation: frame.generation,
+      sequence: frame.sequence,
+      timelineAtMonoMs,
+    });
+    return timelineAtMonoMs;
+  }
   #acceptAudio(runtime: SessionRuntime, event: Extract<MediaIngressEvent, { type: "audio" }>): void {
     const lane = laneFromSource(event.side);
     const generation = runtime.fences[lane].generation;
@@ -501,12 +567,20 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         startedAtMs: frame.capturedAtMs,
       });
     }
-    this.#recordEvidence(runtime, {
-      type: "audio",
-      sessionId: runtime.sessionId,
-      track: sourceTrack(event.side),
+    const timelineAtMonoMs = this.#sourceEvidenceTimeline(
+      runtime,
+      event.side,
       frame,
-    });
+    );
+    if (timelineAtMonoMs !== undefined) {
+      this.#recordEvidence(runtime, {
+        type: "audio",
+        sessionId: runtime.sessionId,
+        track: sourceTrack(event.side),
+        timelineAtMonoMs,
+        frame,
+      });
+    }
 
     const laneRun = this.#ensureLaneRun(runtime, lane);
     if (laneRun.input.offerLatest(frame) === "dropped_oldest") {
@@ -702,6 +776,48 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     }
   }
 
+  #playoutEvidenceTimeline(
+    runtime: SessionRuntime,
+    side: Side,
+    frame: import("./audio.js").AudioFrame,
+    startedAtMonoMs: number,
+  ): number | undefined {
+    if (!Number.isFinite(startedAtMonoMs) || startedAtMonoMs < 0) {
+      this.#emitAlert(
+        runtime,
+        frame.lane,
+        frame.generation,
+        "invalid_playout_timeline",
+        "Rejected playout evidence with an invalid audible start timestamp",
+        false,
+      );
+      return undefined;
+    }
+    const previous = runtime.playoutEvidenceCursors[side];
+    if (previous !== undefined && previous.generation === frame.generation && frame.sequence <= previous.sequence) {
+      this.#emitAlert(
+        runtime,
+        frame.lane,
+        frame.generation,
+        "invalid_playout_sequence",
+        "Rejected playout evidence with a non-increasing frame sequence",
+        false,
+      );
+      return undefined;
+    }
+    const sequenceDistance = previous?.generation === frame.generation
+      ? frame.sequence - previous.sequence
+      : 0;
+    const timelineAtMonoMs = sequenceDistance === 0
+      ? startedAtMonoMs
+      : Math.max(startedAtMonoMs, previous!.timelineAtMonoMs + sequenceDistance * CANONICAL_AUDIO.frameDurationMs);
+    runtime.playoutEvidenceCursors[side] = Object.freeze({
+      generation: frame.generation,
+      sequence: frame.sequence,
+      timelineAtMonoMs,
+    });
+    return timelineAtMonoMs;
+  }
   #acceptPlayout(
     runtime: SessionRuntime,
     side: Side,
@@ -716,11 +832,14 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     ) {
       return;
     }
+    const timelineAtMonoMs = this.#playoutEvidenceTimeline(runtime, side, frame, startedAtMonoMs);
+    if (timelineAtMonoMs === undefined) return;
 
     this.#recordEvidence(runtime, {
       type: "audio",
       sessionId: runtime.sessionId,
       track: playoutTrack(side),
+      timelineAtMonoMs,
       frame,
     });
     const firstAudioKey = frame.lane + ":" + frame.generation;
