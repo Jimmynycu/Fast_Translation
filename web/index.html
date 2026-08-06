@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="A same-room, two-device demo for live AI voice translation." />
+    <title>Relay &mdash; Live translation room</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Relay home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span>Relay</span>
+      </a>
+      <div class="header-status">
+        <span class="status-dot" id="global-status-dot"></span>
+        <span id="global-status">Local demo</span>
+      </div>
+    </header>
+
+    <main>
+      <section id="operator-view" class="view operator-view">
+        <div class="hero">
+          <div>
+            <p class="eyebrow">Same-room translation lab</p>
+            <h1>Two voices.<br /><span>One conversation.</span></h1>
+          </div>
+          <p class="hero-copy">Create a private room, pair two phones, and observe the translation pipeline in real time.</p>
+        </div>
+
+        <div class="disclosure" role="note">
+          <span class="disclosure-icon" aria-hidden="true">AI</span>
+          <div>
+            <strong>Translated speech is AI-generated</strong>
+            <p>This demo records session audio and transcripts for evaluation. Get consent from everyone before starting.</p>
+          </div>
+        </div>
+
+        <section id="setup-section" class="setup-grid" aria-labelledby="setup-title">
+          <form id="session-form" class="panel setup-panel">
+            <div class="panel-heading">
+              <div><p class="step-label">01 / Room setup</p><h2 id="setup-title">Conversation</h2></div>
+              <span class="quiet-badge">Operator</span>
+            </div>
+
+            <div class="language-pair">
+              <label class="field">
+                <span>Phone A speaks</span>
+                <select id="language-a" name="languageA">
+                  <option value="en-US">English (US)</option>
+                  <option value="zh-TW">&#20013;&#25991;&#65288;&#21488;&#28771;&#65289;</option>
+                  <option value="ja-JP">&#26085;&#26412;&#35486;</option>
+                  <option value="ko-KR">&#54620;&#44397;&#50612;</option>
+                  <option value="es-ES">Espa&#241;ol</option>
+                  <option value="fr-FR">Fran&#231;ais</option>
+                </select>
+              </label>
+              <span class="swap-glyph" aria-hidden="true">&#8644;</span>
+              <label class="field">
+                <span>Phone B speaks</span>
+                <select id="language-b" name="languageB">
+                  <option value="zh-TW">&#20013;&#25991;&#65288;&#21488;&#28771;&#65289;</option>
+                  <option value="en-US">English (US)</option>
+                  <option value="ja-JP">&#26085;&#26412;&#35486;</option>
+                  <option value="ko-KR">&#54620;&#44397;&#50612;</option>
+                  <option value="es-ES">Espa&#241;ol</option>
+                  <option value="fr-FR">Fran&#231;ais</option>
+                </select>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Translation profile</span>
+              <select id="translation-profile" name="translationProfile">
+                <option value="glossary_controlled">Glossary controlled</option>
+                <option value="native_live_baseline">Native live baseline</option>
+                <option value="deterministic_test">Deterministic test</option>
+              </select>
+              <small>Controls the translation and voice pipeline used by both lanes.</small>
+            </label>
+
+            <label class="consent-check">
+              <input id="recording-consent" type="checkbox" />
+              <span>I have everyone&rsquo;s consent to record this session for evaluation.</span>
+            </label>
+
+            <button id="create-session" class="button button-primary button-wide" type="submit" disabled>
+              <span>Create translation room</span><span aria-hidden="true">&rarr;</span>
+            </button>
+            <p id="session-form-error" class="form-error" role="alert" hidden></p>
+          </form>
+
+          <form id="glossary-form" class="panel glossary-panel">
+            <div class="panel-heading">
+              <div><p class="step-label">Optional</p><h2>Terminology</h2></div>
+              <span id="glossary-status" class="quiet-badge">Not imported</span>
+            </div>
+            <p class="panel-copy">Upload a UTF-8 CSV before creating the room. Protected names and terms will be monitored during the call.</p>
+            <label class="field">
+              <span>Glossary name</span>
+              <input id="glossary-name" name="glossaryName" value="Demo terminology" required />
+            </label>
+            <label class="field">
+              <span>Approved by</span>
+              <input id="glossary-approved-by" name="glossaryApprovedBy" value="POC glossary owner" required />
+              <small>Importing records an explicit customer-owner approval.</small>
+            </label>
+            <label id="file-drop" class="file-drop">
+              <input id="glossary-file" type="file" accept=".csv,text/csv" />
+              <span class="file-icon" aria-hidden="true">CSV</span>
+              <span><strong id="file-label">Choose a glossary</strong><small>CSV &middot; id, source, aliases, target_exact</small></span>
+            </label>
+            <button id="import-glossary" class="button button-secondary button-wide" type="submit">Import glossary</button>
+            <p id="glossary-error" class="form-error" role="alert" hidden></p>
+          </form>
+        </section>
+
+        <section id="operator-dashboard" class="dashboard" hidden aria-labelledby="dashboard-title">
+          <div class="dashboard-header">
+            <div>
+              <p class="eyebrow">Live room</p>
+              <h2 id="dashboard-title">Conversation console</h2>
+              <p class="session-reference">Session <code id="session-id">&mdash;</code></p>
+            </div>
+            <div class="dashboard-actions">
+              <span id="recording-badge" class="recording-badge is-off"><span></span><span id="recording-label">Recording off</span></span>
+              <button id="start-session" class="button button-primary" type="button">Start session</button>
+              <button id="pause-session" class="button button-secondary" type="button" disabled>Pause</button>
+              <button id="end-session" class="button button-danger" type="button" disabled>End</button>
+            </div>
+          </div>
+
+          <div class="dashboard-layout">
+            <div class="dashboard-main">
+              <section class="panel pairing-panel" aria-labelledby="pairing-title">
+                <div class="section-heading">
+                  <div><p class="step-label">02 / Connect</p><h3 id="pairing-title">Pair both phones</h3></div>
+                  <span id="participant-count" class="quiet-badge">0 / 2 joined</span>
+                </div>
+                <div id="join-cards" class="join-grid"></div>
+              </section>
+
+              <section class="panel transcript-panel" aria-labelledby="transcript-title">
+                <div class="section-heading">
+                  <div><p class="step-label">Live transcript</p><h3 id="transcript-title">Conversation</h3></div>
+                  <span id="room-state" class="state-pill">Created</span>
+                </div>
+                <div class="transcript-columns">
+                  <div>
+                    <div class="lane-label"><span class="side side-a">A</span> Source + AI target</div>
+                    <div id="transcript-a" class="transcript-stream" aria-live="polite"><p class="empty-state">Waiting for Phone A&hellip;</p></div>
+                  </div>
+                  <div>
+                    <div class="lane-label"><span class="side side-b">B</span> Source + AI target</div>
+                    <div id="transcript-b" class="transcript-stream" aria-live="polite"><p class="empty-state">Waiting for Phone B&hellip;</p></div>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <aside class="dashboard-rail">
+              <section class="metric-grid" aria-label="Session metrics">
+                <article class="metric-card"><span>First audio</span><strong id="latency-value">&mdash;</strong><small id="latency-detail">No samples yet</small></article>
+                <article class="metric-card"><span>Generation cuts</span><strong id="cut-count">0</strong><small>Old audio fenced</small></article>
+                <article class="metric-card"><span>Term alerts</span><strong id="alert-count">0</strong><small id="alert-detail">No alerts</small></article>
+              </section>
+
+              <section class="panel compact-panel">
+                <div class="section-heading"><h3>Terminology</h3><span class="live-indicator"><span></span> Live</span></div>
+                <div id="terminology-feed" class="event-feed" aria-live="polite"><p class="empty-state">No terminology events.</p></div>
+              </section>
+
+              <section class="panel compact-panel">
+                <div class="section-heading"><h3>Pipeline events</h3><button id="clear-events" class="text-button" type="button">Clear</button></div>
+                <div id="pipeline-feed" class="event-feed event-feed-scroll" aria-live="polite"><p class="empty-state">The event stream will appear here.</p></div>
+              </section>
+            </aside>
+          </div>
+        </section>
+      </section>
+
+      <section id="participant-view" class="view participant-view" hidden>
+        <div class="participant-shell">
+          <header class="participant-heading">
+            <div><p class="eyebrow">Translation room</p><h1>Phone <span id="participant-side">A</span></h1></div>
+            <span id="participant-connection" class="connection-pill is-offline"><span></span> Offline</span>
+          </header>
+
+          <div class="disclosure participant-disclosure" role="note">
+            <span class="disclosure-icon" aria-hidden="true">AI</span>
+            <div><strong>AI-translated voice</strong><p>Your microphone audio and transcripts may be recorded for this evaluation.</p></div>
+          </div>
+
+          <section class="panel call-panel">
+            <div id="call-idle">
+              <div class="call-illustration" aria-hidden="true">
+                <span class="phone-shape phone-left"></span>
+                <span class="sound-wave"><i></i><i></i><i></i><i></i><i></i></span>
+                <span class="phone-shape phone-right"></span>
+              </div>
+              <h2>Ready to join?</h2>
+              <p>Use headphones to prevent the translated voice from feeding back into your microphone.</p>
+
+              <div class="preflight" aria-label="Device preflight">
+                <div id="check-secure" class="preflight-item"><span>&hellip;</span> Secure connection</div>
+                <div id="check-audio" class="preflight-item"><span>&hellip;</span> Live audio support</div>
+                <div id="check-mic" class="preflight-item"><span>&hellip;</span> Microphone access</div>
+              </div>
+
+              <label class="headphone-check"><input id="headphones-confirmed" type="checkbox" /><span>I&rsquo;m wearing headphones</span></label>
+              <button id="start-microphone" class="button button-primary button-wide button-large" type="button">
+                <span class="mic-symbol" aria-hidden="true"></span> Start microphone
+              </button>
+              <p id="participant-error" class="form-error" role="alert" hidden></p>
+            </div>
+
+            <div id="call-live" hidden>
+              <div class="live-call-top">
+                <div><span class="live-kicker"><i></i> Microphone live</span><h2>Speak naturally</h2><p>The other phone hears your translated voice.</p></div>
+                <div class="audio-orb" aria-hidden="true"><span id="audio-meter"></span><i></i><i></i><i></i><i></i><i></i></div>
+              </div>
+
+              <div class="caption-stack">
+                <article class="caption-card"><span>Your speech</span><p id="participant-source-caption" aria-live="polite">Listening&hellip;</p></article>
+                <article class="caption-card translated-caption"><span>Translated conversation &middot; AI voice</span><p id="participant-target-caption" aria-live="polite">Waiting for the other speaker&hellip;</p></article>
+              </div>
+
+              <div class="call-footer">
+                <div class="playback-state"><span></span><span id="playback-label">Translated audio ready</span></div>
+                <button id="stop-microphone" class="button button-danger" type="button">Stop microphone</button>
+              </div>
+            </div>
+          </section>
+
+          <p class="participant-footnote">Keep this page open and your screen awake. Recording is controlled by the room operator.</p>
+        </div>
+      </section>
+    </main>
+
+    <template id="join-card-template">
+      <article class="join-card">
+        <div class="join-copy"><span class="side">A</span><div><strong>Phone A</strong><small class="join-language"></small></div></div>
+        <img class="qr-code" alt="" width="144" height="144" />
+        <a class="join-link" href="#" target="_blank" rel="noreferrer">Open participant link <span aria-hidden="true">&#8599;</span></a>
+        <button class="copy-link text-button" type="button">Copy link</button>
+      </article>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-test/
+.env
+data/
+node-compile-cache/
+work/node-compile-cache/
+work/tmp/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store
+.vite/
+playwright-report/
+test-results/

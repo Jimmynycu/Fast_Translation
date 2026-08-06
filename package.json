@@ -1,0 +1,37 @@
+{
+  "name": "fast-translation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.16.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "dev": "pnpm build && node --env-file-if-exists=.env --watch dist/src/server/main.js",
+    "start": "node --env-file-if-exists=.env dist/src/server/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build:test && node --test --test-isolation=none \"dist-test/tests/*.test.js\"",
+    "test:watch": "pnpm build:test && node --test --test-isolation=none --watch \"dist-test/tests/*.test.js\"",
+    "keygen": "node scripts/generate-evidence-key.mjs",
+    "benchmark": "pnpm build && node --env-file-if-exists=.env dist/src/benchmark/cli.js"
+  },
+  "dependencies": {
+    "@fastify/static": "^10.1.2",
+    "@fastify/websocket": "^11.3.0",
+    "csv-parse": "^7.0.2",
+    "exceljs": "^4.4.0",
+    "fastify": "^5.11.2",
+    "qrcode": "^1.5.4",
+    "ws": "^8.21.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2"
+  }
+}
