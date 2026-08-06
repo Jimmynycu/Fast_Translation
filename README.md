@@ -9,8 +9,9 @@ fake-telephony driver for provider-free integration tests.
 > media path, test-only fake-telephony seam, keyless local terminology replay,
 > OpenAI adapters, controlled terminology path, encrypted evidence store, and
 > benchmark mechanism tooling. It does not contain evidence of a successful live
-> OpenAI, SIP/PSTN, or Palabra acceptance run. Palabra is a benchmark reference
-> in the protocol, not a runtime adapter.
+> OpenAI, SIP/PSTN, or Palabra acceptance run. The `palabra_live` runtime
+> adapter is implemented, but live Palabra acceptance evidence remains
+> `NOT_RUN` without credentials and a completed provider run.
 
 ## Implemented scope
 
@@ -49,9 +50,11 @@ two-phone procedure, TLS requirements, and exact commands, see the
 | `local_eval` | None | Injects declared lane transcripts after canonical input audio, runs the real glossary control/alert/playout path, and emits deterministic PCM. It proves Harness behavior, not acoustic STT or natural target speech. |
 | `native_live_baseline` | `OPENAI_API_KEY` | Dedicated OpenAI realtime speech-translation adapter. No controlled glossary guarantee. |
 | `glossary_controlled` | `OPENAI_API_KEY` | Session-pinned STT keyword/language hints, text translation, exact-term authorization, and TTS. |
+| `palabra_live` | `PALABRA_API_KEY` | Server-side Palabra streaming adapter with controlled/per-utterance relay semantics. `PALABRA_INPUT_CHUNK_MS` defaults to 320 ms (20–320 ms, multiples of 20). |
 
-The server always exposes `deterministic_test` and `local_eval`. It exposes both
-OpenAI-backed profiles only when `OPENAI_API_KEY` is present at startup.
+The server always exposes `deterministic_test` and `local_eval`. It exposes
+OpenAI-backed profiles only when `OPENAI_API_KEY` is present, and exposes
+`palabra_live` only when `PALABRA_API_KEY` is present at startup.
 Credentials remain on the server; they are never sent in participant links or
 browser responses.
 
@@ -138,7 +141,8 @@ approval metadata, stores immutable versions, verifies a content hash on pin,
 and pins one version into a session. Each approved source/target pair is also
 compiled into the reverse lane; ambiguous reverse terms are rejected at import.
 Both `glossary_controlled` and `local_eval` accept a pinned glossary version.
-The API rejects one on deterministic or native-baseline sessions.
+The API rejects one on deterministic, native-baseline, and `palabra_live`
+sessions; Palabra account glossaries are outside this pinned target-exact guarantee.
 
 Required entry columns are:
 

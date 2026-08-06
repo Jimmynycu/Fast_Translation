@@ -63,6 +63,30 @@ describe("loadConfig", () => {
       },
     );
   });
+  it("loads the Palabra profile only with its server key and validates chunk pacing", () => {
+    const config = loadConfig({
+      TRANSLATION_PROFILE: "palabra_live",
+      PALABRA_API_KEY: "palabra-test-key",
+      PALABRA_INPUT_CHUNK_MS: "280",
+      EVIDENCE_PROFILE: "in_memory",
+    });
+    assert.equal(config.translationProfile, "palabra_live");
+    assert.equal(config.palabraApiKey, "palabra-test-key");
+    assert.equal(config.palabraInputChunkMs, 280);
+    assert.throws(
+      () => loadConfig({
+        TRANSLATION_PROFILE: "palabra_live",
+        PALABRA_API_KEY: "palabra-test-key",
+        PALABRA_INPUT_CHUNK_MS: "21",
+        EVIDENCE_PROFILE: "in_memory",
+      }),
+      /multiple of 20/u,
+    );
+    assert.throws(
+      () => loadConfig({ TRANSLATION_PROFILE: "palabra_live", EVIDENCE_PROFILE: "in_memory" }),
+      /PALABRA_API_KEY/u,
+    );
+  });
 
   it("requires an OpenAI key for live profiles", () => {
     assert.throws(

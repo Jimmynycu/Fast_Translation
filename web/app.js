@@ -44,6 +44,7 @@ const state = {
 
 const PROFILE_LABELS = {
   glossary_controlled: "Glossary controlled",
+  palabra_live: "Palabra live",
   local_eval: "Local glossary evaluation",
   native_live_baseline: "Native live baseline",
   deterministic_test: "Deterministic test",
@@ -768,7 +769,7 @@ async function createSession(event) {
     state.glossaryVersion !== null &&
     !["glossary_controlled", "local_eval"].includes(translationProfileId)
   ) {
-    showError(error, "Select Glossary controlled or Local glossary evaluation to use the glossary.");
+    showError(error, "Select Glossary controlled or Local glossary evaluation to use the glossary; Palabra live does not accept a pinned glossary.");
     return;
   }
 

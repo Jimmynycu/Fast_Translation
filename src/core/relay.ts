@@ -346,7 +346,21 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         if (runtime.status !== "ready") {
           throw this.#invalidState(runtime, "start");
         }
-        this.#setStatus(runtime, "active", command.commandId);
+        try {
+          await Promise.all((["A_TO_B", "B_TO_A"] as const).map((lane) =>
+            this.#translation.prepare(this.#laneContext(runtime, lane)),
+          ));
+          if (runtime.status !== "ready") {
+            await Promise.allSettled([
+              this.#translation.closeSession(runtime.sessionId),
+            ]);
+            return;
+          }
+          this.#setStatus(runtime, "active", command.commandId);
+        } catch (error: unknown) {
+          await Promise.allSettled([this.#translation.closeSession(runtime.sessionId)]);
+          throw error;
+        }
         return;
       case "pause":
         if (runtime.status !== "active") {
@@ -595,24 +609,32 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     }
   }
 
-  #ensureLaneRun(runtime: SessionRuntime, lane: Lane): LaneRun {
-    const generation = runtime.fences[lane].generation;
-    const existing = runtime.laneRuns[lane];
-    if (existing !== undefined && existing.generation === generation) return existing;
-
-    const input = new AsyncQueue<import("./audio.js").AudioFrame>(runtime.spec.maxQueueFrames ?? 25);
-    const controller = new AbortController();
+  #laneContext(
+    runtime: SessionRuntime,
+    lane: Lane,
+    generation = runtime.fences[lane].generation,
+  ): LaneContext {
     const languages = laneLanguages(runtime.spec, lane);
-    const applicableGlossary = runtime.compiledGlossaries?.[lane];
-    const context: LaneContext = Object.freeze({
+    const glossary = runtime.compiledGlossaries?.[lane];
+    return Object.freeze({
       sessionId: runtime.sessionId,
       lane,
       generation,
       sourceLanguage: languages.sourceLanguage,
       targetLanguage: languages.targetLanguage,
       profile: runtime.spec.profile,
-      ...(applicableGlossary === undefined ? {} : { glossary: applicableGlossary }),
+      ...(glossary === undefined ? {} : { glossary }),
     });
+  }
+
+  #ensureLaneRun(runtime: SessionRuntime, lane: Lane): LaneRun {
+    const existing = runtime.laneRuns[lane];
+    const generation = runtime.fences[lane].generation;
+    if (existing !== undefined && existing.generation === generation) return existing;
+
+    const input = new AsyncQueue<import("./audio.js").AudioFrame>(runtime.spec.maxQueueFrames ?? 25);
+    const controller = new AbortController();
+    const context = this.#laneContext(runtime, lane, generation);
 
     let laneRun!: LaneRun;
     const task = this.#consumeTranslation(runtime, input, context, controller.signal).finally(() => {
@@ -921,27 +943,38 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     runtime.closedAtMs = this.#now();
     this.#setStatus(runtime, "closed", commandId);
     this.#emit(runtime, { type: "session_closed", reason });
-    try {
-      await this.#media.closeSession(runtime.sessionId);
-    } catch (error: unknown) {
+    const [mediaCleanup, translationCleanup, evidenceCleanup] = await Promise.allSettled([
+      Promise.resolve(this.#media.closeSession(runtime.sessionId)),
+      this.#translation.closeSession(runtime.sessionId),
+      this.#evidence.close(runtime.sessionId),
+    ]);
+    if (mediaCleanup.status === "rejected") {
       this.#emitAlert(
         runtime,
         null,
         null,
         "media_cleanup_failed",
-        this.#errorMessage(error),
+        this.#errorMessage(mediaCleanup.reason),
         true,
       );
     }
-    try {
-      await this.#evidence.close(runtime.sessionId);
-    } catch (error: unknown) {
+    if (translationCleanup.status === "rejected") {
+      this.#emitAlert(
+        runtime,
+        null,
+        null,
+        "translation_cleanup_failed",
+        this.#errorMessage(translationCleanup.reason),
+        true,
+      );
+    }
+    if (evidenceCleanup.status === "rejected") {
       this.#emitAlert(
         runtime,
         null,
         null,
         "evidence_finalize_failed",
-        this.#errorMessage(error),
+        this.#errorMessage(evidenceCleanup.reason),
         true,
       );
     }

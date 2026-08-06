@@ -152,11 +152,31 @@ With a key present, the server registers `native_live_baseline`,
 `glossary_controlled`, `local_eval`, and `deterministic_test`. The startup
 profile variable is validated at launch; the operator's session selection
 chooses the actual route.
+With `PALABRA_API_KEY` instead, the server registers `palabra_live` in addition
+to the keyless profiles; the two provider keys are independent.
 Use encrypted evidence instead of `in_memory` when the session requires a
 persistent record.
 
 The key flows from the launching process environment to validated server config
 and then to server-side OpenAI adapters. It is never sent to either phone.
+
+### Palabra live profile
+
+For the server-side Palabra path, keep the API key out of browser and QR flows:
+
+```powershell
+$env:PALABRA_API_KEY = "<server-side Palabra API key>"
+$env:PALABRA_INPUT_CHUNK_MS = "320"
+$env:TRANSLATION_PROFILE = "palabra_live"
+$env:EVIDENCE_PROFILE = "in_memory"
+pnpm dev
+```
+
+`PALABRA_INPUT_CHUNK_MS` accepts integer values from 20 through 320 in steps of
+20. The relay treats `palabra_live` as a controlled, per-utterance profile; it
+prepares both lane contexts before activation. Pinned `glossaryVersion` requests
+are rejected for this profile. Palabra account glossaries may be configured at
+the provider, but they do not provide this Harness's pinned target-exact guarantee.
 
 ## 5. Check the running server
 
@@ -184,7 +204,7 @@ fixed before scanning the QR codes.
 3. For `glossary_controlled` or `local_eval`, optionally import a glossary
    before creating the room. After the glossary owner reviews the entries, enter
    that approver's name and upload an approved CSV or XLSX file. A glossary
-   version is rejected for `deterministic_test` and `native_live_baseline`.
+   version is rejected for `deterministic_test`, `native_live_baseline`, and `palabra_live`.
 4. Confirm recording consent and click **Create translation room**.
 5. Scan the Phone A QR with the A participant and the Phone B QR with the B
    participant. Do not swap links; each link fixes its side.
@@ -449,8 +469,8 @@ The signed profile and release-gate artifacts use trust anchor `operator_supplie
 | Phone says microphone requires HTTPS | Use the HTTPS QR origin and trust its issuing CA on that phone. HTTP is valid only for localhost smoke testing. |
 | QR opens the wrong host | Fix the root-only `PUBLIC_BASE_URL`, restart, and create a new room. Subpaths, credentials, queries, and fragments are rejected. |
 | Operator cannot start | Both participants must click **Start microphone** so both media sockets join and the session becomes ready. |
-| Profile is unavailable | Check `/api/capabilities`. Add `OPENAI_API_KEY` for OpenAI profiles and restart the process. |
-| Session rejects the glossary version | Select `glossary_controlled` or `local_eval`; deterministic and native-baseline sessions cannot pin a glossary. |
+| Profile is unavailable | Check `/api/capabilities`. Add `OPENAI_API_KEY` for OpenAI profiles or `PALABRA_API_KEY` for `palabra_live`, then restart the process. |
+| Session rejects the glossary version | Select `glossary_controlled` or `local_eval`; deterministic, native-baseline, and `palabra_live` sessions cannot pin a glossary. |
 | Glossary never binds | Match glossary source/target languages to the desired lane and verify all four required headers. |
 | Room returns `fake-telephony://` grants | `MEDIA_PROFILE=fake_telephony` is an in-process test seam, not a phone link. Use `browser_pair` for two phones or the replay command for keyless transport testing. |
 | No evidence file appears | `in_memory` is intentionally non-persistent. For encrypted evidence, end the room cleanly and check `EVIDENCE_DIRECTORY`. |

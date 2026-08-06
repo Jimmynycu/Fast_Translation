@@ -385,6 +385,28 @@ describe("server application", () => {
       await app.close();
     }
   });
+  it("rejects a pinned glossary for Palabra live", async () => {
+    const { app, relay } = await fixture();
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        headers: OPERATOR_HEADERS,
+        payload: {
+          languages: { A: "en-US", B: "zh-TW" },
+          translationProfileId: "palabra_live",
+          glossaryVersion: "factory-v1",
+          recordingConsent: true,
+        },
+      });
+      assert.equal(response.statusCode, 422);
+      assert.equal(response.json().error.code, "glossary_profile_mismatch");
+      assert.equal(relay.opened.length, 0);
+    } finally {
+      await app.close();
+    }
+  });
+
 
   it("rejects an unknown glossary without opening a relay session", async () => {
     const { app, relay } = await fixture();
@@ -466,6 +488,7 @@ describe("server application", () => {
       assert.deepEqual(capabilities.json().translationProfiles, [
         "native_live_baseline",
         "glossary_controlled",
+        "palabra_live",
         "local_eval",
         "deterministic_test",
       ]);

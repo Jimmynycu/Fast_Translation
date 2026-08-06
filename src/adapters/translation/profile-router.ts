@@ -1,5 +1,6 @@
 import type {
   GenerationRef,
+  LaneContext,
   TranslationEvent,
   TranslationPort,
   TranslationProfile,
@@ -32,6 +33,12 @@ export class TranslationProfileRouter implements TranslationPort {
     return Object.freeze([...this.#ports.keys()].sort());
   }
 
+  async prepare(context: LaneContext): Promise<void> {
+    const port = this.#ports.get(context.profile);
+    if (port === undefined) throw new TranslationProfileUnavailableError(context.profile);
+    await port.prepare(context);
+  }
+
   translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     const port = this.#ports.get(request.context.profile);
     if (port === undefined) throw new TranslationProfileUnavailableError(request.context.profile);
@@ -43,4 +50,11 @@ export class TranslationProfileRouter implements TranslationPort {
       [...new Set(this.#ports.values())].map(async (port) => port.cancel(generation)),
     );
   }
+
+  async closeSession(sessionId: string): Promise<void> {
+    await Promise.all(
+      [...new Set(this.#ports.values())].map(async (port) => port.closeSession(sessionId)),
+    );
+  }
+
 }

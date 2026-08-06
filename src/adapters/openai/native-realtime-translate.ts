@@ -81,6 +81,9 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       "OpenAI realtime closeTimeoutMs",
     );
   }
+  async prepare(_context: import("../../core/types.js").LaneContext): Promise<void> {}
+
+
 
   async *translate(
     request: TranslationRequest,
@@ -466,6 +469,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     this.#active.delete(key);
     active.stop();
   }
+
+  async closeSession(_sessionId: string): Promise<void> {}
 
   async #pumpInput(
     request: TranslationRequest,

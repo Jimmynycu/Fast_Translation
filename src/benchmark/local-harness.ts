@@ -224,6 +224,8 @@ class HarnessEvidence implements EvidencePort {
 }
 
 class StreamingEchoTranslation implements TranslationPort {
+  async prepare(_context: import("../core/types.js").LaneContext): Promise<void> {}
+
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     for await (const frame of request.frames) {
       if (request.signal.aborted) return;
@@ -244,7 +246,11 @@ class StreamingEchoTranslation implements TranslationPort {
   }
 
   async cancel(_generation: GenerationRef): Promise<void> {}
+  async closeSession(_sessionId: string): Promise<void> {}
+
 }
+
+
 
 interface RunningHarness {
   readonly relay: ModularGuardedDuplexRelay;

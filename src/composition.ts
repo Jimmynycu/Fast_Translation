@@ -13,6 +13,7 @@ import {
   OpenAITextTranslator,
   OpenAITtsAdapter,
 } from "./adapters/openai/index.js";
+import { PalabraTranslationAdapter } from "./adapters/palabra/index.js";
 import { DeterministicTranslationAdapter } from "./adapters/translation/deterministic.js";
 import { ControlledTranslationAdapter } from "./adapters/translation/glossary-controlled.js";
 import { createLocalEvalTranslationAdapter } from "./adapters/translation/local-eval.js";
@@ -270,6 +271,15 @@ function translationRouter(config: AppConfig): TranslationProfileRouter {
           model: config.openaiTtsModel,
           voice: config.openaiTtsVoice,
         }),
+      }),
+    );
+  }
+  if (config.palabraApiKey !== undefined) {
+    profiles.set(
+      "palabra_live",
+      new PalabraTranslationAdapter({
+        apiKey: config.palabraApiKey,
+        inputChunkMs: config.palabraInputChunkMs,
       }),
     );
   }

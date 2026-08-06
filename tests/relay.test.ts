@@ -83,6 +83,8 @@ class FakeMedia implements MediaPort {
 
 class FakeTranslation implements TranslationPort {
   readonly captured: AudioFrame[] = [];
+  readonly prepared: LaneContext[] = [];
+  readonly closedSessions: string[] = [];
   readonly cancelled: GenerationRef[] = [];
   readonly #waitForRelease: boolean;
   #released = false;
@@ -95,6 +97,10 @@ class FakeTranslation implements TranslationPort {
   release(): void {
     this.#released = true;
     for (const resolve of this.#releaseWaiters.splice(0)) resolve();
+  }
+
+  async prepare(context: LaneContext): Promise<void> {
+    this.prepared.push(context);
   }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
@@ -136,11 +142,22 @@ class FakeTranslation implements TranslationPort {
   async cancel(generation: GenerationRef): Promise<void> {
     this.cancelled.push(generation);
   }
+  async closeSession(sessionId: string): Promise<void> {
+    this.closedSessions.push(sessionId);
+  }
+
+
 }
 
 class BatchTranslation implements TranslationPort {
   readonly completedBatches: AudioFrame[][] = [];
+  readonly prepared: LaneContext[] = [];
+  readonly closedSessions: string[] = [];
   readonly contexts: LaneContext[] = [];
+
+  async prepare(context: LaneContext): Promise<void> {
+    this.prepared.push(context);
+  }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     this.contexts.push(request.context);
@@ -171,7 +188,18 @@ class BatchTranslation implements TranslationPort {
   }
 
   async cancel(_generation: GenerationRef): Promise<void> {}
+  async closeSession(sessionId: string): Promise<void> {
+    this.closedSessions.push(sessionId);
+  }
+
 }
+class PrepareFailureTranslation extends FakeTranslation {
+  override async prepare(context: LaneContext): Promise<void> {
+    if (context.lane === "B_TO_A") throw new Error("prepare failed");
+    await super.prepare(context);
+  }
+}
+
 
 async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
   const deadline = performance.now() + 2_000;
@@ -253,6 +281,37 @@ function audioEvent(side: Side, sequence: number): Extract<MediaIngressEvent, { 
 }
 
 describe("ModularGuardedDuplexRelay", () => {
+  it("prepares both lanes before activation and closes the provider on end", async () => {
+    const media = new FakeMedia();
+    const translation = new FakeTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-prepare" });
+    await waitUntil(() => events.some((event) => event.type === "session_state" && event.status === "active"), "active event was not observed");
+    assert.deepEqual(translation.prepared.map((context) => context.lane).sort(), ["A_TO_B", "B_TO_A"]);
+    const activeIndex = events.findIndex((event) => event.type === "session_state" && event.status === "active");
+    const readyIndex = events.findIndex((event) => event.type === "session_state" && event.status === "ready");
+    assert.ok(activeIndex > readyIndex);
+    await relay.command("session-1", { type: "end", commandId: "end-prepare" });
+    await collector;
+    assert.ok(translation.closedSessions.includes("session-1"));
+  });
+
+  it("leaves a ready session when lane preparation fails and cleans the provider", async () => {
+    const media = new FakeMedia();
+    const translation = new PrepareFailureTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { collector } = await readySession(relay, media);
+    await assert.rejects(
+      relay.command("session-1", { type: "start", commandId: "start-prepare-failure" }),
+      /prepare failed/u,
+    );
+    assert.equal(relay.snapshot("session-1").status, "ready");
+    assert.ok(translation.closedSessions.includes("session-1"));
+    await relay.command("session-1", { type: "end", commandId: "end-prepare-failure" });
+    await collector;
+  });
+
   it("runs the idempotent operator lifecycle and records state", async () => {
     const media = new FakeMedia();
     const translation = new FakeTranslation();

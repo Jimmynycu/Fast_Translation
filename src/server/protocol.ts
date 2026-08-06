@@ -29,6 +29,7 @@ export const laneSchema = z.enum(["A_TO_B", "B_TO_A"]);
 export const translationProfileSchema = z.enum([
   "native_live_baseline",
   "glossary_controlled",
+  "palabra_live",
   "local_eval",
   "deterministic_test",
 ]);

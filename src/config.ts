@@ -21,6 +21,7 @@ const environmentSchema = z
     TLS_CERT_PATH: optionalSecret,
     TLS_KEY_PATH: optionalSecret,
     OPENAI_API_KEY: optionalSecret,
+    PALABRA_API_KEY: optionalSecret,
     OPERATOR_TOKEN: optionalOperatorToken,
     OPENAI_REALTIME_MODEL: z.string().min(1).default("gpt-realtime-translate"),
     OPENAI_TRANSCRIBE_MODEL: z.string().min(1).default("gpt-live-transcribe"),
@@ -35,8 +36,11 @@ const environmentSchema = z
     LOCAL_EVAL_TRANSLATION_MODE: z.enum(["preserve", "drop_placeholders"]).default("preserve"),
     MEDIA_PROFILE: z.enum(MEDIA_PROFILES).default("browser_pair"),
     TRANSLATION_PROFILE: z
-      .enum(["native_live_baseline", "glossary_controlled", "local_eval", "deterministic_test"])
+      .enum(["native_live_baseline", "glossary_controlled", "palabra_live", "local_eval", "deterministic_test"])
       .default("glossary_controlled"),
+    PALABRA_INPUT_CHUNK_MS: z.coerce.number().int().min(20).max(320)
+      .refine((value) => value % 20 === 0, "PALABRA_INPUT_CHUNK_MS must be a multiple of 20")
+      .default(320),
     EVIDENCE_PROFILE: z.enum(["encrypted_local", "in_memory"]).default("encrypted_local"),
     EVIDENCE_DIRECTORY: z.string().min(1).default("./data/evidence"),
     GLOSSARY_DIRECTORY: z.string().min(1).default("./data/glossaries"),
@@ -61,6 +65,18 @@ const environmentSchema = z
         code: "custom",
         path: ["OPENAI_API_KEY"],
         message: `OPENAI_API_KEY is required for ${value.TRANSLATION_PROFILE}`,
+      });
+    }
+
+
+    if (
+      value.TRANSLATION_PROFILE === "palabra_live" &&
+      value.PALABRA_API_KEY === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["PALABRA_API_KEY"],
+        message: "PALABRA_API_KEY is required for palabra_live",
       });
     }
 
@@ -96,6 +112,7 @@ export type AppConfig = Readonly<{
   tlsCertPath?: string;
   tlsKeyPath?: string;
   openaiApiKey?: string;
+  palabraApiKey?: string;
   operatorToken: string;
   openaiRealtimeModel: string;
   openaiTranscribeModel: string;
@@ -107,7 +124,8 @@ export type AppConfig = Readonly<{
   localEvalConfidence: number;
   localEvalTranslationMode: "preserve" | "drop_placeholders";
   mediaProfile: MediaProfile;
-  translationProfile: "native_live_baseline" | "glossary_controlled" | "local_eval" | "deterministic_test";
+  translationProfile: "native_live_baseline" | "glossary_controlled" | "palabra_live" | "local_eval" | "deterministic_test";
+  palabraInputChunkMs: number;
   evidenceProfile: "encrypted_local" | "in_memory";
   evidenceDirectory: string;
   glossaryDirectory: string;
@@ -127,6 +145,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv, cwd = process.cwd()):
       : { tlsCertPath: resolve(cwd, parsed.TLS_CERT_PATH) }),
     ...(parsed.TLS_KEY_PATH === undefined ? {} : { tlsKeyPath: resolve(cwd, parsed.TLS_KEY_PATH) }),
     ...(parsed.OPENAI_API_KEY === undefined ? {} : { openaiApiKey: parsed.OPENAI_API_KEY }),
+    ...(parsed.PALABRA_API_KEY === undefined ? {} : { palabraApiKey: parsed.PALABRA_API_KEY }),
     operatorToken: parsed.OPERATOR_TOKEN ?? randomBytes(32).toString("base64url"),
     openaiRealtimeModel: parsed.OPENAI_REALTIME_MODEL,
     openaiTranscribeModel: parsed.OPENAI_TRANSCRIBE_MODEL,
@@ -139,6 +158,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv, cwd = process.cwd()):
     localEvalTranslationMode: parsed.LOCAL_EVAL_TRANSLATION_MODE,
     mediaProfile: parsed.MEDIA_PROFILE,
     translationProfile: parsed.TRANSLATION_PROFILE,
+    palabraInputChunkMs: parsed.PALABRA_INPUT_CHUNK_MS,
     evidenceProfile: parsed.EVIDENCE_PROFILE,
     evidenceDirectory: resolve(cwd, parsed.EVIDENCE_DIRECTORY),
     glossaryDirectory: resolve(cwd, parsed.GLOSSARY_DIRECTORY),

@@ -53,9 +53,13 @@ export class DeterministicTranslationAdapter implements TranslationPort {
     yield completed(request.context, this.#now());
   }
 
+  async prepare(_context: import("../../core/types.js").LaneContext): Promise<void> {}
+
   async cancel(generation: GenerationRef): Promise<void> {
     this.#cancelled.add(generationKey(generation));
   }
+
+  async closeSession(_sessionId: string): Promise<void> {}
 }
 
 function completed(

@@ -12,6 +12,7 @@ export type MediaProfile = (typeof MEDIA_PROFILES)[number];
 export const TRANSLATION_PROFILES = [
   "native_live_baseline",
   "glossary_controlled",
+  "palabra_live",
   "local_eval",
   "deterministic_test",
 ] as const;
@@ -215,8 +216,10 @@ export type TranslationEvent =
   | TranslationCompletedEvent
   | TranslationErrorEvent;
 export interface TranslationPort {
+  prepare(context: LaneContext): Promise<void>;
   translate(request: TranslationRequest): AsyncIterable<TranslationEvent>;
   cancel(generation: GenerationRef): Promise<void>;
+  closeSession(sessionId: string): Promise<void>;
 }
 
 interface MediaIngressEventBase {

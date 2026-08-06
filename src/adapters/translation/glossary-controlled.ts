@@ -135,6 +135,8 @@ export class ControlledTranslationAdapter implements TranslationPort {
     this.#now = options.now ?? (() => performance.now());
   }
 
+  async prepare(_context: LaneContext): Promise<void> {}
+
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     const key = generationKey(request.context);
     this.#active.get(key)?.abort();
@@ -215,6 +217,8 @@ export class ControlledTranslationAdapter implements TranslationPort {
       // The local abort fence is authoritative; provider cancellation is best effort.
     }
   }
+  async closeSession(_sessionId: string): Promise<void> {}
+
 
   async *#translateTranscript(
     request: TranslationRequest,

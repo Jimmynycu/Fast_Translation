@@ -121,7 +121,8 @@ without blocking media.
 
 The composition root always registers `deterministic_test` and `local_eval`.
 If and only if `OPENAI_API_KEY` is present, it also registers both OpenAI-backed
-profiles:
+profiles. If and only if `PALABRA_API_KEY` is present, it registers
+`palabra_live` with the configured `PALABRA_INPUT_CHUNK_MS` pacing.
 
 | Profile | Implementation |
 |---|---|
@@ -129,6 +130,7 @@ profiles:
 | `local_eval` | Accepts canonical input frames, injects declared lane transcripts, runs the same glossary binding/authorization and alert path, and emits deterministic canonical PCM. It proves Harness behavior, not acoustic STT or provider TTS. |
 | `native_live_baseline` | Connects server-side to the dedicated OpenAI realtime translation adapter and streams normalized translation events into the Harness. |
 | `glossary_controlled` | Composes live transcription, server-side text translation, glossary binding/authorization, and TTS. |
+| `palabra_live` | Uses the server-side Palabra streaming adapter. Relay lanes remain controlled/per-utterance; it is not classified as native continuous. |
 
 For each controlled lane, the pinned glossary's source terms and aliases are
 deduplicated and sent to `gpt-live-transcribe` as session-specific keyword
@@ -145,7 +147,11 @@ best available text when control or a provider fails; continuity is not a claim
 that terminology acceptance passed.
 
 The `TRANSLATION_PROFILE` environment variable participates in startup
-validation. A no-key process can select `deterministic_test` or `local_eval`.
+validation. A no-key process can select `deterministic_test` or `local_eval`;
+`palabra_live` requires `PALABRA_API_KEY`. Translation ports expose required
+`prepare(context)` and `closeSession(sessionId)` lifecycle methods. Starting a
+room prepares both lane contexts concurrently before emitting `active`; a
+preparation failure leaves the room `ready` and closes the provider session.
 The API reports the actually registered profiles and rejects a session request
 for an unavailable profile.
 
@@ -169,8 +175,9 @@ rejects duplicate or ambiguous reverse terms before storing the version.
 
 `glossaryVersion` is valid when the session profile is
 `glossary_controlled` or `local_eval`; the HTTP API rejects it for
-`deterministic_test` and `native_live_baseline` instead of advertising a
-glossary that those paths ignore.
+`deterministic_test`, `native_live_baseline`, and `palabra_live` instead of
+advertising a glossary that those paths ignore. Palabra account-enabled
+glossaries are outside this pinned target-exact guarantee.
 
 Both CSV and XLSX are advertised by `/api/capabilities` and accepted by the
 browser picker. Header names are normalized before mapping; duplicate normalized
@@ -242,7 +249,10 @@ humans directly, with no AI greeting or IVR before the human conversation.
   playback latency, forced alignment, or human review.
 - The discovery command can call the OpenAI text endpoint, but it is not a live
   speech-to-speech acceptance run.
-- No Palabra runtime adapter or automated Palabra runner is implemented.
+- The `palabra_live` runtime adapter is implemented and exercised with fake
+  sockets; no live Palabra acceptance runner or provider evidence is included,
+  so Palabra acceptance remains `NOT_RUN` without credentials and a completed
+  provider run.
 - A workspace-local helper issues disposable LAN test certificates; installing
   its CA on each phone, LAN DNS/routing, and firewall setup remain operator
   responsibilities.

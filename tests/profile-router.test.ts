@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { TranslationProfileRouter, TranslationProfileUnavailableError } from "../src/adapters/translation/profile-router.js";
 import type {
   GenerationRef,
+  LaneContext,
   TranslationEvent,
   TranslationPort,
   TranslationRequest,
@@ -10,7 +11,13 @@ import type {
 
 class StubPort implements TranslationPort {
   readonly requests: TranslationRequest[] = [];
+  readonly prepared: LaneContext[] = [];
+  readonly closedSessions: string[] = [];
   readonly cancellations: GenerationRef[] = [];
+
+  async prepare(context: LaneContext): Promise<void> {
+    this.prepared.push(context);
+  }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     this.requests.push(request);
@@ -26,6 +33,10 @@ class StubPort implements TranslationPort {
   async cancel(generation: GenerationRef): Promise<void> {
     this.cancellations.push(generation);
   }
+  async closeSession(sessionId: string): Promise<void> {
+    this.closedSessions.push(sessionId);
+  }
+
 }
 
 async function* noFrames() {
@@ -76,6 +87,30 @@ describe("TranslationProfileRouter", () => {
         }),
       TranslationProfileUnavailableError,
     );
+  });
+
+  it("prepares only the selected profile and closes each distinct adapter once", async () => {
+    const shared = new StubPort();
+    const other = new StubPort();
+    const router = new TranslationProfileRouter(new Map([
+      ["deterministic_test", shared],
+      ["local_eval", shared],
+      ["native_live_baseline", other],
+    ]));
+    const context: LaneContext = {
+      sessionId: "s",
+      lane: "A_TO_B",
+      generation: 0,
+      sourceLanguage: "en-US",
+      targetLanguage: "zh-TW",
+      profile: "local_eval",
+    };
+    await router.prepare(context);
+    assert.deepEqual(shared.prepared, [context]);
+    assert.deepEqual(other.prepared, []);
+    await router.closeSession("s");
+    assert.deepEqual(shared.closedSessions, ["s"]);
+    assert.deepEqual(other.closedSessions, ["s"]);
   });
 
   it("broadcasts best-effort generation cancellation to configured adapters", async () => {

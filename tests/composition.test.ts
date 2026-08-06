@@ -269,7 +269,37 @@ describe("production composition", () => {
     }
   });
 
+  it("registers Palabra without OpenAI and keeps the key off capabilities", async () => {
+    const glossaryDirectory = temporaryDirectory("palabra-only");
+    const config = loadConfig({
+      PALABRA_API_KEY: "palabra-test-key",
+      PALABRA_INPUT_CHUNK_MS: "320",
+      TRANSLATION_PROFILE: "palabra_live",
+      EVIDENCE_PROFILE: "in_memory",
+      GLOSSARY_DIRECTORY: glossaryDirectory,
+      LOG_LEVEL: "silent",
+    });
+    const composition = await composeApplication(config);
+    await composition.app.ready();
+    try {
+      const capabilities = await composition.app.inject({
+        method: "GET",
+        url: "/api/capabilities",
+        headers: { authorization: "Bearer " + config.operatorToken },
+      });
+      assert.deepEqual(capabilities.json().translationProfiles, [
+        "deterministic_test",
+        "local_eval",
+        "palabra_live",
+      ]);
+      assert.equal(JSON.stringify(capabilities.json()).includes("palabra-test-key"), false);
+    } finally {
+      await composition.app.close();
+      await rm(glossaryDirectory, { recursive: true, force: true });
+    }
+  });
   it("ends active sessions and flushes encrypted evidence when the app closes", async () => {
+
     const directory = temporaryDirectory("shutdown");
     const evidenceDirectory = resolve(directory, "evidence");
     const key = Buffer.alloc(32, 9);
