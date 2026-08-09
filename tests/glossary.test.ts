@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   GlossaryConflictError,
   compileGlossary,
+  compileGlossaryPair,
   reverseGlossarySpec,
   type GlossaryAlert,
 } from "../src/core/glossary.js";
@@ -72,6 +73,29 @@ test("reverse glossary compiles the approved pair for the opposite lane", () => 
   const authorized = compiled.authorize(placeholder1, bound);
   assert.equal(authorized.status, "authorized");
   assert.equal(authorized.text, "torque controller");
+});
+
+test("compiles a frozen forward/reverse pair and rejects ambiguous alias ownership", () => {
+  const spec = {
+    id: "factory-terms",
+    version: "1",
+    sourceLanguage: "en",
+    targetLanguage: "zh-TW",
+    entries,
+  } as const;
+  const pair = compileGlossaryPair(spec);
+  assert.equal(Object.isFrozen(pair), true);
+  assert.equal(pair.forward.hash.length, 64);
+  assert.equal(pair.reverse.sourceLanguage, "zh-TW");
+  assert.throws(() => compileGlossary({
+    ...spec,
+    entries: [{
+      id: "duplicate-alias",
+      source: "Spindle",
+      aliases: [" spindle "],
+      targetExact: "主軸",
+    }],
+  }), /ambiguous normalized term/u);
 });
 
 test("compile rejects duplicate IDs, empty values, and normalized alias conflicts", () => {

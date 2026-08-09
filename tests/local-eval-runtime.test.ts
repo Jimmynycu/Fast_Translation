@@ -5,16 +5,25 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { test } from "node:test";
 import WebSocket, { type RawData } from "ws";
-import { composeApplication, type ApplicationComposition } from "../src/composition.js";
-import { loadConfig } from "../src/config.js";
+import { InMemoryEvidenceStore } from "../src/adapters/evidence/in-memory.js";
+import { FileGlossaryRepository } from "../src/adapters/glossary/file-repository.js";
+import { createLocalEvalTranslationAdapter } from "../src/adapters/translation/local-eval.js";
+import { FileGlossaryRegistry } from "../src/composition.js";
 import { CANONICAL_AUDIO } from "../src/core/audio.js";
+import { ModularGuardedDuplexRelay } from "../src/core/relay.js";
+import type { EvidenceRecord } from "../src/core/types.js";
+import { createMediaRuntime } from "../src/media-runtime.js";
+import { createServerAccessControl } from "../src/server/access.js";
+import { createServerApp } from "../src/server/app.js";
 import { unpackPlayoutAudio } from "../src/server/protocol.js";
 
 const WAIT_MS = 5_000;
 type JsonObject = Record<string, unknown>;
 
 interface RunningHarness {
-  readonly composition: ApplicationComposition;
+  readonly app: Awaited<ReturnType<typeof createServerApp>>;
+  readonly events: JsonEventJournal;
+  readonly relay: ModularGuardedDuplexRelay;
   readonly directory: string;
   readonly origin: string;
   readonly operatorToken: string;
@@ -58,8 +67,7 @@ async function availablePort(): Promise<number> {
   return address.port;
 }
 
-async function connect(url: string): Promise<WebSocket> {
-  const socket = new WebSocket(url);
+async function waitForSocketOpen(socket: WebSocket): Promise<void> {
   await new Promise<void>((resolvePromise, reject) => {
     const timer = setTimeout(() => reject(new Error("WebSocket connect timeout")), WAIT_MS);
     socket.once("open", () => {
@@ -71,43 +79,81 @@ async function connect(url: string): Promise<WebSocket> {
       reject(error);
     });
   });
+}
+
+async function connect(url: string): Promise<WebSocket> {
+  const socket = new WebSocket(url);
+  await waitForSocketOpen(socket);
   return socket;
 }
 
-function waitJson(
-  socket: WebSocket,
-  predicate: (message: JsonObject) => boolean,
-  label: string,
-): Promise<JsonObject> {
-  return new Promise((resolvePromise, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("Timed out waiting for " + label));
-    }, WAIT_MS);
-    const onMessage = (raw: RawData, binary: boolean): void => {
-      if (binary) return;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(new TextDecoder().decode(rawBytes(raw)));
-      } catch {
-        return;
-      }
-      if (!isObject(parsed) || !predicate(parsed)) return;
-      cleanup();
-      resolvePromise(parsed);
-    };
-    const onError = (error: Error): void => {
-      cleanup();
-      reject(error);
-    };
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      socket.off("message", onMessage);
-      socket.off("error", onError);
-    };
-    socket.on("message", onMessage);
-    socket.once("error", onError);
-  });
+interface EventWaiter {
+  readonly predicate: (message: JsonObject) => boolean;
+  readonly resolve: (message: JsonObject) => void;
+  readonly reject: (error: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Event replay is asynchronous after the WebSocket handshake. Retain it from
+ * connection onward so a fast local-eval turn cannot pass between one-shot
+ * test listeners.
+ */
+class JsonEventJournal {
+  readonly #messages: JsonObject[] = [];
+  readonly #waiters = new Set<EventWaiter>();
+  #failure: Error | undefined;
+
+  constructor(socket: WebSocket) {
+    socket.on("message", this.#onMessage);
+    socket.on("error", this.#onError);
+  }
+
+  waitFor(
+    predicate: (message: JsonObject) => boolean,
+    label: string,
+  ): Promise<JsonObject> {
+    const existing = this.#messages.find(predicate);
+    if (existing !== undefined) return Promise.resolve(existing);
+    if (this.#failure !== undefined) return Promise.reject(this.#failure);
+
+    let waiter!: EventWaiter;
+    return new Promise<JsonObject>((resolvePromise, reject) => {
+      const timer = setTimeout(() => {
+        this.#waiters.delete(waiter);
+        reject(new Error("Timed out waiting for " + label));
+      }, WAIT_MS);
+      waiter = { predicate, resolve: resolvePromise, reject, timer };
+      this.#waiters.add(waiter);
+    });
+  }
+
+  #onMessage = (raw: RawData, binary: boolean): void => {
+    if (binary) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(rawBytes(raw)));
+    } catch {
+      return;
+    }
+    if (!isObject(parsed)) return;
+    this.#messages.push(parsed);
+    for (const waiter of [...this.#waiters]) {
+      if (!waiter.predicate(parsed)) continue;
+      clearTimeout(waiter.timer);
+      this.#waiters.delete(waiter);
+      waiter.resolve(parsed);
+    }
+  };
+
+  #onError = (error: Error): void => {
+    this.#failure = error;
+    for (const waiter of this.#waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.#waiters.clear();
+  };
 }
 
 function waitBinary(socket: WebSocket, label: string): Promise<Uint8Array> {
@@ -183,19 +229,39 @@ async function startHarness(
   const directory = resolve(process.cwd(), "work", "tmp", "local-eval-runtime", randomUUID());
   const port = await availablePort();
   const operatorToken = "local-eval-operator-0123456789abcdef";
-  const config = loadConfig({
-    PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
-    OPERATOR_TOKEN: operatorToken,
-    TRANSLATION_PROFILE: "local_eval",
-    LOCAL_EVAL_TRANSCRIPT_A_TO_B: "Verify the mistake proofing fixture.",
-    LOCAL_EVAL_TRANSCRIPT_B_TO_A: "請確認防呆治具。",
-    LOCAL_EVAL_TRANSLATION_MODE: translationMode,
-    EVIDENCE_PROFILE: "in_memory",
-    GLOSSARY_DIRECTORY: directory,
-    LOG_LEVEL: "silent",
+  const origin = `http://127.0.0.1:${port}`;
+  const access = createServerAccessControl({ operatorToken });
+  const media = createMediaRuntime({
+    profile: "browser_pair",
+    publicBaseUrl: new URL(origin),
+    access,
   });
-  const composition = await composeApplication(config);
-  const origin = await composition.app.listen({ host: "127.0.0.1", port });
+  if (media.browserGateway === undefined) {
+    throw new Error("The local evaluation runtime requires browser media");
+  }
+  const translation = createLocalEvalTranslationAdapter({
+    transcriptByLane: {
+      A_TO_B: "Verify the mistake proofing fixture.",
+      B_TO_A: "請確認防呆治具。",
+    },
+    translationMode,
+  });
+  const relay = new ModularGuardedDuplexRelay({
+    media: media.port,
+    translation,
+    evidence: new InMemoryEvidenceStore<EvidenceRecord>(),
+    endpointGrant: media.endpointGrant,
+  });
+  const app = await createServerApp({
+    relay,
+    glossaries: new FileGlossaryRegistry(new FileGlossaryRepository({ directory })),
+    mediaProfile: media.profile,
+    browserMedia: media.browserGateway,
+    access,
+    translation: { ...translation.capabilities, defaultMode: "accurate" },
+    logger: false,
+  });
+  await app.listen({ host: "127.0.0.1", port });
   const csv = [
     "id,source,aliases,target_exact",
     "poka-yoke,poka-yoke,mistake proofing,防呆",
@@ -211,7 +277,7 @@ async function startHarness(
   assert.equal(typeof imported.glossaryVersion, "string");
   const created = await postJson(origin, "/api/sessions", operatorToken, {
     languages: { A: "en-US", B: "zh-TW" },
-    translationProfileId: "local_eval",
+    translationMode: "accurate",
     glossaryVersion: imported.glossaryVersion,
     recordingConsent: true,
   }, 201);
@@ -221,9 +287,22 @@ async function startHarness(
   const eventUrl = new URL(`/ws/events/${encodeURIComponent(sessionId)}`, origin);
   eventUrl.protocol = "ws:";
   eventUrl.searchParams.set("access", operatorToken);
-  const eventSocket = await connect(eventUrl.toString());
-  const ready = waitJson(
-    eventSocket,
+  const eventSocket = new WebSocket(eventUrl.toString());
+  const events = new JsonEventJournal(eventSocket);
+  await waitForSocketOpen(eventSocket);
+  await events.waitFor(
+    (message) => message.type === "session_state" && dataOf(message).status === "waiting",
+    "event stream subscription",
+  );
+  const joinedA = events.waitFor(
+    (message) => message.type === "participant_joined" && dataOf(message).side === "A",
+    "participant A joined",
+  );
+  const joinedB = events.waitFor(
+    (message) => message.type === "participant_joined" && dataOf(message).side === "B",
+    "participant B joined",
+  );
+  const ready = events.waitFor(
     (message) => message.type === "session_state" && dataOf(message).status === "ready",
     "ready",
   );
@@ -231,9 +310,8 @@ async function startHarness(
     connect(mediaUrl(created, origin, sessionId, "A")),
     connect(mediaUrl(created, origin, sessionId, "B")),
   ]);
-  await ready;
-  const active = waitJson(
-    eventSocket,
+  await Promise.all([joinedA, joinedB, ready]);
+  const active = events.waitFor(
     (message) => message.type === "session_state" && dataOf(message).status === "active",
     "active",
   );
@@ -242,7 +320,7 @@ async function startHarness(
     commandId: randomUUID(),
   }, 202);
   await active;
-  return { composition, directory, origin, operatorToken, sessionId, eventSocket, socketA, socketB };
+  return { app, events, relay, directory, origin, operatorToken, sessionId, eventSocket, socketA, socketB };
 }
 
 async function stopHarness(harness: RunningHarness): Promise<void> {
@@ -251,7 +329,12 @@ async function stopHarness(harness: RunningHarness): Promise<void> {
     closeSocket(harness.socketB),
     closeSocket(harness.eventSocket),
   ]);
-  await harness.composition.app.close();
+  await harness.relay.command(harness.sessionId, {
+    type: "end",
+    commandId: randomUUID(),
+    reason: "local_evaluation_test_cleanup",
+  }).catch(() => undefined);
+  await harness.app.close();
   await rm(harness.directory, { recursive: true, force: true });
 }
 
@@ -270,10 +353,30 @@ async function closeSocket(socket: WebSocket): Promise<void> {
   });
 }
 
-function sendTurn(socket: WebSocket, fill: number): void {
-  socket.send(JSON.stringify({ type: "speech_start" }));
-  socket.send(new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(fill), { binary: true });
-  socket.send(JSON.stringify({ type: "speech_end" }));
+function sendSocketMessage(
+  socket: WebSocket,
+  message: string | Uint8Array,
+  binary: boolean,
+): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    socket.send(message, { binary }, (error) => {
+      if (error == null) {
+        resolvePromise();
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
+async function sendTurn(socket: WebSocket, fill: number): Promise<void> {
+  await sendSocketMessage(socket, JSON.stringify({ type: "speech_start" }), false);
+  await sendSocketMessage(
+    socket,
+    new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(fill),
+    true,
+  );
+  await sendSocketMessage(socket, JSON.stringify({ type: "speech_end" }), false);
 }
 
 test("local_eval authorizes alias and reverse glossary through real HTTP and WebSockets", {
@@ -281,32 +384,30 @@ test("local_eval authorizes alias and reverse glossary through real HTTP and Web
 }, async () => {
   const harness = await startHarness("preserve");
   try {
-    const validatedA = waitJson(
-      harness.eventSocket,
+    const validatedA = harness.events.waitFor(
       (message) => message.type === "target_validated" &&
         message.lane === "A_TO_B" && dataOf(message).text?.toString().includes("防呆") === true,
       "A_TO_B target_exact",
     );
     const audioToB = waitBinary(harness.socketB, "A_TO_B canonical audio");
-    sendTurn(harness.socketA, 4);
+    await sendTurn(harness.socketA, 4);
     const [resultA, packetB] = await Promise.all([validatedA, audioToB]);
     assert.deepEqual(dataOf(resultA).guaranteedTargetExact, ["防呆"]);
     const playoutB = unpackPlayoutAudio(packetB);
     assert.equal(playoutB.pcm16le.byteLength, CANONICAL_AUDIO.bytesPerFrame);
-    harness.socketB.send(JSON.stringify({
+    await sendSocketMessage(harness.socketB, JSON.stringify({
       type: "playout_started",
       generation: playoutB.generation,
       sequence: playoutB.sequence,
-    }));
+    }), false);
 
-    const validatedB = waitJson(
-      harness.eventSocket,
+    const validatedB = harness.events.waitFor(
       (message) => message.type === "target_validated" &&
         message.lane === "B_TO_A" && dataOf(message).text?.toString().includes("poka-yoke") === true,
       "B_TO_A reverse target_exact",
     );
     const audioToA = waitBinary(harness.socketA, "B_TO_A canonical audio");
-    sendTurn(harness.socketB, 7);
+    await sendTurn(harness.socketB, 7);
     const [resultB, packetA] = await Promise.all([validatedB, audioToA]);
     assert.deepEqual(dataOf(resultB).guaranteedTargetExact, ["poka-yoke"]);
     assert.equal(unpackPlayoutAudio(packetA).pcm16le.byteLength, CANONICAL_AUDIO.bytesPerFrame);
@@ -320,19 +421,17 @@ test("local_eval runtime fails open with alert and uninterrupted canonical audio
 }, async () => {
   const harness = await startHarness("drop_placeholders");
   try {
-    const alert = waitJson(
-      harness.eventSocket,
+    const alert = harness.events.waitFor(
       (message) => message.type === "terminology_alert" &&
         dataOf(message).code === "GLOSSARY_PLACEHOLDER_MISSING",
       "placeholder fail-open alert",
     );
-    const target = waitJson(
-      harness.eventSocket,
-      (message) => message.type === "target_committed" && message.lane === "A_TO_B",
+    const target = harness.events.waitFor(
+      (message) => message.type === "target_segment" && message.lane === "A_TO_B",
       "fail-open target text",
     );
     const audio = waitBinary(harness.socketB, "fail-open canonical audio");
-    sendTurn(harness.socketA, 9);
+    await sendTurn(harness.socketA, 9);
     const [alertEvent, targetEvent, packet] = await Promise.all([alert, target, audio]);
     assert.equal(dataOf(alertEvent).code, "GLOSSARY_PLACEHOLDER_MISSING");
     assert.equal(typeof dataOf(targetEvent).text, "string");

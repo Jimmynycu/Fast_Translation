@@ -39,6 +39,8 @@ describe("media runtime composition", () => {
     assert.ok(runtime.port instanceof FakeTelephonyMediaPort);
     assert.equal(runtime.browserGateway, undefined);
     assert.equal(runtime.telephonyTestDriver, runtime.port);
+    assert.equal(typeof runtime.telephonyTestDriver?.ingestDtmf, "function");
+    assert.equal(typeof runtime.telephonyTestDriver?.emitAlert, "function");
     assert.deepEqual(await runtime.endpointGrant("session/1", "B"), {
       kind: "telephony_test",
       side: "B",

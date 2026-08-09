@@ -18,7 +18,7 @@ function canonical(value: unknown): unknown {
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
         .map(([key, entry]) => [key, canonical(entry)]),
     );
   }
@@ -168,14 +168,14 @@ describe("approved small benchmark workload", () => {
 });
 
 describe("executable benchmark manifest", () => {
-  it("pins fixtures, schedules, arm configs, profiles, evidence, timing, and run order", () => {
+  it("pins fixtures, schedules, explicit providers and behaviors, evidence, timing, and run order", () => {
     validateExecutableBenchmarkManifest();
     const first = createExecutableBenchmarkManifest();
     const second = createExecutableBenchmarkManifest();
     assert.equal(first.manifestSha256, second.manifestSha256);
     assert.deepEqual(first, second);
     assert.match(first.manifestSha256, /^[a-f0-9]{64}$/u);
-    assert.equal(first.schemaVersion, 2);
+    assert.equal(first.schemaVersion, 3);
     assert.equal(first.runs.length, 183);
     assert.equal(first.runs.filter((run) => run.stage === "discovery").length, 60);
     assert.equal(first.runs.filter((run) => run.stage === "formal_terminology").length, 24);
@@ -187,6 +187,7 @@ describe("executable benchmark manifest", () => {
     assert.equal(Object.isFrozen(first.fixtures[0]), true);
     assert.equal(Object.isFrozen(first.schedules[0]?.events), true);
     assert.equal(Object.isFrozen(first.arms[0]?.config), true);
+    assert.equal(Object.isFrozen(first.arms[0]?.behavior), true);
     assert.equal(Object.isFrozen(first.runs[0]?.sourceRun), true);
 
     const fixtureIds = new Set(first.fixtures.map((fixture) => fixture.fixtureId));
@@ -196,9 +197,23 @@ describe("executable benchmark manifest", () => {
       if (run.scheduleId !== undefined) assert.equal(scheduleIds.has(run.scheduleId), true);
       if (run.arm !== undefined) {
         assert.match(run.armConfigSha256 ?? "", /^[a-f0-9]{64}$/u);
-        assert.match(run.profileSha256 ?? "", /^[a-f0-9]{64}$/u);
+        assert.match(run.behaviorSha256 ?? "", /^[a-f0-9]{64}$/u);
       }
     }
+    assert.deepEqual(first.arms.map((arm) => [arm.arm, arm.provider, arm.mode]), [
+      ["PALABRA_REFERENCE", "palabra", "balanced"],
+      ["OPENAI_NATIVE_TRANSLATE", "openai_native", "balanced"],
+      ["GLOSSARY_CONTROLLED", "openai_controlled", "accurate"],
+    ]);
+    assert.deepEqual(first.gates, {
+      targetExact: "all_bound_committed_terms",
+      zeroOpenRegression: true,
+      alertsClear: true,
+      latencyEvidence: "all_local_latency_samples",
+      normalizedEventEvidence: "revisions_finality_audio_sequence",
+      noRuntimeHotSwap: true,
+      gatesSha256: first.gates.gatesSha256,
+    });
 
     const latencyPairs = new Map<string, number>();
     for (const run of first.runs.filter((candidate) => candidate.stage === "latency")) {
@@ -316,11 +331,11 @@ describe("executable benchmark manifest", () => {
     assert.ok(secondLatency);
     const duplicatedArm = firstLatency.arm;
     const duplicatedConfigSha256 = firstLatency.armConfigSha256;
-    const duplicatedProfileSha256 = firstLatency.profileSha256;
+    const duplicatedBehaviorSha256 = firstLatency.behaviorSha256;
     if (
       duplicatedArm === undefined ||
       duplicatedConfigSha256 === undefined ||
-      duplicatedProfileSha256 === undefined
+      duplicatedBehaviorSha256 === undefined
     ) {
       throw new Error("Canonical latency run is missing its arm freeze");
     }
@@ -329,7 +344,7 @@ describe("executable benchmark manifest", () => {
           ...run,
           arm: duplicatedArm,
           armConfigSha256: duplicatedConfigSha256,
-          profileSha256: duplicatedProfileSha256,
+          behaviorSha256: duplicatedBehaviorSha256,
         }
       : run);
     const duplicateArm = withManifestHash({

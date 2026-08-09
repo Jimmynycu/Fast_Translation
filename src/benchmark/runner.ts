@@ -32,6 +32,14 @@ export interface FormalTerminologyObservation {
   readonly glossaryHash: string;
   readonly playedFrameCount: number;
   readonly uninterrupted: boolean;
+  /** Captured normalized transcript revision/finality and playout-sequence evidence. */
+  readonly normalizedEventEvidence: Readonly<{
+    readonly sourceRevision: number;
+    readonly targetRevision: number;
+    readonly targetFinal: boolean;
+    readonly playoutSequenceContiguous: boolean;
+  }>;
+  readonly alerts: readonly string[];
   readonly elapsedMs: number;
 }
 
@@ -47,6 +55,13 @@ export interface LocalLatencyObservation {
   readonly glossaryHash: string;
   readonly playedFrameCount: number;
   readonly uninterrupted: boolean;
+  readonly normalizedEventEvidence: Readonly<{
+    readonly sourceRevision: number;
+    readonly targetRevision: number;
+    readonly targetFinal: boolean;
+    readonly playoutSequenceContiguous: boolean;
+  }>;
+  readonly alerts: readonly string[];
   readonly metricsMs: Readonly<{
     readonly speechToAligned: number;
     readonly stableSourceToPlayable: number;
@@ -64,18 +79,32 @@ export interface LocalInterruptionObservation {
   readonly staleOutputRejected: boolean;
   readonly validOutputResumed: boolean;
   readonly clearLatencyMs: number;
+  readonly alerts: readonly string[];
 }
 
 export interface LocalSoakObservation {
   readonly kind: "continuous_duplex";
   readonly scheduleId: string;
-  readonly executionMode: "accelerated_virtual_time";
+  /** This is a sparse local mechanism fixture, never a live sustained-soak result. */
+  readonly executionMode: "sampled_virtual_mechanism";
+  /** The omitted virtual frames are not sent to a provider or retained in a queue. */
+  readonly coverageScope: "virtual_mechanism_only";
+  /** Span of the virtual timeline represented by the sparse fixture. */
   readonly virtualDurationMs: number;
-  readonly processedFrames: number;
-  readonly queueMaximumDepth: number;
-  readonly queueFinalDepth: number;
-  readonly queueGrowthDetected: boolean;
+  /** Virtual 20 ms frame positions covered by the deterministic sparse fixture. */
+  readonly virtualFramesRepresented: number;
+  /** Actual source PCM frames sent to the local relay, per direction. */
+  readonly sampleFramesPerLane: number;
+  /** Actual source PCM frames sent to the local relay across both directions. */
+  readonly processedSampleFrames: number;
+  /** Maximum simultaneous local playout callbacks; this is not a provider queue depth. */
+  readonly playbackMaximumConcurrency: number;
+  /** Sampled frames that were not acknowledged by the local MediaPort. */
+  readonly unacknowledgedSampleFrames: number;
+  /** Queue pressure observed within the sparse local fixture only. */
+  readonly queuePressureDetected: boolean;
   readonly checksum: number;
+  readonly alerts: readonly string[];
 }
 
 export type BenchmarkObservation =
@@ -158,6 +187,13 @@ export interface BenchmarkAcceptanceScore {
   readonly armVerdicts: Readonly<Record<BenchmarkArm, BenchmarkArmVerdict>>;
   readonly discovery: BenchmarkStageScore;
   readonly localMechanismVerdict: "PASS" | "FAIL";
+  readonly localReleaseEvidence: Readonly<{
+    readonly targetExact: boolean;
+    readonly zeroRegression: boolean;
+    readonly alertsClear: boolean;
+    readonly latency: boolean;
+    readonly evidenceComplete: boolean;
+  }>;
   readonly providerAcceptanceVerdict: "NOT_RUN";
   readonly productAcceptanceVerdict: "NOT_RUN";
   readonly limitations: readonly string[];
@@ -433,6 +469,11 @@ function observationPassed(observation: BenchmarkObservation): boolean {
   switch (observation.kind) {
     case "formal_terminology":
       return observation.uninterrupted &&
+        observation.alerts.length === 0 &&
+        observation.normalizedEventEvidence.sourceRevision >= 0 &&
+        observation.normalizedEventEvidence.targetRevision >= 0 &&
+        observation.normalizedEventEvidence.targetFinal &&
+        observation.normalizedEventEvidence.playoutSequenceContiguous &&
         observation.playedFrameCount === 3 &&
         (observation.scenario === "protected"
           ? observation.targetExactSatisfied &&
@@ -446,6 +487,11 @@ function observationPassed(observation: BenchmarkObservation): boolean {
             observation.matchedSourceTexts.length === 0);
     case "latency":
       return observation.uninterrupted &&
+        observation.alerts.length === 0 &&
+        observation.normalizedEventEvidence.sourceRevision >= 0 &&
+        observation.normalizedEventEvidence.targetRevision >= 0 &&
+        observation.normalizedEventEvidence.targetFinal &&
+        observation.normalizedEventEvidence.playoutSequenceContiguous &&
         observation.playedFrameCount === 3 &&
         (observation.scenario === "protected"
           ? observation.targetExactSatisfied &&
@@ -460,17 +506,57 @@ function observationPassed(observation: BenchmarkObservation): boolean {
         );
     case "interruption":
       return observation.generationCut &&
+        observation.alerts.length === 0 &&
         observation.playoutCleared &&
         observation.staleOutputRejected &&
         observation.validOutputResumed &&
         Number.isFinite(observation.clearLatencyMs);
     case "continuous_duplex":
       return observation.virtualDurationMs === 600_000 &&
-        observation.processedFrames === 60_000 &&
-        observation.queueFinalDepth === 0 &&
+        observation.coverageScope === "virtual_mechanism_only" &&
+        observation.alerts.length === 0 &&
+        observation.virtualFramesRepresented === 60_000 &&
+        observation.sampleFramesPerLane === 30 &&
+        observation.processedSampleFrames === 60 &&
+        observation.processedSampleFrames < observation.virtualFramesRepresented &&
+        observation.unacknowledgedSampleFrames === 0 &&
         observation.checksum > 0 &&
-        !observation.queueGrowthDetected;
+        !observation.queuePressureDetected;
   }
+}
+
+function observationAlerts(observation: BenchmarkObservation | undefined): readonly string[] | undefined {
+  return observation?.alerts;
+}
+
+function releaseEvidence(results: readonly BenchmarkRunResult[]): BenchmarkAcceptanceScore["localReleaseEvidence"] {
+  const local = results.filter((result) => result.arm === "GLOSSARY_CONTROLLED");
+  const formal = local.filter((result) => result.stage === "formal_terminology");
+  const latency = local.filter((result) => result.stage === "latency");
+  const targetExact = formal.filter((result) =>
+    result.observation?.kind === "formal_terminology" && result.observation.scenario === "protected"
+  ).length === 4 && formal.every((result) =>
+    result.observation?.kind !== "formal_terminology" ||
+    result.observation.scenario !== "protected" || result.observation.targetExactSatisfied
+  );
+  const zeroRegression = formal.length === 8 && formal.every((result) => result.outcome === "PASS");
+  const alertsClear = local.length > 0 && local.every((result) =>
+    observationAlerts(result.observation)?.length === 0
+  );
+  const latencyPassed = latency.length === 12 && latency.every((result) =>
+    result.outcome === "PASS" && result.observation?.kind === "latency" &&
+    Object.values(result.observation.metricsMs).every((sample) => Number.isFinite(sample) && sample >= 0)
+  );
+  const evidenceComplete = local.length === 41 && local.every((result) =>
+    result.outcome === "PASS" && result.observation !== undefined
+  );
+  return deepFreeze({
+    targetExact,
+    zeroRegression,
+    alertsClear,
+    latency: latencyPassed,
+    evidenceComplete,
+  });
 }
 
 function stageScore(
@@ -577,6 +663,7 @@ export function scoreBenchmarkResults(
   const localMechanismVerdict =
     armVerdicts.GLOSSARY_CONTROLLED.verdict === "PASS" ? "PASS" as const : "FAIL" as const;
   const discoveryResults = results.filter((result) => result.stage === "discovery");
+  const localReleaseEvidence = releaseEvidence(results);
   const body = {
     schemaVersion: 1 as const,
     manifestSha256: manifest.manifestSha256,
@@ -585,10 +672,12 @@ export function scoreBenchmarkResults(
     armVerdicts,
     discovery: stageScore(discoveryResults, 60),
     localMechanismVerdict,
+    localReleaseEvidence,
     providerAcceptanceVerdict: "NOT_RUN" as const,
     productAcceptanceVerdict: "NOT_RUN" as const,
     limitations: Object.freeze([
       "The local arm measures deterministic mechanism behavior, not live acoustic latency.",
+      "Continuous duplex PASS covers only 60 sampled virtual frames (30 per lane); a sustained provider or queue soak remains NOT_RUN.",
       "OpenAI and Palabra adapters were not configured and remain NOT_RUN.",
       "Discovery requires the separately budgeted paid command and remains NOT_RUN.",
     ]),
@@ -704,10 +793,20 @@ export async function executeKeylessBenchmark(
         const schedule = run.scheduleId === undefined
           ? undefined
           : requiredSchedule(run, schedules);
+        if (
+          run.provider === undefined ||
+          run.mode === undefined ||
+          run.behavior === undefined
+        ) {
+          throw new Error(`${run.runId} is missing its explicit execution behavior`);
+        }
         const observation = await localHarnessExecutor({
           run,
-          profile: options.profileUnderTest.profile,
-          profileHash: options.profileUnderTest.profileHash,
+          provider: run.provider,
+          mode: run.mode,
+          behavior: run.behavior,
+          approvedProfile: options.profileUnderTest.profile,
+          approvedProfileHash: options.profileUnderTest.profileHash,
           ...(fixture === undefined ? {} : { fixture }),
           ...(schedule === undefined ? {} : { schedule }),
         });

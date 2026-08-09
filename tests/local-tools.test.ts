@@ -95,20 +95,35 @@ describe("keyless local tools", () => {
       ) as {
         schemaVersion: number;
         generator: string;
+        sourceGlossarySha256: string;
         fixtures: Array<{
           wavPath: string;
           wavSha256: string;
           phrase: string;
           targetExact: string;
+          direction: "A_TO_B" | "B_TO_A";
+          phraseKind: "source" | "alias" | "confuser";
+          visibility: "public" | "holdout";
+          expectation: "target_exact_present" | "target_exact_absent";
         }>;
       };
-      assert.equal(manifest.schemaVersion, 2);
+      assert.equal(manifest.schemaVersion, 3);
       assert.ok([
         "Windows SAPI", "FFmpeg flite", "Windows SAPI + FFmpeg flite",
       ].includes(manifest.generator));
+      assert.match(manifest.sourceGlossarySha256, /^[a-f0-9]{64}$/u);
       assert.ok(manifest.fixtures.length > 0);
       assert.ok(manifest.fixtures.every((fixture) =>
         fixture.phrase.length > 0 && fixture.targetExact.length > 0
+      ));
+      assert.ok(manifest.fixtures.some((fixture) => fixture.direction === "A_TO_B"));
+      assert.ok(manifest.fixtures.some((fixture) => fixture.direction === "B_TO_A"));
+      assert.ok(manifest.fixtures.some((fixture) =>
+        fixture.visibility === "holdout" && fixture.expectation === "target_exact_present"
+      ));
+      assert.ok(manifest.fixtures.some((fixture) =>
+        fixture.phraseKind === "confuser" && fixture.visibility === "holdout" &&
+        fixture.expectation === "target_exact_absent"
       ));
       const first = manifest.fixtures[0];
       assert.ok(first);

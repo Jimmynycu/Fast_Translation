@@ -1,8 +1,26 @@
 const MULAW_BIAS = 0x84;
 const MULAW_CLIP = 32_635;
 
-export const TELEPHONY_SAMPLE_RATE_HZ = 8_000;
+/**
+ * Fixed, provider-free transport format used by the telephony fixture.
+ * PCMU is the RTP name for G.711 mu-law; every fixture packet is exactly one
+ * 20 ms mono frame and carries no credentials or provider metadata.
+ */
+export const TELEPHONY_PCMU_FORMAT = Object.freeze({
+  codec: "PCMU" as const,
+  sampleRateHz: 8_000,
+  channels: 1 as const,
+  frameDurationMs: 20,
+  samplesPerFrame: 160,
+  bytesPerFrame: 160,
+});
+
+export const TELEPHONY_SAMPLE_RATE_HZ = TELEPHONY_PCMU_FORMAT.sampleRateHz;
 export const CANONICAL_SAMPLE_RATE_HZ = 24_000;
+
+export function createPcmuSilenceFrame(): Uint8Array {
+  return new Uint8Array(TELEPHONY_PCMU_FORMAT.bytesPerFrame).fill(0xff);
+}
 
 export function decodeMulawSample(value: number): number {
   const encoded = (~value) & 0xff;
@@ -34,6 +52,7 @@ export function encodeMulawSample(sample: number): number {
  * intentionally belongs to the phone adapter seam, never to the relay core.
  */
 export function decodeMulaw8kToPcm16le24k(input: Uint8Array): Uint8Array {
+  assertTelephonyFrame(input);
   const output = new Uint8Array(input.byteLength * 3 * Int16Array.BYTES_PER_ELEMENT);
   const view = new DataView(output.buffer, output.byteOffset, output.byteLength);
 
@@ -55,9 +74,7 @@ export function decodeMulaw8kToPcm16le24k(input: Uint8Array): Uint8Array {
  * survives the adapter round trip without a provider-specific dependency.
  */
 export function encodePcm16le24kToMulaw8k(input: Uint8Array): Uint8Array {
-  if (input.byteLength % 6 !== 0) {
-    throw new RangeError("24 kHz PCM input must contain complete groups of three Int16 samples");
-  }
+  assertCanonicalFrame(input);
 
   const inputView = new DataView(input.buffer, input.byteOffset, input.byteLength);
   const output = new Uint8Array(input.byteLength / 6);
@@ -75,8 +92,13 @@ export function encodePcm16le24kToMulaw8k(input: Uint8Array): Uint8Array {
 }
 
 export function assertTelephonyFrame(input: Uint8Array): void {
-  if (input.byteLength !== 160) {
-    throw new RangeError(`Expected one 20 ms 8 kHz mu-law frame (160 bytes), received ${input.byteLength}`);
+  if (input.byteLength !== TELEPHONY_PCMU_FORMAT.bytesPerFrame) {
+    throw new RangeError(
+      `Expected one ${TELEPHONY_PCMU_FORMAT.frameDurationMs} ms ` +
+      `${TELEPHONY_PCMU_FORMAT.sampleRateHz / 1_000} kHz ` +
+      `${TELEPHONY_PCMU_FORMAT.codec} frame ` +
+      `(${TELEPHONY_PCMU_FORMAT.bytesPerFrame} bytes), received ${input.byteLength}`,
+    );
   }
 }
 

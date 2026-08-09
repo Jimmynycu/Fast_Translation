@@ -15,8 +15,8 @@ phone-browser participants on the same LAN:
                                       |
                                       v
 +----------------+   HTTPS/WSS   +-----------------------------+   server only
-| Phone A browser| <-----------> | Central Harness on one PC   | <------------> OpenAI
-| mic + headphones|              | session, routing, profiles, |   (optional)
+| Phone A browser| <-----------> | Central Harness on one PC   | <------------> selected provider
+| mic + headphones|              | session, routing, modes,    |       OpenAI or Palabra
 +----------------+               | glossary, fence, evidence   |
                                  +-----------------------------+
 +----------------+   HTTPS/WSS              ^
@@ -26,15 +26,17 @@ phone-browser participants on the same LAN:
 ```
 
 This is not a carrier call. A phone is an ordinary browser endpoint. There is no
-PSTN/SIP number, inbound ring, IVR, AI greeting, DTMF, or automated language
-question in the current implementation.
+PSTN/SIP number, inbound ring, IVR, AI greeting, live DTMF control, or
+automated language question in the current implementation. The test-telephony
+driver can inject DTMF only as a normalized fixture alert; it never dials,
+answers, or synthesizes conversational audio.
 
 `createMediaRuntime` is the composition seam. `MEDIA_PROFILE=browser_pair`
 builds the browser WebSocket port and signed QR grants.
 `MEDIA_PROFILE=fake_telephony` instead builds the in-process G.711 mu-law test
 port, returns `fake-telephony://` grants, exposes a test driver, and omits the
-browser media route. Capabilities advertise only the active profile. The fake
-profile is executable but is not a live carrier.
+browser media route. Capabilities advertise only the active media setting. The
+fake fixture is executable but is not a live carrier.
 
 The direct-start rule is enforced by the room lifecycle: the operator creates a
 room, both participants connect through the selected media adapter, the Harness
@@ -50,7 +52,7 @@ agent sits in front of either human.
 - participant connection state;
 - bounded source and playout queues;
 - per-lane sequence and generation state;
-- translation-profile routing;
+- fixed-provider, per-session-mode routing;
 - interruption cuts and stale-generation rejection;
 - normalized session events; and
 - non-blocking evidence writes, including active-session closure and evidence
@@ -117,43 +119,59 @@ recording key plus an explicit plaintext acknowledgement. Live evidence writes
 remain bounded and fail open: an evidence problem is surfaced as a health alert
 without blocking media.
 
-## Translation profiles
+## Translation provider and mode contract
 
-The composition root always registers `deterministic_test` and `local_eval`.
-If and only if `OPENAI_API_KEY` is present, it also registers both OpenAI-backed
-profiles. If and only if `PALABRA_API_KEY` is present, it registers
-`palabra_live` with the configured `PALABRA_INPUT_CHUNK_MS` pacing.
+`TRANSLATION_PROVIDER` selects exactly one provider while the server starts:
+`openai_native`, `openai_controlled`, or `palabra`. Composition validates the
+selected key and the configured `TRANSLATION_MODE`, constructs only that
+provider's `TranslationPort`, and publishes its static capabilities. The
+provider never changes at runtime.
 
-| Profile | Implementation |
-|---|---|
-| `deterministic_test` | Emits deterministic labels and returns input audio through the correct opposite-side route. It exercises the Harness but performs no language translation. |
-| `local_eval` | Accepts canonical input frames, injects declared lane transcripts, runs the same glossary binding/authorization and alert path, and emits deterministic canonical PCM. It proves Harness behavior, not acoustic STT or provider TTS. |
-| `native_live_baseline` | Connects server-side to the dedicated OpenAI realtime translation adapter and streams normalized translation events into the Harness. |
-| `glossary_controlled` | Composes live transcription, server-side text translation, glossary binding/authorization, and TTS. |
-| `palabra_live` | Uses the server-side Palabra streaming adapter. Relay lanes remain controlled/per-utterance; it is not classified as native continuous. |
+| Provider | Required server credential | Advertised modes | Deterministic pinned glossary |
+|---|---|---|---|
+| `openai_native` | `OPENAI_API_KEY` | `fast`, `balanced`; `accurate` is unsupported | none; `balanced` is marked degraded because it uses adapter-local holdback rather than a model-quality guarantee |
+| `openai_controlled` | `OPENAI_API_KEY` | `fast`, `balanced`, `accurate` | all three modes advertise it |
+| `palabra` | `PALABRA_API_KEY` | `fast`, `balanced`, `accurate` | none; `accurate` is marked degraded because Palabra account glossaries cannot provide this Harness's deterministic pinned guarantee |
 
-For each controlled lane, the pinned glossary's source terms and aliases are
-deduplicated and sent to `gpt-live-transcribe` as session-specific keyword
-hints; the lane source language is sent as a language hint. The automatically
-compiled reverse glossary therefore supplies the opposite lane's hints without
-runtime mutation. Unsupported keyword shapes are omitted from STT hints while
-the deterministic target authorization path remains active.
+`TRANSLATION_MODE` defaults to `balanced` and must be one of `fast`,
+`balanced`, or `accurate`; it supplies the default UI selection and is validated
+against the chosen provider. It does not force all sessions to use that mode.
+The operator UI reads `/api/capabilities`, displays the fixed provider, and
+offers only the advertised modes. Each option carries a behavior version,
+full/degraded state and reason, and a `deterministicGlossary` flag. A session
+request sends a mode, not a provider; the server rejects unsupported modes and
+pins provider, mode, behavior version, and degradation state into the session
+snapshot.
 
-The controlled profile replaces matched source terms with opaque placeholders,
-asks the text translator to preserve them byte-for-byte, and reinserts the
-approved `target_exact` values. Missing, duplicated, reordered, or unknown
-placeholders create structured terminology alerts. The path fails open with the
-best available text when control or a provider fails; continuity is not a claim
-that terminology acceptance passed.
+The mode behavior is defined independently of an adapter: `fast` continuously
+commits input and permits provisional revisions with no holdback; `balanced`
+continuously commits input, emits final-only transcript segments, and uses a
+250 ms holdback; `accurate` commits at speech end, emits final-only segments,
+and uses a 700 ms holdback. All modes retain the same destination-only
+interruption rule. The capability status is authoritative when a provider cannot
+meet a mode's strongest terminology expectation.
 
-The `TRANSLATION_PROFILE` environment variable participates in startup
-validation. A no-key process can select `deterministic_test` or `local_eval`;
-`palabra_live` requires `PALABRA_API_KEY`. Translation ports expose required
-`prepare(context)` and `closeSession(sessionId)` lifecycle methods. Starting a
-room prepares both lane contexts concurrently before emitting `active`; a
-preparation failure leaves the room `ready` and closes the provider session.
-The API reports the actually registered profiles and rejects a session request
-for an unavailable profile.
+`openai_native` is the direct server-side OpenAI realtime path. `openai_controlled`
+is a separate complete path composing transcription, server-side text
+translation, glossary binding/authorization, and TTS. For each controlled lane,
+pinned source terms and aliases are deduplicated into session keyword hints; the
+compiled reverse glossary supplies the opposite lane without runtime mutation.
+Matched terms are replaced by opaque placeholders, translated while preserved,
+then restored to approved `target_exact` values. Missing, duplicate, reordered,
+or unknown placeholders create structured terminology alerts. This path fails
+open with the best available text if control or a provider fails; continuity does
+not make a terminology acceptance claim.
+
+`palabra` is a complete independent server-side speech-to-speech alternative.
+It uses the Palabra streaming adapter with `PALABRA_INPUT_CHUNK_MS` pacing
+(20–320 ms in 20 ms increments) and exposes its own capability table. A Palabra
+account glossary is not a substitute for the Harness's deterministic pinned
+target-exact contract.
+
+Translation ports expose `prepare(context)` and `closeSession(sessionId)`
+lifecycle methods. Opening a room prepares both lane contexts concurrently
+before it becomes active; a preparation failure leaves the room ready and closes
+the provider session.
 
 ## Glossary boundary
 
@@ -173,11 +191,13 @@ session. The Harness compiles both directions: the approved `source` ->
 not guessed as reverse aliases. Import compiles both directions up front and
 rejects duplicate or ambiguous reverse terms before storing the version.
 
-`glossaryVersion` is valid when the session profile is
-`glossary_controlled` or `local_eval`; the HTTP API rejects it for
-`deterministic_test`, `native_live_baseline`, and `palabra_live` instead of
-advertising a glossary that those paths ignore. Palabra account-enabled
-glossaries are outside this pinned target-exact guarantee.
+Supplying `glossaryVersion` when creating a session is valid only when the
+selected mode advertises `deterministicGlossary: true`. The UI prevents an
+incompatible request, and the HTTP API authoritatively rejects it with
+`glossary_unsupported`, returning the compatible modes. This is capability
+driven: currently all `openai_controlled` modes qualify, while no
+`openai_native` or `palabra` mode does. Palabra account-enabled glossaries are
+outside this pinned target-exact guarantee.
 
 Both CSV and XLSX are advertised by `/api/capabilities` and accepted by the
 browser picker. Header names are normalized before mapping; duplicate normalized
@@ -197,37 +217,47 @@ A real two-phone run must therefore use HTTPS/WSS with:
   URL below a subpath because the current static application does not mount
   there.
 
-Operator browser HTTP calls require the bearer token read from the startup
-`operatorUrl` fragment; operator event sockets use the same token. Per-session
-participant grants are HMAC-bound to the session and side. The human-facing link
-keeps that grant in `#access=...`; the browser presents it only when opening the
-same-session event socket and the exact-side media socket. Missing or mismatched
-HTTP credentials return 401, and rejected WebSocket connections close with
-policy code 1008.
+Operator browser HTTP calls require the bearer token read from the operator URL
+fragment; operator event sockets use the same token. Set `OPERATOR_TOKEN`
+explicitly for an operable launch URL because startup logging deliberately
+redacts the fragment. Per-session participant grants are HMAC-bound to the
+session and side. A participant link keeps that grant in `#access=...`; the
+browser presents it only when opening the same-session event socket and the
+exact-side media socket. Missing or mismatched HTTP credentials return 401, and
+rejected WebSocket connections close with policy code 1008.
 
-The OpenAI credential path is deliberately short:
+The provider credential path is deliberately short:
 
 ```text
-launching process environment -> validated server config -> OpenAI adapter
+launch process environment -> validated server config -> selected OpenAI or Palabra adapter
 ```
 
-The key never enters browser JavaScript, QR links, API payloads, UI events,
-glossary files, or evidence. `.env.example` documents the variables; the `pnpm
-dev`, `pnpm start`, and `pnpm benchmark` scripts load an optional repository-root
-`.env` through Node's `--env-file-if-exists` flag.
+`OPENAI_API_KEY` is required only for `openai_native` or `openai_controlled`;
+`PALABRA_API_KEY` is required only for `palabra`. Neither key enters browser
+JavaScript, QR links, participant URLs, API payloads, UI events, glossary files,
+or evidence. QR carries a scoped participant grant rather than a provider key.
+`.env.example` documents the variables; `pnpm dev`, `pnpm start`, and `pnpm
+benchmark` load an optional repository-root `.env` through Node's
+`--env-file-if-exists` flag.
 
 ## Media composition seam and future carrier
 
 The core depends on the `MediaPort` contract rather than browser or carrier
 types. `createMediaRuntime` currently selects either the browser WebSocket
 adapter or the in-process fake-telephony adapter from one `MEDIA_PROFILE`
-value. The relay, translation profiles, glossary control, and evidence contract
-do not change.
+value. The relay, selected provider/mode contract, glossary control, and evidence
+contract do not change.
 
-The fake adapter converts 8 kHz G.711 mu-law to canonical PCM and back. Its
-test-only driver is exposed by `ApplicationComposition` only in that profile,
-so integration tests can connect both sides, signal speech, inject numbered
-frames, and inspect output. It is not a live carrier integration.
+The fake adapter converts fixed 8 kHz, mono, 20 ms PCMU/G.711 mu-law frames to
+canonical PCM and back. Its test-only driver is exposed by
+`ApplicationComposition` only in that media setting, so integration tests can connect
+both sides, exercise a bounded reorder window, signal speech, inject numbered
+frames, observe generation-aware clear/output events, and test
+hangup/reconnect. DTMF and transport failures enter the core only as normalized
+alert events; they never create translated audio. It is a keyless mechanism
+fixture, not a live carrier integration or a Twilio/SIP acceptance result. The
+fixture itself is keyless; a full server still enforces the selected translation
+provider's normal API-key preflight.
 
 A future Twilio Media Streams, SIP/RTP, or PBX adapter belongs at this seam.
 Production phone work must preserve the product rule: ring/connect the two
@@ -238,21 +268,26 @@ humans directly, with no AI greeting or IVR before the human conversation.
 - Contract and unit tests use local fakes for provider sockets and HTTP calls.
 - The self-check and keyless runner are deterministic; provider and product
   acceptance verdicts remain `NOT_RUN`.
+- The PCMU fixture validates adapter mechanics (codec conversion, bounded
+  jitter, lifecycle, alerts, and evidence routing) only. It does not exercise
+  Twilio, SIP/RTP networking, carrier provisioning, phone numbers, or live
+  call acceptance.
 - The local TTS corpus replay hash-validates generated WAVs and exercises
   mu-law conversion, fake telephony, relay, glossary control, playout, and
   evidence. It injects manifest text as the transcript and therefore makes no
   acoustic STT or natural target-speech claim.
 - The keyless runner executes the controlled arm's eight formal cases, twelve
   local-processing latency cases, twenty interruption state-machine cases, and
-  one accelerated 10-minute virtual soak, with persistent markers and results.
+  one sparse virtual duplex mechanism fixture: 30 actual PCM frames per lane
+  placed across a virtual 10-minute (60,000-frame) timeline. Its PASS is not a
+  sustained provider or queue-soak result; that evidence remains `NOT_RUN`.
 - Those observations do not include STT, provider translation, TTS, acoustic
   playback latency, forced alignment, or human review.
 - The discovery command can call the OpenAI text endpoint, but it is not a live
   speech-to-speech acceptance run.
-- The `palabra_live` runtime adapter is implemented and exercised with fake
-  sockets; no live Palabra acceptance runner or provider evidence is included,
-  so Palabra acceptance remains `NOT_RUN` without credentials and a completed
-  provider run.
+- The `palabra` runtime adapter is implemented and exercised with fake sockets;
+  no live Palabra acceptance runner or provider evidence is included, so Palabra
+  acceptance remains `NOT_RUN` without credentials and a completed provider run.
 - A workspace-local helper issues disposable LAN test certificates; installing
   its CA on each phone, LAN DNS/routing, and firewall setup remain operator
   responsibilities.

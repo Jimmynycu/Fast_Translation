@@ -2,6 +2,7 @@ import { createAudioFrame, laneFromSource } from "../../core/audio.js";
 import { AsyncQueue } from "../../core/async-queue.js";
 import type {
   Lane,
+  MediaAlertEvent,
   MediaClearRequest,
   MediaIngressEvent,
   MediaIngressRequest,
@@ -34,6 +35,11 @@ export class TelephonySequenceError extends Error {
   }
 }
 
+export const TELEPHONY_DTMF_DIGITS = [
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#", "A", "B", "C", "D",
+] as const;
+export type TelephonyDtmfDigit = (typeof TELEPHONY_DTMF_DIGITS)[number];
+
 export interface FakeTelephonyAudio {
   readonly type: "audio";
   readonly generation: number;
@@ -50,12 +56,26 @@ export type FakeTelephonyOutbound = FakeTelephonyAudio | FakeTelephonyClear;
 
 export interface FakeTelephonyMediaPortOptions {
   readonly queueCapacity?: number;
+  /**
+   * Number of future 20 ms PCMU packets retained while waiting for a missing
+   * sequence. The default is a deterministic 60 ms window.
+   */
+  readonly jitterBufferFrames?: number;
+  /** Retained closed-session IDs that cannot be reopened by stale fixtures. */
+  readonly closedSessionLimit?: number;
   readonly now?: () => number;
+}
+
+interface BufferedTelephonyPacket {
+  readonly sequence: number;
+  readonly mulaw8k: Uint8Array;
+  readonly capturedAtMs: number;
 }
 
 interface FakeSideState {
   connected: boolean;
-  lastInputSequence: number | undefined;
+  expectedInputSequence: number | undefined;
+  readonly jitter: Map<number, BufferedTelephonyPacket>;
   outputSequence: number;
   readonly outbound: FakeTelephonyOutbound[];
 }
@@ -70,7 +90,8 @@ interface FakeTelephonySession {
 function sideState(): FakeSideState {
   return {
     connected: false,
-    lastInputSequence: undefined,
+    expectedInputSequence: undefined,
+    jitter: new Map(),
     outputSequence: 0,
     outbound: [],
   };
@@ -87,8 +108,30 @@ function assertSequence(sequence: number): void {
   }
 }
 
+function assertCapturedAtMs(capturedAtMs: number): void {
+  if (!Number.isFinite(capturedAtMs) || capturedAtMs < 0) {
+    throw new RangeError("capturedAtMs must be finite and non-negative");
+  }
+}
+
+function assertDtmfDigit(digit: string): asserts digit is TelephonyDtmfDigit {
+  if (!(TELEPHONY_DTMF_DIGITS as readonly string[]).includes(digit)) {
+    throw new RangeError("digit must be a DTMF digit (0-9, *, #, or A-D)");
+  }
+}
+
+function assertAlert(code: string, message: string, retryable: boolean): void {
+  if (code.trim().length === 0) throw new TypeError("alert code must not be empty");
+  if (message.trim().length === 0) throw new TypeError("alert message must not be empty");
+  if (typeof retryable !== "boolean") throw new TypeError("alert retryable must be boolean");
+}
+
 export class FakeTelephonyMediaPort implements MediaPort {
   readonly #queueCapacity: number;
+  readonly #jitterBufferFrames: number;
+  readonly #closedSessionLimit: number;
+  readonly #closedSessions = new Set<string>();
+  readonly #closedSessionOrder: string[] = [];
   readonly #now: () => number;
   readonly #sessions = new Map<string, FakeTelephonySession>();
 
@@ -96,6 +139,14 @@ export class FakeTelephonyMediaPort implements MediaPort {
     this.#queueCapacity = options.queueCapacity ?? 500;
     if (!Number.isSafeInteger(this.#queueCapacity) || this.#queueCapacity < 1) {
       throw new RangeError("queueCapacity must be a positive safe integer");
+    }
+    this.#jitterBufferFrames = options.jitterBufferFrames ?? 3;
+    if (!Number.isSafeInteger(this.#jitterBufferFrames) || this.#jitterBufferFrames < 0) {
+      throw new RangeError("jitterBufferFrames must be a non-negative safe integer");
+    }
+    this.#closedSessionLimit = options.closedSessionLimit ?? 1_000;
+    if (!Number.isSafeInteger(this.#closedSessionLimit) || this.#closedSessionLimit < 1) {
+      throw new RangeError("closedSessionLimit must be a positive safe integer");
     }
     this.#now = options.now ?? (() => performance.now());
   }
@@ -107,7 +158,7 @@ export class FakeTelephonyMediaPort implements MediaPort {
     const state = session.sides[side];
     if (state.connected) return;
     state.connected = true;
-    state.lastInputSequence = undefined;
+    this.#resetIngress(state);
     state.outputSequence = 0;
     this.#requireOffer(session, {
       type: "participant_state",
@@ -125,7 +176,7 @@ export class FakeTelephonyMediaPort implements MediaPort {
     const state = session.sides[side];
     if (!state.connected) return;
     state.connected = false;
-    state.lastInputSequence = undefined;
+    this.#resetIngress(state);
     this.#requireOffer(session, {
       type: "participant_state",
       sessionId,
@@ -160,32 +211,77 @@ export class FakeTelephonyMediaPort implements MediaPort {
     assertIdentity(sessionId, side);
     assertSequence(sequence);
     assertTelephonyFrame(mulaw8k);
+    assertCapturedAtMs(capturedAtMs);
     const session = this.#session(sessionId);
     const state = session.sides[side];
     if (!state.connected) {
       throw new TelephonyConnectionError("Participant " + side + " is not connected");
     }
-    const expected =
-      state.lastInputSequence === undefined ? sequence : state.lastInputSequence + 1;
-    if (sequence !== expected) throw new TelephonySequenceError(expected, sequence);
 
-    const lane = laneFromSource(side);
-    const frame = createAudioFrame({
-      sessionId,
-      lane,
-      generation: session.generations[lane],
+    const expected = state.expectedInputSequence;
+    if (expected === undefined) {
+      state.expectedInputSequence = sequence;
+    } else if (sequence < expected || state.jitter.has(sequence)) {
+      throw new TelephonySequenceError(expected, sequence);
+    } else if (sequence - expected > this.#jitterBufferFrames) {
+      this.#offerAlert(
+        session,
+        sessionId,
+        side,
+        "telephony_jitter_overflow",
+        "Dropped PCMU frame sequence " + sequence +
+          "; it exceeds the " + this.#jitterBufferFrames +
+          "-frame jitter window while waiting for sequence " + expected,
+        true,
+        capturedAtMs,
+      );
+      return;
+    }
+
+    state.jitter.set(sequence, Object.freeze({
       sequence,
+      mulaw8k: Uint8Array.from(mulaw8k),
       capturedAtMs,
-      pcm16le: decodeMulaw8kToPcm16le24k(mulaw8k),
-    });
-    this.#requireOffer(session, {
-      type: "audio",
+    }));
+    this.#drainJitter(session, sessionId, side, state);
+  }
+
+  ingestDtmf(
+    sessionId: string,
+    side: Side,
+    digit: TelephonyDtmfDigit,
+    capturedAtMs = this.#now(),
+  ): void {
+    assertIdentity(sessionId, side);
+    assertDtmfDigit(digit);
+    assertCapturedAtMs(capturedAtMs);
+    const session = this.#session(sessionId);
+    this.#requireConnected(session, side);
+    this.#offerAlert(
+      session,
       sessionId,
       side,
-      timestampMonoMs: capturedAtMs,
-      frame,
-    });
-    state.lastInputSequence = sequence;
+      "telephony_dtmf_received",
+      "Received DTMF " + digit + " from participant " + side,
+      false,
+      capturedAtMs,
+    );
+  }
+
+  emitAlert(
+    sessionId: string,
+    side: Side,
+    code: string,
+    message: string,
+    retryable: boolean,
+    capturedAtMs = this.#now(),
+  ): void {
+    assertIdentity(sessionId, side);
+    assertAlert(code, message, retryable);
+    assertCapturedAtMs(capturedAtMs);
+    const session = this.#session(sessionId);
+    this.#requireConnected(session, side);
+    this.#offerAlert(session, sessionId, side, code, message, retryable, capturedAtMs);
   }
 
   outbound(sessionId: string, side: Side): readonly FakeTelephonyOutbound[] {
@@ -202,14 +298,19 @@ export class FakeTelephonyMediaPort implements MediaPort {
   }
 
   closeSession(sessionId: string): void {
+    if (this.#closedSessions.has(sessionId)) return;
     const session = this.#sessions.get(sessionId);
-    if (session === undefined || session.closed) return;
+    if (session === undefined || session.closed) {
+      this.#rememberClosedSession(sessionId);
+      return;
+    }
     for (const side of ["A", "B"] as const) {
       if (session.sides[side].connected) this.hangup(sessionId, side);
     }
     session.closed = true;
     session.ingress.close();
     this.#sessions.delete(sessionId);
+    this.#rememberClosedSession(sessionId);
   }
 
   frames(request: MediaIngressRequest): AsyncIterable<MediaIngressEvent> {
@@ -253,6 +354,9 @@ export class FakeTelephonyMediaPort implements MediaPort {
   #session(sessionId: string): FakeTelephonySession {
     const existing = this.#sessions.get(sessionId);
     if (existing !== undefined) return existing;
+    if (this.#closedSessions.has(sessionId)) {
+      throw new TelephonyConnectionError("Cannot reopen a closed media session");
+    }
     if (sessionId.trim().length === 0) throw new TypeError("sessionId must not be empty");
     const created: FakeTelephonySession = {
       ingress: new AsyncQueue<MediaIngressEvent>(this.#queueCapacity),
@@ -262,6 +366,58 @@ export class FakeTelephonyMediaPort implements MediaPort {
     };
     this.#sessions.set(sessionId, created);
     return created;
+  }
+
+  #rememberClosedSession(sessionId: string): void {
+    if (this.#closedSessions.has(sessionId)) return;
+    this.#closedSessions.add(sessionId);
+    this.#closedSessionOrder.push(sessionId);
+    while (this.#closedSessionOrder.length > this.#closedSessionLimit) {
+      const expired = this.#closedSessionOrder.shift();
+      if (expired === undefined) break;
+      this.#closedSessions.delete(expired);
+    }
+  }
+
+  #resetIngress(state: FakeSideState): void {
+    state.expectedInputSequence = undefined;
+    state.jitter.clear();
+  }
+
+  #requireConnected(session: FakeTelephonySession, side: Side): void {
+    if (!session.sides[side].connected) {
+      throw new TelephonyConnectionError("Participant " + side + " is not connected");
+    }
+  }
+
+  #drainJitter(
+    session: FakeTelephonySession,
+    sessionId: string,
+    side: Side,
+    state: FakeSideState,
+  ): void {
+    while (state.expectedInputSequence !== undefined) {
+      const packet = state.jitter.get(state.expectedInputSequence);
+      if (packet === undefined) return;
+      const lane = laneFromSource(side);
+      const frame = createAudioFrame({
+        sessionId,
+        lane,
+        generation: session.generations[lane],
+        sequence: packet.sequence,
+        capturedAtMs: packet.capturedAtMs,
+        pcm16le: decodeMulaw8kToPcm16le24k(packet.mulaw8k),
+      });
+      this.#requireOffer(session, {
+        type: "audio",
+        sessionId,
+        side,
+        timestampMonoMs: packet.capturedAtMs,
+        frame,
+      });
+      state.jitter.delete(packet.sequence);
+      state.expectedInputSequence += 1;
+    }
   }
 
   #speech(
@@ -280,6 +436,27 @@ export class FakeTelephonyMediaPort implements MediaPort {
       side,
       timestampMonoMs: this.#now(),
     });
+  }
+
+  #offerAlert(
+    session: FakeTelephonySession,
+    sessionId: string,
+    side: Side,
+    code: string,
+    message: string,
+    retryable: boolean,
+    timestampMonoMs: number,
+  ): void {
+    const event: MediaAlertEvent = {
+      type: "alert",
+      sessionId,
+      side,
+      timestampMonoMs,
+      code,
+      message,
+      retryable,
+    };
+    this.#requireOffer(session, event);
   }
 
   #requireOffer(session: FakeTelephonySession, event: MediaIngressEvent): void {

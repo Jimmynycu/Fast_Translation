@@ -6,6 +6,12 @@ import {
   type BenchmarkArm,
   type BenchmarkDirection,
 } from "./protocol.js";
+import {
+  resolveTranslationBehavior,
+  type TranslationBehavior,
+  type TranslationMode,
+  type TranslationProviderId,
+} from "../core/translation-behavior.js";
 
 export interface ExecutableFixture {
   readonly fixtureId: string;
@@ -35,10 +41,15 @@ export interface ArmFreeze {
   readonly arm: BenchmarkArm;
   readonly adapterId: string;
   readonly adapterVersion: string;
+  /** The concrete provider selected for this arm; never inferred from a profile. */
+  readonly provider: TranslationProviderId;
+  /** The concrete behavior mode selected for this arm. */
+  readonly mode: TranslationMode;
+  /** Immutable normalized behavior contract used by the executed session. */
+  readonly behavior: TranslationBehavior;
+  readonly behaviorSha256: string;
   readonly config: Readonly<Record<string, string>>;
   readonly configSha256: string;
-  readonly profile: Readonly<Record<string, string>>;
-  readonly profileSha256: string;
 }
 
 export interface ExecutableRun {
@@ -49,7 +60,10 @@ export interface ExecutableRun {
   readonly scheduleId?: string;
   readonly arm?: BenchmarkArm;
   readonly armConfigSha256?: string;
-  readonly profileSha256?: string;
+  readonly provider?: TranslationProviderId;
+  readonly mode?: TranslationMode;
+  readonly behavior?: TranslationBehavior;
+  readonly behaviorSha256?: string;
   readonly pairingKey?: string;
   readonly direction?: BenchmarkDirection;
   readonly repeat?: number;
@@ -57,7 +71,7 @@ export interface ExecutableRun {
 }
 
 export interface ExecutableBenchmarkManifest {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly suiteId: string;
   readonly seed: string;
   readonly fixtures: readonly ExecutableFixture[];
@@ -84,6 +98,9 @@ export interface ExecutableBenchmarkManifest {
   readonly gates: Readonly<{
     readonly targetExact: "all_bound_committed_terms";
     readonly zeroOpenRegression: true;
+    readonly alertsClear: true;
+    readonly latencyEvidence: "all_local_latency_samples";
+    readonly normalizedEventEvidence: "revisions_finality_audio_sequence";
     readonly noRuntimeHotSwap: true;
     readonly gatesSha256: string;
   }>;
@@ -226,26 +243,30 @@ const soakSchedule = schedule("FULL_DUPLEX_10M", "continuous_duplex", 600_000, [
 const ARM_INPUTS: Readonly<Record<BenchmarkArm, Readonly<{
   adapterId: string;
   adapterVersion: string;
+  provider: TranslationProviderId;
+  mode: TranslationMode;
   config: Readonly<Record<string, string>>;
-  profile: Readonly<Record<string, string>>;
 }>>> = {
   PALABRA_REFERENCE: {
     adapterId: "palabra-reference",
     adapterVersion: "streaming-api-contract-v1",
+    provider: "palabra",
+    mode: "balanced",
     config: { transport: "webrtc", glossarySnapshot: "required-per-block" },
-    profile: { role: "latency-reference", terminologyMode: "account-glossary-snapshot" },
   },
   OPENAI_NATIVE_TRANSLATE: {
     adapterId: "openai-realtime-translate",
     adapterVersion: "gpt-realtime-translate-contract-v1",
+    provider: "openai_native",
+    mode: "balanced",
     config: { transport: "webrtc", model: "gpt-realtime-translate" },
-    profile: { role: "native-baseline", terminologyMode: "none" },
   },
   GLOSSARY_CONTROLLED: {
     adapterId: "central-harness-controlled",
-    adapterVersion: "controlled-profile-contract-v1",
-    config: { transport: "central-harness", profilePin: "session-start" },
-    profile: { role: "candidate", terminologyMode: "owner-approved-exact-three-surface" },
+    adapterVersion: "controlled-behavior-contract-v1",
+    provider: "openai_controlled",
+    mode: "accurate",
+    config: { transport: "central-harness", glossaryBinding: "session-start" },
   },
 };
 
@@ -255,10 +276,12 @@ const arms = BENCHMARK_WORKLOAD.arms.map((arm): ArmFreeze => {
     arm,
     adapterId: input.adapterId,
     adapterVersion: input.adapterVersion,
+    provider: input.provider,
+    mode: input.mode,
+    behavior: resolveTranslationBehavior(input.mode),
+    behaviorSha256: sha256(resolveTranslationBehavior(input.mode)),
     config: deepFreeze({ ...input.config }),
     configSha256: sha256(input.config),
-    profile: deepFreeze({ ...input.profile }),
-    profileSha256: sha256(input.profile),
   });
 });
 
@@ -302,6 +325,9 @@ const timing = deepFreeze({ ...timingBody, scheduleSha256: sha256(timingBody) })
 const gatesBody = {
   targetExact: "all_bound_committed_terms" as const,
   zeroOpenRegression: true as const,
+  alertsClear: true as const,
+  latencyEvidence: "all_local_latency_samples" as const,
+  normalizedEventEvidence: "revisions_finality_audio_sequence" as const,
   noRuntimeHotSwap: true as const,
 };
 const gates = deepFreeze({ ...gatesBody, gatesSha256: sha256(gatesBody) });
@@ -310,6 +336,30 @@ function armFreeze(arm: BenchmarkArm): ArmFreeze {
   const value = arms.find((candidate) => candidate.arm === arm);
   if (value === undefined) throw new Error(`Missing arm freeze for ${arm}`);
   return value;
+}
+
+function runMode(arm: ArmFreeze, stage: ExecutableRun["stage"]): TranslationMode {
+  // A ten-minute full-duplex schedule must use the continuous-commit behavior.
+  // Formal terminology remains on the arm's accurate final-turn behavior.
+  return arm.arm === "GLOSSARY_CONTROLLED" && stage === "continuous_duplex"
+    ? "fast"
+    : arm.mode;
+}
+
+function runBehavior(arm: ArmFreeze, stage: ExecutableRun["stage"]): Readonly<{
+  readonly provider: TranslationProviderId;
+  readonly mode: TranslationMode;
+  readonly behavior: TranslationBehavior;
+  readonly behaviorSha256: string;
+}> {
+  const mode = runMode(arm, stage);
+  const behavior = resolveTranslationBehavior(mode);
+  return deepFreeze({
+    provider: arm.provider,
+    mode,
+    behavior,
+    behaviorSha256: sha256(behavior),
+  });
 }
 
 function formalFixtureId(direction: BenchmarkDirection, fixtureSlot: number): string {
@@ -336,6 +386,7 @@ function executableRuns(): readonly ExecutableRun[] {
   }
   for (const run of BENCHMARK_MANIFEST.formalRuns) {
     const arm = armFreeze(run.arm);
+    const execution = runBehavior(arm, run.stage);
     runs.push(deepFreeze({
       runId: run.runId,
       stage: run.stage,
@@ -343,7 +394,7 @@ function executableRuns(): readonly ExecutableRun[] {
       fixtureId: formalFixtureId(run.direction, run.fixtureSlot),
       arm: run.arm,
       armConfigSha256: arm.configSha256,
-      profileSha256: arm.profileSha256,
+      ...execution,
       direction: run.direction,
       pairingKey: `formal:${run.direction}:${run.fixtureSlot}`,
       sourceRun: deepFreeze({ ...run }),
@@ -351,6 +402,7 @@ function executableRuns(): readonly ExecutableRun[] {
   }
   for (const run of BENCHMARK_MANIFEST.latencyRuns) {
     const arm = armFreeze(run.arm);
+    const execution = runBehavior(arm, run.stage);
     runs.push(deepFreeze({
       runId: run.runId,
       stage: run.stage,
@@ -358,7 +410,7 @@ function executableRuns(): readonly ExecutableRun[] {
       fixtureId: `latency:${run.direction.toLocaleLowerCase("en-US")}:${run.scenario}`,
       arm: run.arm,
       armConfigSha256: arm.configSha256,
-      profileSha256: arm.profileSha256,
+      ...execution,
       direction: run.direction,
       repeat: run.repeat,
       pairingKey: `latency:${run.direction}:${run.scenario}:r${run.repeat}`,
@@ -367,6 +419,7 @@ function executableRuns(): readonly ExecutableRun[] {
   }
   for (const run of BENCHMARK_MANIFEST.interruptionRuns) {
     const arm = armFreeze(run.arm);
+    const execution = runBehavior(arm, run.stage);
     runs.push(deepFreeze({
       runId: run.runId,
       stage: run.stage,
@@ -374,7 +427,7 @@ function executableRuns(): readonly ExecutableRun[] {
       scheduleId: run.scenario,
       arm: run.arm,
       armConfigSha256: arm.configSha256,
-      profileSha256: arm.profileSha256,
+      ...execution,
       repeat: run.repeat,
       pairingKey: `interruption:${run.scenario}:r${run.repeat}`,
       sourceRun: deepFreeze({ ...run }),
@@ -382,6 +435,7 @@ function executableRuns(): readonly ExecutableRun[] {
   }
   for (const run of BENCHMARK_MANIFEST.soakRuns) {
     const arm = armFreeze(run.arm);
+    const execution = runBehavior(arm, run.stage);
     runs.push(deepFreeze({
       runId: run.runId,
       stage: run.stage,
@@ -389,7 +443,7 @@ function executableRuns(): readonly ExecutableRun[] {
       scheduleId: soakSchedule.scheduleId,
       arm: run.arm,
       armConfigSha256: arm.configSha256,
-      profileSha256: arm.profileSha256,
+      ...execution,
       pairingKey: "soak:full-duplex-10m",
       sourceRun: deepFreeze({ ...run }),
     }));
@@ -399,9 +453,9 @@ function executableRuns(): readonly ExecutableRun[] {
 
 export function createExecutableBenchmarkManifest(): ExecutableBenchmarkManifest {
   const body = {
-    schemaVersion: 2 as const,
-    suiteId: "fast-translation-compact-poc-v2",
-    seed: "fast-translation-fixed-seed-v2",
+    schemaVersion: 3 as const,
+    suiteId: "fast-translation-normalized-contract-v3",
+    seed: "fast-translation-fixed-seed-v3",
     fixtures: deepFreeze([...discoveryFixtures, ...formalFixtures, ...latencyFixtures]),
     schedules: deepFreeze([...interruptionSchedules, soakSchedule]),
     arms: deepFreeze([...arms]),
@@ -486,7 +540,13 @@ export function validateExecutableBenchmarkManifest(
   }
   for (const arm of manifest.arms) {
     requireHash(arm.configSha256, sha256(arm.config), `${arm.arm} config`);
-    requireHash(arm.profileSha256, sha256(arm.profile), `${arm.arm} profile`);
+    requireHash(arm.behaviorSha256, sha256(arm.behavior), `${arm.arm} behavior`);
+    if (
+      arm.behavior.mode !== arm.mode ||
+      sha256(arm.behavior) !== sha256(resolveTranslationBehavior(arm.mode))
+    ) {
+      throw new Error(`${arm.arm} behavior does not match its selected mode`);
+    }
     const canonicalArm = arms.find((candidate) => candidate.arm === arm.arm);
     if (canonicalArm === undefined || sha256(arm) !== sha256(canonicalArm)) {
       throw new Error(`Arm semantics mismatch: ${arm.arm}`);
@@ -530,7 +590,15 @@ export function validateExecutableBenchmarkManifest(
       const arm = armById.get(run.arm);
       if (arm === undefined) throw new Error(`Unknown arm ${run.arm}`);
       requireHash(run.armConfigSha256 ?? "", arm.configSha256, `${run.runId} config`);
-      requireHash(run.profileSha256 ?? "", arm.profileSha256, `${run.runId} profile`);
+      const execution = runBehavior(arm, run.stage);
+      if (
+        run.provider !== execution.provider ||
+        run.mode !== execution.mode ||
+        sha256(run.behavior) !== sha256(execution.behavior)
+      ) {
+        throw new Error(`${run.runId} execution behavior does not match its case`);
+      }
+      requireHash(run.behaviorSha256 ?? "", execution.behaviorSha256, `${run.runId} behavior`);
     }
   }
   const expectedRuns =

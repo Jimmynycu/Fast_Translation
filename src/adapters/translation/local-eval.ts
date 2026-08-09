@@ -78,7 +78,7 @@ class TranscriptFixtureAdapter implements ControlledTranscriptionPort {
     request: ControlledTranscriptionRequest,
   ): AsyncIterable<ControlledTranscriptionEvent> {
     let sawAudio = false;
-    let turnId = "turn-" + request.context.generation;
+    let turnId = request.context.turnId;
     for await (const event of request.events) {
       if (request.signal.aborted) return;
       if (event.type === "speech_end") {

@@ -4,8 +4,7 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { chromium } from "playwright-core";
-import { composeApplication } from "../src/composition.js";
-import { loadConfig } from "../src/config.js";
+import { createKeylessBrowserAcceptanceApplication } from "./support/acceptance.js";
 
 const RUN_BROWSER_E2E = process.env.RUN_BROWSER_E2E === "1";
 
@@ -69,7 +68,7 @@ async function waitForRoomState(
 }
 
 describe("real browser Harness", () => {
-  it("runs two fake microphones through both AudioWorklets and both duplex lanes", {
+  it("runs two fake microphones through both AudioWorklets and both keyless duplex lanes", {
     skip: !RUN_BROWSER_E2E,
     timeout: 60_000,
   }, async () => {
@@ -80,17 +79,10 @@ describe("real browser Harness", () => {
 
     const port = await reservePort();
     const origin = "http://127.0.0.1:" + port;
-    const operatorToken = "browser-e2e-" + "x".repeat(32);
-    const config = loadConfig({
-      PUBLIC_BASE_URL: origin,
-      OPERATOR_TOKEN: operatorToken,
-      TRANSLATION_PROFILE: "deterministic_test",
-      EVIDENCE_PROFILE: "in_memory",
-      MEDIA_PROFILE: "browser_pair",
-      LOG_LEVEL: "silent",
-    });
-    const composition = await composeApplication(config);
-    await composition.app.listen({ host: "127.0.0.1", port });
+    const fixture = await createKeylessBrowserAcceptanceApplication(origin, "fast");
+    await fixture.app.listen({ host: "127.0.0.1", port });
+    const operatorUrl = new URL("/", origin);
+    operatorUrl.hash = new URLSearchParams({ access: fixture.operatorToken }).toString();
 
     let browser: import("playwright-core").Browser | undefined;
     try {
@@ -108,7 +100,10 @@ describe("real browser Harness", () => {
       const context = await browser.newContext();
       await context.grantPermissions(["microphone"], { origin });
       const operator = await context.newPage();
-      await operator.goto(composition.operatorUrl);
+      await operator.goto(operatorUrl.toString());
+      await operator.locator("#translation-mode").selectOption("fast");
+      assert.equal(await operator.locator("#translation-mode").inputValue(), "fast");
+      assert.notEqual((await operator.locator("#translation-provider").textContent())?.trim(), "");
       await operator.locator("#recording-consent").check();
       await operator.locator("#create-session").click();
       await operator.locator("#operator-dashboard").waitFor({ state: "visible" });
@@ -155,7 +150,7 @@ describe("real browser Harness", () => {
       }
     } finally {
       await browser?.close();
-      await composition.app.close();
+      await fixture.app.close();
     }
   });
 });

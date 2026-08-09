@@ -13,7 +13,7 @@ describe("HTTP and media protocol", () => {
   it("requires explicit recording consent to create a session", () => {
     const valid = createSessionRequestSchema.parse({
       languages: { A: "en-US", B: "zh-TW" },
-      translationProfileId: "deterministic_test",
+      translationMode: "balanced",
       recordingConsent: true,
     });
     assert.equal(valid.recordingConsent, true);
@@ -21,23 +21,31 @@ describe("HTTP and media protocol", () => {
       () =>
         createSessionRequestSchema.parse({
           languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "deterministic_test",
+          translationMode: "balanced",
           recordingConsent: false,
         }),
       /recordingConsent/,
     );
   });
 
-  it("accepts the keyless controlled local evaluation profile", () => {
+  it("accepts an explicit supported speed mode", () => {
     const parsed = createSessionRequestSchema.parse({
       languages: { A: "en-US", B: "zh-TW" },
-      translationProfileId: "local_eval",
+      translationMode: "accurate",
       glossaryVersion: "factory-v1",
       recordingConsent: true,
     });
 
-    assert.equal(parsed.translationProfileId, "local_eval");
+    assert.equal(parsed.translationMode, "accurate");
     assert.equal(parsed.glossaryVersion, "factory-v1");
+  });
+
+  it("rejects profile names and unknown translation modes", () => {
+    assert.throws(() => createSessionRequestSchema.parse({
+      languages: { A: "en-US", B: "zh-TW" },
+      translationMode: "palabra_live",
+      recordingConsent: true,
+    }));
   });
 
   it("accepts the browser CSV glossary file contract", () => {

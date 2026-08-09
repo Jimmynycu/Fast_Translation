@@ -171,17 +171,22 @@ Seams/adapters：
 
 GlossaryCascadeAdapter 內部再組 STT/text/TTS；不要把三個 SDK 直接暴露給 Session module。
 
-Config-only swap：
+Current provider and session contract：
 
-    APP_PROFILE=local
-    TRANSLATION_PROFILE=native_realtime
+    TRANSLATION_PROVIDER=openai_native
+    TRANSLATION_MODE=balanced
+    MEDIA_PROFILE=browser_pair
 
-Phone phase：
+`TRANSLATION_PROVIDER` selects one provider for the server process at startup;
+it is not selected by a session or changed at runtime. `TRANSLATION_MODE` is
+only the default UI selection. Before each new session, the operator selects a
+mode advertised by `/api/capabilities`; the session pins that mode's behavior
+version and full/degraded capability state. `deterministicGlossary` in the same
+capability entry, rather than a provider name, determines whether a glossary
+version may be attached.
 
-    APP_PROFILE=twilio
-    TRANSLATION_PROFILE=native_realtime
-
-只有 composition root 分支；core 不改。各 profile startup 驗證必填設定，secret 只由環境或 secret store 注入。
+Phone-media research remains a media-adapter concern; it does not introduce a
+translation profile or let a session switch the server's provider.
 
 ## 8. Barge-in policy
 
@@ -258,7 +263,7 @@ Reliability/access：
 1. 三層 full-duplex 定義與限制（5 分鐘）。
 2. 同一 corpus A/B native 與 glossary/shadow（10 分鐘）。
 3. 正常輪替、backchannel、中斷、2 秒 overlap（10 分鐘）。
-4. APP_PROFILE 架構展示；當輪仍只跑 local（5 分鐘）。
+4. 固定 server provider 與 per-session capability contract 架構展示；當輪仍只跑 local browser media（5 分鐘）。
 5. 管理層自由對話，dashboard 顯示 latency/term hit/queue clear（10 分鐘）。
 6. Go/no-go：決定 phone POC、PBX/SIP 與新上線日期（10 分鐘）。
 

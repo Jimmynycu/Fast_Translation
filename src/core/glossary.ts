@@ -83,6 +83,11 @@ export interface CompiledGlossary {
   authorize(translatedText: string, bound: BoundGlossaryText): GlossaryAuthorizationResult;
 }
 
+export interface CompiledGlossaryPair {
+  readonly forward: CompiledGlossary;
+  readonly reverse: CompiledGlossary;
+}
+
 export interface CompileGlossaryOptions {
   readonly onAlert?: (alert: GlossaryAlert) => void;
 }
@@ -195,6 +200,26 @@ export function reverseGlossarySpec(spec: GlossarySpec): GlossarySpec {
   });
 }
 
+/**
+ * Compiles the approved mapping and its inverse as one immutable pair. This
+ * catches forward conflicts and reverse target collisions before a version can
+ * be pinned for either lane.
+ */
+export function compileGlossaryPair(
+  spec: GlossarySpec,
+  options: CompileGlossaryOptions = {},
+): CompiledGlossaryPair {
+  const forward = compileGlossary(spec, options);
+  const reverse = compileGlossary(reverseGlossarySpec({
+    id: forward.id,
+    version: forward.version,
+    sourceLanguage: forward.sourceLanguage,
+    targetLanguage: forward.targetLanguage,
+    entries: forward.entries,
+  }));
+  return Object.freeze({ forward, reverse });
+}
+
 export function compileGlossary(
   spec: GlossarySpec,
   options: CompileGlossaryOptions = {},
@@ -217,10 +242,17 @@ export function compileGlossary(
 
     const sourceKey = matchKey(source);
     const aliasesByKey = new Map<string, string>();
+    const entryTerms = new Set<string>([sourceKey]);
     for (const aliasValue of candidate.aliases) {
       const alias = requireText(aliasValue, `entries[${index}].aliases`);
       const key = matchKey(alias);
-      if (key !== sourceKey) aliasesByKey.set(key, alias);
+      if (entryTerms.has(key)) {
+        throw new GlossaryConflictError(
+          `ambiguous normalized term "${alias}" is repeated within ${entryId}`,
+        );
+      }
+      entryTerms.add(key);
+      aliasesByKey.set(key, alias);
     }
     const aliases = [...aliasesByKey.values()].sort((a, b) => matchKey(a).localeCompare(matchKey(b)));
     for (const term of [source, ...aliases]) {

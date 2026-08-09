@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { encodeMulawSample } from "../src/adapters/media/telephony-codec.js";
+import {
+  createPcmuSilenceFrame,
+  encodeMulawSample,
+} from "../src/adapters/media/telephony-codec.js";
 import {
   BrowserMediaProtocolError,
   BrowserWebSocketMediaPort,
@@ -8,6 +11,7 @@ import {
 } from "../src/adapters/media/browser-websocket.js";
 import {
   FakeTelephonyMediaPort,
+  TelephonyConnectionError,
   TelephonySequenceError,
 } from "../src/adapters/media/fake-telephony.js";
 import { CANONICAL_AUDIO, createAudioFrame } from "../src/core/audio.js";
@@ -284,8 +288,8 @@ describe("BrowserWebSocketMediaPort", () => {
 });
 
 describe("FakeTelephonyMediaPort", () => {
-  it("decodes connected 8 kHz mu-law ingress and rejects sequence gaps", async () => {
-    const media = new FakeTelephonyMediaPort({ now: () => 88 });
+  it("decodes connected PCMU ingress in sequence through a bounded jitter window", async () => {
+    const media = new FakeTelephonyMediaPort({ now: () => 88, jitterBufferFrames: 1 });
     const controller = new AbortController();
     const events = media.frames({ sessionId: "phone-1", signal: controller.signal })[Symbol.asyncIterator]();
 
@@ -303,21 +307,61 @@ describe("FakeTelephonyMediaPort", () => {
       assert.equal(audio.frame.pcm16le.byteLength, 960);
     }
 
+    media.ingestMulaw("phone-1", "B", 42, mulaw, 128);
+    media.ingestMulaw("phone-1", "B", 41, mulaw, 108);
+    const reordered = [await events.next(), await events.next()]
+      .map((event) => event.value)
+      .filter((event): event is Extract<typeof event, { type: "audio" }> => event?.type === "audio");
+    assert.deepEqual(
+      reordered.map((event) => [event.frame.sequence, event.timestampMonoMs]),
+      [[41, 108], [42, 128]],
+    );
+
     assert.throws(
       () => media.ingestMulaw("phone-1", "B", 42, mulaw),
-      (error: unknown) => error instanceof TelephonySequenceError && error.expected === 41,
+      (error: unknown) => error instanceof TelephonySequenceError && error.expected === 43,
     );
+
+    media.ingestMulaw("phone-1", "B", 45, mulaw);
+    const overflow = (await events.next()).value;
+    assert.deepEqual(overflow, {
+      type: "alert",
+      sessionId: "phone-1",
+      side: "B",
+      timestampMonoMs: 88,
+      code: "telephony_jitter_overflow",
+      message: "Dropped PCMU frame sequence 45; it exceeds the 1-frame jitter window while waiting for sequence 43",
+      retryable: true,
+    });
     controller.abort();
     await events.return?.();
   });
 
-  it("encodes canonical playout, records clears, and resets ingress on reconnect", async () => {
+  it("encodes both directions, records generation clears, and resets ingress on reconnect", async () => {
     const media = new FakeTelephonyMediaPort({ now: () => 99 });
     media.connect("phone-2", "A");
+    media.connect("phone-2", "B");
     await media.play({
       sessionId: "phone-2",
       side: "A",
-      frames: (async function* () { yield frame("phone-2", 4, 12); })(),
+      frames: (async function* () {
+        yield createAudioFrame({
+          ...frame("phone-2", 4, 12),
+          lane: "B_TO_A",
+        });
+      })(),
+      signal: new AbortController().signal,
+      onPlayoutStarted: () => undefined,
+    });
+    await media.play({
+      sessionId: "phone-2",
+      side: "B",
+      frames: (async function* () {
+        yield createAudioFrame({
+          ...frame("phone-2", 6, 14),
+          lane: "A_TO_B",
+        });
+      })(),
       signal: new AbortController().signal,
       onPlayoutStarted: () => undefined,
     });
@@ -327,19 +371,91 @@ describe("FakeTelephonyMediaPort", () => {
       lane: "B_TO_A",
       generation: 5,
     });
+    await media.clear({
+      sessionId: "phone-2",
+      side: "B",
+      lane: "A_TO_B",
+      generation: 7,
+    });
 
-    const outbound = media.outbound("phone-2", "A");
-    assert.equal(outbound[0]?.type, "audio");
-    if (outbound[0]?.type === "audio") {
-      assert.equal(outbound[0].mulaw8k.byteLength, 160);
-      assert.equal(outbound[0].generation, 4);
-      assert.equal(outbound[0].sequence, 0);
+    const outboundA = media.outbound("phone-2", "A");
+    assert.equal(outboundA[0]?.type, "audio");
+    if (outboundA[0]?.type === "audio") {
+      assert.equal(outboundA[0].mulaw8k.byteLength, 160);
+      assert.equal(outboundA[0].generation, 4);
+      assert.equal(outboundA[0].sequence, 0);
     }
-    assert.deepEqual(outbound[1], { type: "clear", generation: 5 });
+    assert.deepEqual(outboundA[1], { type: "clear", generation: 5 });
+
+    const outboundB = media.outbound("phone-2", "B");
+    assert.equal(outboundB[0]?.type, "audio");
+    if (outboundB[0]?.type === "audio") {
+      assert.equal(outboundB[0].mulaw8k.byteLength, 160);
+      assert.equal(outboundB[0].generation, 6);
+      assert.equal(outboundB[0].sequence, 0);
+    }
+    assert.deepEqual(outboundB[1], { type: "clear", generation: 7 });
 
     media.hangup("phone-2", "A");
     media.reconnect("phone-2", "A");
-    const mulaw = new Uint8Array(160).fill(0xff);
+    const mulaw = createPcmuSilenceFrame();
     assert.doesNotThrow(() => media.ingestMulaw("phone-2", "A", 1, mulaw));
+  });
+
+  it("maps DTMF and transport alerts to observability events without synthesizing audio", async () => {
+    const media = new FakeTelephonyMediaPort({ now: () => 144 });
+    const controller = new AbortController();
+    const events = media.frames({ sessionId: "phone-controls", signal: controller.signal })[Symbol.asyncIterator]();
+    media.connect("phone-controls", "A");
+    await events.next();
+
+    media.ingestDtmf("phone-controls", "A", "#", 160);
+    assert.deepEqual((await events.next()).value, {
+      type: "alert",
+      sessionId: "phone-controls",
+      side: "A",
+      timestampMonoMs: 160,
+      code: "telephony_dtmf_received",
+      message: "Received DTMF # from participant A",
+      retryable: false,
+    });
+
+    media.emitAlert("phone-controls", "A", "telephony_fixture_notice", "fixture only", true, 180);
+    assert.deepEqual((await events.next()).value, {
+      type: "alert",
+      sessionId: "phone-controls",
+      side: "A",
+      timestampMonoMs: 180,
+      code: "telephony_fixture_notice",
+      message: "fixture only",
+      retryable: true,
+    });
+    assert.deepEqual(media.outbound("phone-controls", "A"), []);
+    assert.throws(
+      () => media.ingestDtmf("phone-controls", "A", "Z" as never),
+      /DTMF digit/u,
+    );
+    controller.abort();
+    await events.return?.();
+  });
+
+  it("tombstones closed sessions so stale fixtures cannot reconnect or emit controls", () => {
+    const media = new FakeTelephonyMediaPort();
+    media.connect("closed-phone", "A");
+    media.closeSession("closed-phone");
+
+    for (const action of [
+      () => media.connect("closed-phone", "A"),
+      () => media.reconnect("closed-phone", "A"),
+      () => media.ingestDtmf("closed-phone", "A", "1"),
+      () => media.emitAlert("closed-phone", "A", "stale", "stale fixture", false),
+    ]) {
+      assert.throws(
+        action,
+        (error: unknown) => error instanceof TelephonyConnectionError &&
+          error.message === "Cannot reopen a closed media session",
+      );
+    }
+    assert.deepEqual(media.outbound("closed-phone", "A"), []);
   });
 });

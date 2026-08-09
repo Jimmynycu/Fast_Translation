@@ -11,6 +11,7 @@ import { CANONICAL_AUDIO } from "../core/audio.js";
 import type { GlossarySpec } from "../core/glossary.js";
 import { ModularGuardedDuplexRelay } from "../core/relay.js";
 import { assertManifestFixturePath } from "./path-safety.js";
+import { createKeylessLocalEvalVerification, type LocalEvalVerification } from "./verification.js";
 import type {
   EvidenceRecord,
   SessionEvent,
@@ -22,7 +23,10 @@ const OUTCOME_TIMEOUT_MS = 5_000;
 const fixtureSchema = z.object({
   fixtureId: z.string().trim().min(1).max(200),
   entryId: z.string().trim().min(1).max(200),
-  phraseKind: z.enum(["source", "alias"]),
+  direction: z.enum(["A_TO_B", "B_TO_A"]),
+  phraseKind: z.enum(["source", "alias", "confuser"]),
+  visibility: z.enum(["public", "holdout"]),
+  expectation: z.enum(["target_exact_present", "target_exact_absent"]),
   phrase: z.string().trim().min(1).max(4_096),
   targetExact: z.string().trim().min(1).max(4_096),
   wavPath: z.string().trim().min(1).max(255).refine(
@@ -33,7 +37,7 @@ const fixtureSchema = z.object({
 });
 
 const manifestSchema = z.object({
-  schemaVersion: z.literal(2),
+  schemaVersion: z.literal(3),
   generatedAtUtc: z.string().min(1),
   generator: z.string().min(1),
   voice: z.string().min(1),
@@ -46,6 +50,7 @@ const manifestSchema = z.object({
     bitsPerSample: z.literal(16),
   }),
   sourceGlossary: z.string().min(1),
+  sourceGlossarySha256: z.string().regex(/^[a-f0-9]{64}$/u),
   fixtures: z.array(fixtureSchema).min(1).max(500),
 });
 
@@ -67,12 +72,16 @@ export interface LocalEvalReplayAlert {
 export interface LocalEvalReplayFixtureResult {
   readonly fixtureId: string;
   readonly entryId: string;
-  readonly phraseKind: "source" | "alias";
+  readonly direction: "A_TO_B" | "B_TO_A";
+  readonly phraseKind: "source" | "alias" | "confuser";
+  readonly visibility: "public" | "holdout";
+  readonly expectation: "target_exact_present" | "target_exact_absent";
   readonly fixtureTranscript: string;
   readonly expectedTargetExact: string;
   readonly observedSourceFinal?: string;
   readonly observedTargetFinal?: string;
   readonly sourceTranscriptMatched: boolean;
+  readonly targetExactObserved: boolean;
   readonly targetExactMatched: boolean;
   readonly glossaryAuthorized: boolean;
   readonly sourceAudioFrames: number;
@@ -84,7 +93,7 @@ export interface LocalEvalReplayFixtureResult {
 }
 
 export interface LocalEvalReplayReport {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly generatedAtUtc: string;
   readonly mode: "fixture_transcript_harness_replay";
   readonly claims: Readonly<{
@@ -95,8 +104,10 @@ export interface LocalEvalReplayReport {
     readonly mediaPath: "wav_pcm16le24k_to_mulaw8k_to_fake_telephony_to_harness";
     readonly outputSpeech: "deterministic_local_pcm_fixture";
   }>;
+  readonly verification: LocalEvalVerification;
   readonly manifestPath: string;
   readonly manifestSha256: string;
+  readonly sourceGlossarySha256: string;
   readonly sourceLanguage: string;
   readonly targetLanguage: string;
   readonly glossary: Readonly<{
@@ -108,6 +119,9 @@ export interface LocalEvalReplayReport {
     readonly total: number;
     readonly passed: number;
     readonly failed: number;
+    readonly positiveTotal: number;
+    readonly confuserTotal: number;
+    readonly directions: Readonly<Record<"A_TO_B" | "B_TO_A", number>>;
   }>;
   readonly fixtures: readonly LocalEvalReplayFixtureResult[];
 }
@@ -239,6 +253,12 @@ function glossaryFromManifest(
       throw new TypeError("Duplicate fixtureId " + fixture.fixtureId);
     }
     fixtureIds.add(fixture.fixtureId);
+    if (
+      fixture.direction !== "A_TO_B" ||
+      fixture.expectation !== "target_exact_present"
+    ) {
+      continue;
+    }
     const current = grouped.get(fixture.entryId) ?? {
       aliases: [],
       targetExact: fixture.targetExact,
@@ -251,13 +271,19 @@ function glossaryFromManifest(
         throw new TypeError("Multiple source fixtures for " + fixture.entryId);
       }
       current.source = fixture.phrase;
-    } else {
+    } else if (fixture.phraseKind === "alias") {
       current.aliases.push(fixture.phrase);
+    } else {
+      throw new TypeError("A confuser fixture cannot define a glossary entry");
     }
     grouped.set(fixture.entryId, current);
   }
 
-  return Object.freeze({
+  if (grouped.size === 0) {
+    throw new TypeError("Corpus requires at least one A_TO_B positive source fixture");
+  }
+
+  const spec = Object.freeze({
     id: "local-eval-corpus",
     version,
     sourceLanguage,
@@ -274,6 +300,59 @@ function glossaryFromManifest(
       });
     })),
   });
+  validateReverseFixtures(manifest, spec);
+  return spec;
+}
+
+function validateReverseFixtures(manifest: CorpusManifest, spec: GlossarySpec): void {
+  const entries = new Map(spec.entries.map((entry) => [entry.id, entry]));
+  const reversed = new Set<string>();
+  for (const fixture of manifest.fixtures) {
+    if (fixture.direction !== "B_TO_A" || fixture.expectation !== "target_exact_present") {
+      continue;
+    }
+    const entry = entries.get(fixture.entryId);
+    if (entry === undefined) {
+      throw new TypeError("Reverse fixture refers to unknown entry " + fixture.entryId);
+    }
+    if (
+      fixture.phrase !== entry.targetExact ||
+      fixture.targetExact !== entry.source ||
+      fixture.phraseKind !== "source"
+    ) {
+      throw new TypeError("Reverse fixture is not the exact inverse of " + fixture.entryId);
+    }
+    reversed.add(fixture.entryId);
+  }
+  for (const entryId of entries.keys()) {
+    if (!reversed.has(entryId)) {
+      throw new TypeError("Missing B_TO_A inverse fixture for " + entryId);
+    }
+  }
+}
+
+function validateCorpusCoverage(manifest: CorpusManifest): void {
+  const directions = new Set(manifest.fixtures.map((fixture) => fixture.direction));
+  if (!directions.has("A_TO_B") || !directions.has("B_TO_A")) {
+    throw new TypeError("Corpus must cover both A_TO_B and B_TO_A directions");
+  }
+  const hasHoldoutPositive = manifest.fixtures.some((fixture) =>
+    fixture.visibility === "holdout" && fixture.expectation === "target_exact_present"
+  );
+  const hasHoldoutConfuser = manifest.fixtures.some((fixture) =>
+    fixture.visibility === "holdout" && fixture.expectation === "target_exact_absent"
+  );
+  if (!hasHoldoutPositive || !hasHoldoutConfuser) {
+    throw new TypeError("Corpus must contain holdout positive and confuser fixtures");
+  }
+  for (const fixture of manifest.fixtures) {
+    const expected = fixture.phraseKind === "confuser"
+      ? "target_exact_absent"
+      : "target_exact_present";
+    if (fixture.expectation !== expected) {
+      throw new TypeError("Fixture expectation does not match its phraseKind: " + fixture.fixtureId);
+    }
+  }
 }
 
 async function loadFixture(
@@ -303,6 +382,7 @@ function observe(
   evidence: InMemoryEvidenceStore<EvidenceRecord>,
   media: FakeTelephonyMediaPort,
   sessionId: string,
+  direction: "A_TO_B" | "B_TO_A",
 ): ObservedOutcome {
   let sourceFinal: string | undefined;
   let targetFinal: string | undefined;
@@ -311,14 +391,17 @@ function observe(
   let playoutAudioFrames = 0;
   const alerts: LocalEvalReplayAlert[] = [];
 
+  const sourceTrack = direction === "A_TO_B" ? "source_a" : "source_b";
+  const playoutTrack = direction === "A_TO_B" ? "playout_to_b" : "playout_to_a";
+  const destination = direction === "A_TO_B" ? "B" : "A";
   for (const record of evidence.records(sessionId)) {
     if (record.type === "audio") {
-      if (record.track === "source_a") sourceAudioFrames += 1;
-      if (record.track === "playout_to_b") playoutAudioFrames += 1;
+      if (record.track === sourceTrack) sourceAudioFrames += 1;
+      if (record.track === playoutTrack) playoutAudioFrames += 1;
       continue;
     }
     const event: SessionEvent = record.event;
-    if (event.lane !== "A_TO_B") continue;
+    if (event.lane !== direction) continue;
     if (event.type === "source_transcript" && event.final) sourceFinal = event.text;
     if (event.type === "target_transcript" && event.final) targetFinal = event.text;
     if (event.type === "glossary_authorized") glossaryAuthorized = true;
@@ -333,7 +416,7 @@ function observe(
     }
   }
 
-  const telephonyOutputFrames = media.outbound(sessionId, "B")
+  const telephonyOutputFrames = media.outbound(sessionId, destination)
     .filter((event) => event.type === "audio").length;
   return Object.freeze({
     ...(sourceFinal === undefined ? {} : { sourceFinal }),
@@ -362,17 +445,18 @@ async function waitForOutcome(
   evidence: InMemoryEvidenceStore<EvidenceRecord>,
   media: FakeTelephonyMediaPort,
   sessionId: string,
+  direction: "A_TO_B" | "B_TO_A",
 ): Promise<Readonly<{ outcome: ObservedOutcome; timedOut: boolean }>> {
   const deadline = performance.now() + OUTCOME_TIMEOUT_MS;
   while (performance.now() < deadline) {
-    const outcome = observe(evidence, media, sessionId);
+    const outcome = observe(evidence, media, sessionId, direction);
     if (outcome.targetFinal !== undefined && outcome.telephonyOutputFrames > 0) {
       return Object.freeze({ outcome, timedOut: false });
     }
     await delay(1);
   }
   return Object.freeze({
-    outcome: observe(evidence, media, sessionId),
+    outcome: observe(evidence, media, sessionId, direction),
     timedOut: true,
   });
 }
@@ -383,14 +467,20 @@ async function replayFixture(
   sourceLanguage: string,
   targetLanguage: string,
 ): Promise<LocalEvalReplayFixtureResult> {
+  const direction = loaded.fixture.direction;
+  const sourceSide = direction === "A_TO_B" ? "A" : "B";
   const evidence = new InMemoryEvidenceStore<EvidenceRecord>();
   const media = new FakeTelephonyMediaPort({
     queueCapacity: Math.max(500, loaded.frames.length + 20),
   });
   const translation = createLocalEvalTranslationAdapter({
     transcriptByLane: {
-      A_TO_B: loaded.fixture.phrase,
-      B_TO_A: loaded.fixture.targetExact,
+      A_TO_B: direction === "A_TO_B"
+        ? loaded.fixture.phrase
+        : "local-eval unused A_TO_B transcript",
+      B_TO_A: direction === "B_TO_A"
+        ? loaded.fixture.phrase
+        : "local-eval unused B_TO_A transcript",
     },
     confidence: 0.99,
   });
@@ -407,7 +497,8 @@ async function replayFixture(
   const snapshot = await relay.open({
     sideA: { language: sourceLanguage },
     sideB: { language: targetLanguage },
-    profile: "local_eval",
+    provider: "openai_controlled",
+    mode: "accurate",
     glossary,
     maxQueueFrames: Math.max(25, loaded.frames.length + 1),
   });
@@ -423,28 +514,39 @@ async function replayFixture(
       commandId: "start-" + loaded.fixture.fixtureId,
     });
 
-    media.speechStarted(sessionId, "A");
+    media.speechStarted(sessionId, sourceSide);
     for (let index = 0; index < loaded.frames.length; index += 1) {
       const frame = loaded.frames[index];
       if (frame === undefined) continue;
       media.ingestMulaw(
         sessionId,
-        "A",
+        sourceSide,
         index,
         encodePcm16le24kToMulaw8k(frame),
       );
       if (index % 32 === 31) await nextTurn();
     }
-    media.speechEnded(sessionId, "A");
+    media.speechEnded(sessionId, sourceSide);
 
-    const { outcome, timedOut } = await waitForOutcome(evidence, media, sessionId);
+    const { outcome, timedOut } = await waitForOutcome(
+      evidence,
+      media,
+      sessionId,
+      direction,
+    );
     const sourceTranscriptMatched = outcome.sourceFinal === loaded.fixture.phrase;
-    const targetExactMatched = outcome.targetFinal === loaded.fixture.targetExact;
+    const targetExactObserved = outcome.targetFinal?.includes(loaded.fixture.targetExact) === true;
+    const targetExactMatched = loaded.fixture.expectation === "target_exact_present"
+      ? targetExactObserved
+      : !targetExactObserved;
+    const glossaryExpectationMatched = loaded.fixture.expectation === "target_exact_present"
+      ? outcome.glossaryAuthorized
+      : !outcome.glossaryAuthorized;
     const passed =
       !timedOut &&
       sourceTranscriptMatched &&
       targetExactMatched &&
-      outcome.glossaryAuthorized &&
+      glossaryExpectationMatched &&
       outcome.sourceAudioFrames > 0 &&
       outcome.playoutAudioFrames > 0 &&
       outcome.telephonyOutputFrames > 0;
@@ -459,7 +561,10 @@ async function replayFixture(
     return Object.freeze({
       fixtureId: loaded.fixture.fixtureId,
       entryId: loaded.fixture.entryId,
+      direction,
       phraseKind: loaded.fixture.phraseKind,
+      visibility: loaded.fixture.visibility,
+      expectation: loaded.fixture.expectation,
       fixtureTranscript: loaded.fixture.phrase,
       expectedTargetExact: loaded.fixture.targetExact,
       ...(outcome.sourceFinal === undefined
@@ -469,6 +574,7 @@ async function replayFixture(
         ? {}
         : { observedTargetFinal: outcome.targetFinal }),
       sourceTranscriptMatched,
+      targetExactObserved,
       targetExactMatched,
       glossaryAuthorized: outcome.glossaryAuthorized,
       sourceAudioFrames: outcome.sourceAudioFrames,
@@ -497,6 +603,7 @@ export async function replayLocalEvalCorpus(
   const manifestPath = resolve(options.manifestPath);
   const manifestBytes = new Uint8Array(await readFile(manifestPath));
   const manifest = manifestSchema.parse(JSON.parse(Buffer.from(manifestBytes).toString("utf8")));
+  validateCorpusCoverage(manifest);
   const manifestSha256 = sha256(manifestBytes);
   const glossary = glossaryFromManifest(
     manifest,
@@ -519,9 +626,20 @@ export async function replayLocalEvalCorpus(
     ));
   }
   const passed = fixtures.filter((fixture) => fixture.passed).length;
+  const positiveTotal = fixtures.filter(
+    (fixture) => fixture.expectation === "target_exact_present",
+  ).length;
+  const confuserTotal = fixtures.length - positiveTotal;
+  const directionCounts = Object.freeze({
+    A_TO_B: fixtures.filter((fixture) => fixture.direction === "A_TO_B").length,
+    B_TO_A: fixtures.filter((fixture) => fixture.direction === "B_TO_A").length,
+  });
+  const verification = createKeylessLocalEvalVerification(
+    passed === fixtures.length ? "PASS" : "FAIL",
+  );
 
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAtUtc: new Date().toISOString(),
     mode: "fixture_transcript_harness_replay",
     claims: Object.freeze({
@@ -532,8 +650,10 @@ export async function replayLocalEvalCorpus(
       mediaPath: "wav_pcm16le24k_to_mulaw8k_to_fake_telephony_to_harness",
       outputSpeech: "deterministic_local_pcm_fixture",
     }),
+    verification,
     manifestPath,
     manifestSha256,
+    sourceGlossarySha256: manifest.sourceGlossarySha256,
     sourceLanguage,
     targetLanguage,
     glossary: Object.freeze({
@@ -545,6 +665,9 @@ export async function replayLocalEvalCorpus(
       total: fixtures.length,
       passed,
       failed: fixtures.length - passed,
+      positiveTotal,
+      confuserTotal,
+      directions: directionCounts,
     }),
     fixtures: Object.freeze(fixtures),
   });

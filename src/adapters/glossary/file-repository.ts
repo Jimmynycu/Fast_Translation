@@ -5,8 +5,7 @@ import { parse } from "csv-parse/sync";
 import ExcelJS from "exceljs";
 import { z } from "zod";
 import {
-  compileGlossary,
-  reverseGlossarySpec,
+  compileGlossaryPair,
   type CompiledGlossary,
   type GlossaryEntrySpec,
   type GlossarySpec,
@@ -14,6 +13,18 @@ import {
 
 const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 const MAX_ENTRIES = 10_000;
+/**
+ * XLSX is a ZIP container. These caps are deliberately lower than the generic
+ * upload cap because ExcelJS expands the archive in memory.
+ */
+const MAX_XLSX_ARCHIVE_ENTRIES = 1_024;
+const MAX_XLSX_ENTRY_UNCOMPRESSED_BYTES = 16 * 1024 * 1024;
+const MAX_XLSX_TOTAL_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
+const MAX_XLSX_COMPRESSION_RATIO = 100;
+const ZIP_CENTRAL_DIRECTORY_FILE_HEADER = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIRECTORY = 0x06054b50;
+const ZIP64_UINT16_SENTINEL = 0xffff;
+const ZIP64_UINT32_SENTINEL = 0xffff_ffff;
 const REQUIRED_COLUMNS = ["id", "source", "aliases", "target_exact"] as const;
 
 const persistedSchema = z.object({
@@ -142,8 +153,7 @@ export class FileGlossaryRepository {
       targetLanguage: request.targetLanguage,
       entries,
     };
-    const compiled = compileGlossary(spec);
-    compileGlossary(reverseGlossarySpec(spec));
+    const compiled = compileGlossaryPair(spec).forward;
     const storagePath = this.#storagePath(compiled.id, compiled.version);
     const importedAt = this.#now().toISOString();
     const persisted: PersistedGlossaryVersion = {
@@ -182,14 +192,21 @@ export class FileGlossaryRepository {
   }
 
   async pin(id: string, version: string): Promise<PinnedGlossaryVersion> {
-    const persisted = await this.#read(id, version);
-    const compiled = compileGlossary({
+    const normalizedId = normalizedIdentity(id, "glossary id");
+    const normalizedVersion = normalizedIdentity(version, "glossary version");
+    const persisted = await this.#read(normalizedId, normalizedVersion);
+    if (persisted.id !== normalizedId || persisted.version !== normalizedVersion) {
+      throw new GlossaryIntegrityError(
+        "glossary storage identity does not match its requested immutable version",
+      );
+    }
+    const compiled = compileGlossaryPair({
       id: persisted.id,
       version: persisted.version,
       sourceLanguage: persisted.sourceLanguage,
       targetLanguage: persisted.targetLanguage,
       entries: persisted.entries,
-    });
+    }).forward;
     if (compiled.hash !== persisted.hash) {
       throw new GlossaryIntegrityError(
         "glossary " + persisted.id + "@" + persisted.version +
@@ -204,7 +221,10 @@ export class FileGlossaryRepository {
 
   async has(id: string, version: string): Promise<boolean> {
     try {
-      await access(this.#storagePath(id, version), constants.F_OK);
+      await access(this.#storagePath(
+        normalizedIdentity(id, "glossary id"),
+        normalizedIdentity(version, "glossary version"),
+      ), constants.F_OK);
       return true;
     } catch {
       return false;
@@ -249,16 +269,24 @@ export class FileGlossaryRepository {
   }
 
   #storagePath(id: string, version: string): string {
+    const normalizedId = normalizedIdentity(id, "glossary id");
+    const normalizedVersion = normalizedIdentity(version, "glossary version");
     const path = resolve(
       this.#directory,
-      encodedSegment(id),
-      encodedSegment(version) + ".json",
+      encodedSegment(normalizedId),
+      encodedSegment(normalizedVersion) + ".json",
     );
     if (path !== this.#directory && !path.startsWith(this.#directory + sep)) {
       throw new TypeError("glossary path escaped its repository");
     }
     return path;
   }
+}
+
+function normalizedIdentity(value: string, field: string): string {
+  const normalized = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
+  if (normalized.length === 0) throw new TypeError(field + " must not be empty");
+  return normalized;
 }
 
 function validateApproval(approval: GlossaryApproval): void {
@@ -295,6 +323,7 @@ async function parseEntries(
 }
 
 async function parseXlsx(contents: Uint8Array): Promise<GlossaryEntrySpec[]> {
+  assertSafeXlsxArchive(contents);
   const workbook = new ExcelJS.Workbook();
   const loadBuffer = Buffer.from(contents) as unknown as Parameters<
     typeof workbook.xlsx.load
@@ -325,6 +354,124 @@ async function parseXlsx(contents: Uint8Array): Promise<GlossaryEntrySpec[]> {
     records.push(record);
   });
   return records.map((record, index) => entryFromRecord(record, index + 2));
+}
+
+/**
+ * Parses only ZIP central-directory metadata, before ExcelJS receives the
+ * archive. It never inflates an entry, so declared expansion is bounded before
+ * a malicious workbook can drive an allocation in the XLSX reader.
+ */
+function assertSafeXlsxArchive(contents: Uint8Array): void {
+  const view = new DataView(contents.buffer, contents.byteOffset, contents.byteLength);
+  const eocdOffset = findZipEndOfCentralDirectory(view);
+  const diskNumber = view.getUint16(eocdOffset + 4, true);
+  const centralDirectoryDisk = view.getUint16(eocdOffset + 6, true);
+  const entriesOnThisDisk = view.getUint16(eocdOffset + 8, true);
+  const entryCount = view.getUint16(eocdOffset + 10, true);
+  const centralDirectorySize = view.getUint32(eocdOffset + 12, true);
+  const centralDirectoryOffset = view.getUint32(eocdOffset + 16, true);
+
+  if (diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnThisDisk !== entryCount) {
+    throw new TypeError("XLSX archive must use a single ZIP disk");
+  }
+  if (
+    entryCount === ZIP64_UINT16_SENTINEL ||
+    centralDirectorySize === ZIP64_UINT32_SENTINEL ||
+    centralDirectoryOffset === ZIP64_UINT32_SENTINEL
+  ) {
+    throw new TypeError("XLSX ZIP64 archives are not accepted for glossary import");
+  }
+  if (entryCount > MAX_XLSX_ARCHIVE_ENTRIES) {
+    throw new TypeError(
+      "XLSX archive entry count exceeds " + MAX_XLSX_ARCHIVE_ENTRIES,
+    );
+  }
+  if (
+    centralDirectoryOffset > eocdOffset ||
+    centralDirectorySize > eocdOffset - centralDirectoryOffset
+  ) {
+    throw new TypeError("XLSX archive central directory is outside the archive");
+  }
+
+  const centralDirectoryEnd = centralDirectoryOffset + centralDirectorySize;
+  let cursor = centralDirectoryOffset;
+  let totalUncompressedBytes = 0;
+  for (let entryIndex = 0; entryIndex < entryCount; entryIndex += 1) {
+    const fixedHeaderBytes = 46;
+    if (
+      cursor > centralDirectoryEnd - fixedHeaderBytes ||
+      view.getUint32(cursor, true) !== ZIP_CENTRAL_DIRECTORY_FILE_HEADER
+    ) {
+      throw new TypeError("XLSX archive central-directory entry is malformed");
+    }
+
+    const flags = view.getUint16(cursor + 8, true);
+    const compressedBytes = view.getUint32(cursor + 20, true);
+    const uncompressedBytes = view.getUint32(cursor + 24, true);
+    const nameBytes = view.getUint16(cursor + 28, true);
+    const extraBytes = view.getUint16(cursor + 30, true);
+    const commentBytes = view.getUint16(cursor + 32, true);
+    const headerBytes = fixedHeaderBytes + nameBytes + extraBytes + commentBytes;
+
+    if ((flags & 0x0001) !== 0) {
+      throw new TypeError("XLSX archive must not contain encrypted ZIP entries");
+    }
+    if (
+      compressedBytes === ZIP64_UINT32_SENTINEL ||
+      uncompressedBytes === ZIP64_UINT32_SENTINEL
+    ) {
+      throw new TypeError("XLSX ZIP64 archive entries are not accepted for glossary import");
+    }
+    if (cursor > centralDirectoryEnd - headerBytes) {
+      throw new TypeError("XLSX archive central-directory entry exceeds its declared bounds");
+    }
+    if (
+      uncompressedBytes > 0 &&
+      (compressedBytes === 0 ||
+        uncompressedBytes > compressedBytes * MAX_XLSX_COMPRESSION_RATIO)
+    ) {
+      throw new TypeError(
+        "XLSX archive compression ratio exceeds " + MAX_XLSX_COMPRESSION_RATIO,
+      );
+    }
+    if (uncompressedBytes > MAX_XLSX_ENTRY_UNCOMPRESSED_BYTES) {
+      throw new TypeError(
+        "XLSX archive entry exceeds " + MAX_XLSX_ENTRY_UNCOMPRESSED_BYTES +
+          " uncompressed bytes",
+      );
+    }
+    totalUncompressedBytes += uncompressedBytes;
+    if (totalUncompressedBytes > MAX_XLSX_TOTAL_UNCOMPRESSED_BYTES) {
+      throw new TypeError(
+        "XLSX archive exceeds " + MAX_XLSX_TOTAL_UNCOMPRESSED_BYTES +
+          " total uncompressed bytes",
+      );
+    }
+    cursor += headerBytes;
+  }
+
+  if (cursor !== centralDirectoryEnd) {
+    throw new TypeError("XLSX archive central-directory size does not match its entries");
+  }
+  if (totalUncompressedBytes > contents.byteLength * MAX_XLSX_COMPRESSION_RATIO) {
+    throw new TypeError(
+      "XLSX archive compression ratio exceeds " + MAX_XLSX_COMPRESSION_RATIO,
+    );
+  }
+}
+
+function findZipEndOfCentralDirectory(view: DataView): number {
+  const fixedBytes = 22;
+  if (view.byteLength < fixedBytes) {
+    throw new TypeError("XLSX archive is missing the ZIP end record");
+  }
+  const earliestOffset = Math.max(0, view.byteLength - fixedBytes - ZIP64_UINT16_SENTINEL);
+  for (let offset = view.byteLength - fixedBytes; offset >= earliestOffset; offset -= 1) {
+    if (view.getUint32(offset, true) !== ZIP_END_OF_CENTRAL_DIRECTORY) continue;
+    const commentBytes = view.getUint16(offset + 20, true);
+    if (offset + fixedBytes + commentBytes === view.byteLength) return offset;
+  }
+  throw new TypeError("XLSX archive is missing a valid ZIP central directory");
 }
 
 function entryFromUnknown(candidate: unknown, row: number): GlossaryEntrySpec {

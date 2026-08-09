@@ -1,284 +1,253 @@
 # Fast Translation Harness
 
 以繁體中文為主的 local-first live translation POC：一台 Windows operator PC
-執行中央 Harness，兩支手機瀏覽器加入同一個雙向翻譯房間。
+執行中央 Harness，兩支手機瀏覽器透過同一個雙向翻譯房間交談。
 
-> 狀態：browser media、keyless local evaluation、OpenAI adapters、Palabra
-> `palabra_live` adapter、glossary control、encrypted evidence 與 benchmark
-> tooling 均已實作。Repository tests 不等於 live provider acceptance；OpenAI、
-> Palabra、PSTN/SIP 與人工產品驗收仍是 `NOT_RUN`。
+> 狀態：`browser_pair`、glossary import/pinning、recording evidence、barge-in
+> fencing，以及 `openai_native`、`openai_controlled`、`palabra` 三條完整的
+> server-side speech-to-speech 實作路徑均已接線。Repository tests 與本機機制
+> 測試不等於 live provider、PSTN/SIP 或人工產品驗收；這些 verdict 目前均為
+> `NOT_RUN`。
 
 ## 這個 POC 做什麼
 
-- 中央 Fastify Harness 管理 session、A→B/B→A routing、profiles、interruption
-  fence、事件與 evidence。
-- `browser_pair` 將瀏覽器麥克風正規化為 24 kHz、mono、PCM16LE、20 ms frames，
-  兩支手機各自只播放對方 lane 的聲音。
-- `fake_telephony` 是 provider-free 的 in-process test seam，不是 carrier、
-  SIP/PSTN 或電話號碼服務。
-- 所有 provider credential 留在 server；不會進入 QR、participant link、
-  browser JavaScript 或 API response。
-
-## 架構
+- 中央 Fastify Harness 管理 A→B 與 B→A 的獨立 lane、session lifecycle、事件、
+  recording evidence 與 interruption generation fence。
+- `browser_pair` 將兩支手機瀏覽器的麥克風正規化為 24 kHz、mono、PCM16LE、20 ms
+  frames；每支手機只播放對方 lane 的翻譯聲音。
+- provider 在 server 啟動時固定；operator UI 只可從該 provider 實際宣告的
+  `fast`、`balanced`、`accurate` mode 中選擇一個，並將 provider、mode 與 behavior
+  version pin 到新 session。
+- `fake_telephony` 是 in-process 的 G.711 μ-law 機制 fixture，不是 SIP、PSTN、
+  carrier 或電話號碼服務。
+- `OPENAI_API_KEY` 與 `PALABRA_API_KEY` 只在 server process 使用。它們不會出現在
+  browser JavaScript、QR、participant link、capabilities/session payload 或 evidence。
+  QR 僅含 session/side 綁定的 participant access grant，仍應視為敏感連結。
 
 ```text
                          operator HTTPS UI / API / events
                                       |
                                       v
- Phone A mic + headphones <-> [ Central Fastify Harness PC ] <-> Phone B mic + headphones
-                                  A_TO_B / B_TO_A lanes
+ Phone A mic + headphones <-> [ Central Harness PC ] <-> Phone B mic + headphones
+                                A_TO_B / B_TO_A lanes
                                       |
-                         server-side OpenAI or Palabra (optional)
+                    selected server-side speech-to-speech provider
 ```
 
-## 先備條件
+## 先備條件與安裝
 
-- Windows operator PC：Node.js 24 or newer、pnpm 11（lockfile 以 pnpm 11.16.0
-  產生）。
-- 兩支目前仍受支援的手機瀏覽器，與 operator PC 位於可互通的同一 LAN。
-- 兩位參與者各自使用 headphones，並取得錄音同意。
-- 兩手機正式使用麥克風時，需信任與 `PUBLIC_BASE_URL` 的 hostname/IP 相符的
-  HTTPS certificate；localhost PC smoke 可使用 HTTP。
+- Windows operator PC：Node.js 24 或更新版本，以及 pnpm 11（lockfile 使用
+  pnpm 11.16.0）。
+- 兩支目前受支援的手機瀏覽器，與 operator PC 在可互通的同一 LAN。
+- 兩位參與者各自使用 headphones，並在開始前取得明確錄音同意。
+- 兩手機的正式麥克風流程需要 HTTPS；certificate 必須受手機信任，且 SAN 必須與
+  `PUBLIC_BASE_URL` 的 hostname 或 IP 相符。PC localhost smoke 可使用 HTTP。
 
-## 安裝
-
-在 Windows operator PC 的 PowerShell 執行：
+在 repository root 的 PowerShell 執行：
 
 ```powershell
-git clone https://github.com/Jimmynycu/Fast_Translation.git Fast_Translation
-Set-Location .\Fast_Translation
 corepack enable
 corepack prepare pnpm@11.16.0 --activate
 pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test
+pnpm build
 ```
 
-若該 Node.js 24 安裝未提供 `corepack`，請改用已驗證的 pnpm 11，並確認
-`pnpm --version` 至少為 11，再執行 `pnpm install --frozen-lockfile`。
+若 Node 安裝沒有 `corepack`，請使用已驗證的 pnpm 11。兩手機 demo 前，`typecheck`、
+`test` 與 `build` 都應成功。
 
-## 5 分鐘 keyless PC/browser smoke
+## Provider、mode 與 glossary capability
 
-以下流程在 operator PC 上以兩個本機 participant browser tabs 驗證 UI、media、
-session lifecycle 與 barge-in，不需要 OpenAI 或 Palabra key：
+設定 `TRANSLATION_PROVIDER` 選定整個 server process 的 provider；它不能在 UI 或
+運行中的 session 中切換。設定 `TRANSLATION_MODE` 決定 UI 預選值，預設為
+`balanced`。UI 會從 `/api/capabilities` 讀取 provider 實際支援的 modes，只提供那些
+選項；每次建立 room 時，所選 mode 與其 behavior version 都會 pin 到該 session。
+
+| `TRANSLATION_PROVIDER` | Server-side key | UI 可選 modes | Glossary / limitation |
+|---|---|---|---|
+| `openai_native` | `OPENAI_API_KEY` | `fast`, `balanced` | `accurate` 不受支援。沒有 deterministic pinned glossary；`balanced` 是 adapter-local holdback，UI 會標示為 degraded，不能解讀成 model-quality 結論。 |
+| `openai_controlled` | `OPENAI_API_KEY` | `fast`, `balanced`, `accurate` | 完整的 controlled STT → text translation → TTS 路徑；三種 mode 都宣告 deterministic pinned glossary。 |
+| `palabra` | `PALABRA_API_KEY` | `fast`, `balanced`, `accurate` | 完整、獨立的 server-side Palabra speech-to-speech 路徑。它不提供本 Harness 的 deterministic pinned glossary；`accurate` 會標示為 degraded。Palabra account glossary 不等同這個 guarantee。 |
+
+Mode 是可觀察的 relay behavior，不是品質保證：
+
+| Mode | 主要行為 |
+|---|---|
+| `fast` | continuous input、provisional revisions、0 ms relay holdback。 |
+| `balanced` | continuous input、final-only transcript、250 ms holdback。 |
+| `accurate` | speech-end commit、final-only transcript、700 ms holdback。|
+
+在建立 room 時，UI 顯示每個 mode 的 behavior version、full/degraded state、原因與
+`pinned glossary supported` 標記。只有目前 capability 明確宣告
+`deterministicGlossary` 的 mode 才能附帶 glossary version；UI 會先擋下不支援的
+組合，server 也會以 `glossary_unsupported` 做權威拒絕。不要依 provider 名稱猜測
+glossary 支援狀態。
+
+## 設定與啟動
+
+複製 template，然後只把選定 provider 所需的 key 放入 repository-root `.env`。`.env`
+已被忽略，不能 commit、貼到 issue，或放到任何 QR / browser client 中。
 
 ```powershell
 Copy-Item .env.example .env
-$env:PUBLIC_BASE_URL = "http://localhost:4207"
-$env:TRANSLATION_PROFILE = "deterministic_test"
-$env:EVIDENCE_PROFILE = "in_memory"
-$env:OPENAI_API_KEY = ""
-$env:PALABRA_API_KEY = ""
-Remove-Item Env:EVIDENCE_KEY_BASE64 -ErrorAction SilentlyContinue
-pnpm dev
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
 ```
 
-`pnpm dev` 會先 build 一次，再 watch `dist` 的 JavaScript；它不會自動重新編譯
-TypeScript source。開啟 startup log 印出的完整 `operatorUrl`（包含
-`#access=...`），在兩個 browser tabs 開啟 Phone A/B links；兩邊都允許麥克風、
-勾選 headphones 並按 **Start microphone**。等 dashboard 顯示 `2 / 2 joined` 與
-`Ready` 後按 **Start session**，各說一句、在播放時插話測試 generation cut，最後
-按 **End**。
+把第二個命令輸出的 32+ character 值填入 `.env` 的 `OPERATOR_TOKEN`。啟動 log
+刻意不印出 token fragment；operator 在 PC 上開啟
+`https://<host>:4207/#access=<OPERATOR_TOKEN>`。不要把這個 operator URL 分享給
+participants。
 
-`deterministic_test` 只證明 capture、routing、opposite-side playout、lifecycle
-與 fencing；它不翻譯語言，也不證明 STT、TTS 或 translation quality。
+最小的 OpenAI controlled LAN 設定如下（將 placeholder 換成自己的值）：
 
-## `.env` 與 translation profiles
+```dotenv
+HOST=0.0.0.0
+PORT=4207
+PUBLIC_BASE_URL=https://192.168.1.50:4207
+TLS_CERT_PATH=./work/tmp/lan-tls/server-cert.pem
+TLS_KEY_PATH=./work/tmp/lan-tls/server-key.pem
+OPERATOR_TOKEN=<32-or-more-character-secret>
 
-`.env.example` 是模板；在 repository root 建立本機 `.env`：
+MEDIA_PROFILE=browser_pair
+TRANSLATION_PROVIDER=openai_controlled
+TRANSLATION_MODE=balanced
+OPENAI_API_KEY=<server-side-openai-key>
+PALABRA_API_KEY=
+
+# Use in_memory for a disposable smoke. encrypted_local additionally needs
+# EVIDENCE_KEY_BASE64 generated by pnpm keygen.
+EVIDENCE_PROFILE=in_memory
+```
+
+`OPENAI_API_KEY` is required only when the selected provider is `openai_native`
+or `openai_controlled`; `PALABRA_API_KEY` is required only for `palabra`. A
+missing selected key, or `openai_native` with `TRANSLATION_MODE=accurate`, is a
+clear startup/preflight error. `PALABRA_INPUT_CHUNK_MS` defaults to `320` and
+accepts 20–320 in multiples of 20.
+
+Start the compiled server with:
 
 ```powershell
-Copy-Item .env.example .env
+pnpm build
+pnpm start
 ```
 
-`.env` 已被忽略，絕不要 commit。Provider keys 只放在 server process，不能放入
-browser、QR 或公開 issue。
-
-| Profile | 啟用條件 | 行為與限制 |
-|---|---|---|
-| `deterministic_test` | 無 key | deterministic audio/labels；不翻譯。 |
-| `local_eval` | 無 key | 以 fixture transcript 驗證 glossary binding、alerts、playout；不評估 acoustic STT。 |
-| `native_live_baseline` | `OPENAI_API_KEY` | OpenAI realtime speech translation；不保證 pinned glossary。 |
-| `glossary_controlled` | `OPENAI_API_KEY` | OpenAI transcribe + text translation + TTS，配合 pinned glossary target authorization。 |
-| `palabra_live` | `PALABRA_API_KEY` | Server-side Palabra streaming、controlled/per-utterance relay；本地 pinned glossary 不適用。 |
-
-`deterministic_test` 與 `local_eval` 永遠註冊；OpenAI profiles 只有在
-`OPENAI_API_KEY` 存在時註冊；`palabra_live` 只有在 `PALABRA_API_KEY` 存在時註冊。
-選取缺少 credential 的 provider profile 會在 startup 失敗。`PALABRA_INPUT_CHUNK_MS`
-預設 320，接受 20–320 間、20 的倍數。
-
-重要 defaults：`HOST=0.0.0.0`、`PORT=4207`、`MEDIA_PROFILE=browser_pair`、
-`TRANSLATION_PROFILE=glossary_controlled`、`EVIDENCE_PROFILE=encrypted_local`。
-後兩者的預設組合需要 OpenAI key 與 32-byte evidence key；keyless smoke 已明確
-覆寫它們。
+For development, `pnpm dev` builds once and watches the compiled `dist`
+entrypoint. It does not recompile TypeScript source after edits; run `pnpm build`
+again before restarting or relying on a source change.
 
 ## 兩手機 HTTPS/LAN 流程
 
-1. 在 repository root 複製 `.env.example`，並以 operator PC 可達的 LAN IP 取代
-   `192.168.1.50`：
+1. 先產生 workspace-local demo certificate，將 IP 改成 operator PC 真正可達的 LAN
+   位址：
 
    ```powershell
-   Copy-Item .env.example .env
    powershell -ExecutionPolicy Bypass -File .\scripts\generate-lan-tls.ps1 `
      -OutputDirectory .\work\tmp\lan-tls `
      -DnsName fast-translation.local `
      -IpAddress 192.168.1.50
    ```
 
-2. 在 operator PC 與兩支手機信任
-   `./work/tmp/lan-tls/local-demo-ca.cer`。`server-cert.pem` 與尤其
-   `server-key.pem` 僅供本機使用，不能提交。
+2. 在 operator PC 與兩支手機信任 `work\tmp\lan-tls\local-demo-ca.cer`。`server-key.pem`
+   僅供本機使用，不能提交。確認防火牆允許選定 port 的 LAN inbound traffic。
 
-3. 將 `.env` 的相關設定改成以下形式；`PUBLIC_BASE_URL` 必須是可達的 root
-   `http(s)://host:port/` origin，不可有 subpath、credentials、query 或 fragment，
-   並且 certificate SAN 必須匹配該 hostname/IP：
+3. 以 certificate SAN 完全相同的 hostname/IP 填入 `.env` 的 `PUBLIC_BASE_URL`、
+   `TLS_CERT_PATH`、`TLS_KEY_PATH`。`PUBLIC_BASE_URL` 必須是 root HTTP(S) origin：
+   不可含 subpath、credentials、query 或 fragment；手機流程不可使用 `localhost` 或
+   `127.0.0.1`。
 
-   ```dotenv
-   HOST=0.0.0.0
-   PORT=4207
-   PUBLIC_BASE_URL=https://192.168.1.50:4207
-   TLS_CERT_PATH=./work/tmp/lan-tls/server-cert.pem
-   TLS_KEY_PATH=./work/tmp/lan-tls/server-key.pem
-   MEDIA_PROFILE=browser_pair
-   TRANSLATION_PROFILE=deterministic_test
-   EVIDENCE_PROFILE=in_memory
-   PALABRA_INPUT_CHUNK_MS=320
-   OPENAI_API_KEY=
-   PALABRA_API_KEY=
-   ```
-
-4. 啟動：
-
-   ```powershell
-   pnpm dev
-   ```
-
-   `pnpm dev` build 一次後 watch `dist`；修改 TypeScript 後請重新執行 build/dev。
-   `pnpm start` 只啟動既有 `dist`，必須先執行 `pnpm build`。
-
-5. 用設定好的 origin 檢查 health（預期 `status: ok`），並使用 startup log 印出的
-   完整 `operatorUrl` 開啟 operator UI。裸的 `PUBLIC_BASE_URL` 沒有 operator
-   access fragment，會被拒絕：
+4. 啟動後確認 health，再在 operator PC 開啟含 `#access=<OPERATOR_TOKEN>` 的
+   operator URL：
 
    ```powershell
    Invoke-RestMethod -Uri "https://192.168.1.50:4207/api/health"
    ```
 
-6. Operator 在 UI 選兩種語言與已註冊的 profile，按 **Create translation room**，
-   確認 recording consent。將 Phone A QR 給 A、Phone B QR 給 B；兩支手機各接
-   headphones、允許麥克風、勾選 **I'm wearing headphones**、按 **Start microphone**。
-   等 `2 / 2 joined` 與 `Ready` 後按 **Start session**。
+5. Operator UI 會顯示固定 provider、其支援 modes 與 default mode。選兩種不同語言、
+   選 mode，必要時先匯入 glossary，勾選 recording consent，然後按 **Create
+   translation room**。
 
-7. A、B 各說話確認只播放到對方；播放中插話測試 barge-in/generation cut；結束時
-   按 **End**，再關閉瀏覽器頁面。
+6. 僅在 `MEDIA_PROFILE=browser_pair` 時，將 Phone A / Phone B QR 分別交給正確的
+   participant。兩支手機都要信任 certificate、允許麥克風、戴好 headphones、勾選
+   **I'm wearing headphones**，再按 **Start microphone**。
 
-## Provider examples
+7. Dashboard 顯示 `2 / 2 joined` 與 `Ready` 後按 **Start session**。確認 A 說話只
+   播放到 B、B 說話只播放到 A。讓接收端在翻譯正在播放時開始說話，以測試 barge-in：
+   Harness 只清除該接收端舊 generation 的 provisional audio/text，另一條 lane 仍可
+   繼續 capture；finalized evidence 不會被當成舊 provisional output 清除。
 
-### OpenAI
+8. 按 **End** 正常關閉 room，再關閉 participant pages。保留 encrypted evidence 前，
+   請依同意內容與 retention policy 處理。
 
-只在 server 啟動的 PowerShell 設定 key；選 `glossary_controlled` 可使用本機
-pinned glossary，選 `native_live_baseline` 則不接受 pinned glossary：
+## Glossary、recording 與 evidence
 
-```powershell
-$env:OPENAI_API_KEY = "<server-side OpenAI API key>"
-$env:TRANSLATION_PROFILE = "glossary_controlled" # or native_live_baseline
-$env:EVIDENCE_PROFILE = "in_memory"
-$env:PALABRA_API_KEY = ""
-pnpm dev
+UI 接受 CSV 或 XLSX glossary；兩者都必須有以下欄位：
+
+```text
+id,source,aliases,target_exact
 ```
 
-### Palabra
+`aliases` 可為 JSON string array，或以 `|`、`;`、newline 分隔。選好 Phone A / B
+語言後，填入 glossary name 與 approver，從 UI 匯入檔案；server 會建立 immutable
+version 與 hash，該 version 只會被 pin 到建立時相容的 session。變更語言方向後需重新
+匯入。範例見 [manufacturing glossary](examples/manufacturing-glossary.csv)。
 
-Palabra key 同樣只放 server；兩個 provider key 彼此獨立。Palabra account glossaries
-不等同於本 Harness 的 pinned target-exact guarantee：
-
-```powershell
-$env:PALABRA_API_KEY = "<server-side Palabra API key>"
-$env:PALABRA_INPUT_CHUNK_MS = "320"
-$env:TRANSLATION_PROFILE = "palabra_live"
-$env:EVIDENCE_PROFILE = "in_memory"
-$env:OPENAI_API_KEY = ""
-pnpm dev
-```
-
-目前沒有 live Palabra acceptance runner 或 provider evidence；不要把 fake-socket
-tests 或 local PASS 報成 Palabra acceptance。
-
-## Recording、evidence 與 glossary
-
-- `EVIDENCE_PROFILE=in_memory` 不寫檔，適合 smoke，process 結束即消失。
-- `EVIDENCE_PROFILE=encrypted_local` 需要 32-byte base64 `EVIDENCE_KEY_BASE64`。
-  執行 `pnpm keygen`，把輸出的值放入本機 `.env`；遺失 key 將無法讀取既有 evidence。
-- 授權 plaintext export 時，設定同一把 key 到
-  `EVIDENCE_ENCRYPTION_KEY_BASE64`，並明確 acknowledge：
+- `EVIDENCE_PROFILE=in_memory` 不寫檔，適合 disposable smoke。
+- `EVIDENCE_PROFILE=encrypted_local` 需要 32-byte base64 `EVIDENCE_KEY_BASE64`；先執行
+  `pnpm keygen`，再把輸出的值放進本機 `.env`。遺失此 key 就不能讀取既有 evidence。
+- room 建立要求 recording consent；event stream 會反映 recording state。Evidence 包含
+  accepted source/playout audio、session、transcript、glossary、alert、generation cut 與
+  closure 資訊，不取代錄音同意或 retention policy。
+- 授權 plaintext export 時，使用相同 key：
 
   ```powershell
-  $env:EVIDENCE_ENCRYPTION_KEY_BASE64 = "<same 32-byte base64 key used for the evidence file>"
+  $env:EVIDENCE_ENCRYPTION_KEY_BASE64 = "<same-32-byte-base64-key>"
   pnpm evidence:export -- --input .\data\evidence\<session-hash>.evidence.jsonl.enc `
     --output-dir .\work\tmp\evidence-export --acknowledge-plaintext-export
   ```
 
-  Exported events/WAV 是敏感 plaintext，請依 retention policy 處理。
-- CSV 與 XLSX glossary 必須有欄位：
+  Exported events/WAV 是敏感 plaintext，請在 workspace-local output 中依政策保管或
+  移除。
 
-  ```text
-  id,source,aliases,target_exact
-  ```
+## Media fixture 與未來電話 adapter
 
-  `aliases` 可用 JSON string array，或用 `|`、`;`、newline 分隔。只有
-  `glossary_controlled` 與 `local_eval` 接受 pinned glossary；示例檔案見
-  [`examples/manufacturing-glossary.csv`](examples/manufacturing-glossary.csv)。
+將 `MEDIA_PROFILE=fake_telephony` 可選到 in-process test seam。它接收固定 8 kHz、mono、
+20 ms PCMU/G.711 μ-law frames，進行 canonical PCM conversion、bounded jitter reorder、
+generation-aware clear、hangup/reconnect、DTMF/alert normalization 與 evidence routing。
+它不提供 browser media route 或 QR；session endpoint 是 `fake-telephony://…` test
+address，供 integration test driver 使用。選擇它不會撥號、接聽、建立 SIP/RTP 連線或
+取得電話號碼，而且 selected translation provider 的 server key 規則仍然有效。
 
-## 常用 scripts
+未來的 Twilio Media Streams、SIP/RTP 或 PBX adapter 應接在同一個 `MediaPort` /
+`createMediaRuntime` seam；它必須另行完成 codec、resampling、jitter、sequence、DTMF、
+lifecycle、privacy、quality、glossary、barge-in、soak 與 provider acceptance gate，才能
+宣稱真實電話服務。
+
+## 常用命令與限制
 
 | Command | 用途 |
 |---|---|
 | `pnpm typecheck` | TypeScript strict typecheck，不輸出檔案。 |
-| `pnpm test` | 編譯並執行全部 Node tests。 |
-| `pnpm build` | 編譯 server/CLI 到 `dist`。 |
+| `pnpm test` | 編譯並執行 Node tests。 |
+| `pnpm build` | 編譯 server / CLI 到 `dist`。 |
+| `pnpm start` | 啟動既有 `dist`；先執行 build。 |
 | `pnpm test:browser` | 真 browser harness；需 Chrome 與 `CHROME_PATH`（或 Windows default path）。 |
 | `pnpm keygen` | 產生 32-byte evidence key。 |
-| `pnpm local-eval:replay -- --manifest <path> --source-language en-US --target-language zh-TW --output <path>` | 重播 keyless fixture corpus。 |
-| `pnpm benchmark -- protocol --output <path>` | 輸出 benchmark protocol；其他 subcommands 見 demo runbook。 |
-| `pnpm evidence:export -- --input <encrypted-file> --output-dir <dir> --acknowledge-plaintext-export` | 驗證並匯出 encrypted evidence。 |
+| `pnpm local-eval:replay -- --manifest <path> --source-language en-US --target-language zh-TW --output <path>` | 重播 fixture corpus；不評估 acoustic STT。 |
 
-`dev`、`start`、`benchmark`、`evidence:export` 會由 Node 載入 repository-root
-`.env`；直接執行 `node` 不會自動載入它。`local-eval:replay` 需要 flags，且不依賴
-`.env`。
+`dev`、`start`、`benchmark`、`evidence:export` 會由 Node 載入 repository-root `.env`；
+直接執行 `node` 不會自動載入它。
 
-## Troubleshooting
-
-- **Startup 說 profile unavailable / missing key**：檢查 `TRANSLATION_PROFILE` 與
-  對應 `OPENAI_API_KEY`/`PALABRA_API_KEY`，修改後重啟。
-- **Encrypted evidence 啟動失敗**：選 `in_memory`，或用 `pnpm keygen` 產生並設定
-  32-byte `EVIDENCE_KEY_BASE64`。
-- **Operator 401**：使用 startup log 的完整 `operatorUrl`（含 `#access=...`），
-  不要開裸 root URL。
-- **手機無法用麥克風**：使用 HTTPS、信任 `local-demo-ca.cer`、確認 certificate
-  SAN 與 `PUBLIC_BASE_URL` 相符，並確認 `HOST=0.0.0.0`、LAN/firewall 可達。
-- **不是 `2 / 2 joined` 或沒有 Ready**：A/B QR 不要對調；兩支手機都要完成
-  headphones、mic permission 與 **Start microphone**。
-- **Palabra session 拒絕 glossary version**：`palabra_live` 不支援本地 pinned
-  glossary；改用 `glossary_controlled` 或 `local_eval`。
-
-## 公開 repository 的安全與限制
-
-- 不要提交 `.env`、API keys、`server-key.pem`、`work/tmp` artifacts、decrypted
-  evidence 或任何 customer recording；公開貼文也不要貼 operator token。
-- `deterministic_test`/`local_eval` 是 Harness/mechanism checks，不是翻譯、acoustic
-  STT、TTS、forced alignment 或 human acceptance。所有 provider/product acceptance
-  在沒有完成正式 run 前都保持 `NOT_RUN`。
-- 本專案是 browser-to-browser central Harness POC，不是 PSTN/SIP/carrier service；
-  任何真實錄音都需 participant consent 與合規 retention policy。
+不要將 repository tests、fake sockets、fixture replay、fake telephony 或 local PASS
+報告成 live OpenAI、Palabra、Twilio、SIP/PSTN 或人類產品 acceptance。這些驗收目前是
+`NOT_RUN`。
 
 ## 延伸文件
 
-- [Demo runbook](docs/demo-runbook.md)：完整 Windows/LAN、evidence、glossary 與
-  benchmark 操作。
+- [Demo runbook](docs/demo-runbook.md)：完整 Windows/LAN launch、mode、glossary、
+  evidence 與 fixture 操作。
 - [Implementation architecture](docs/implementation-architecture.md)：核心模組、
-  media seam、profiles、evidence 與限制。
+  provider/mode contract、media seam、evidence 與限制。
 - [Palabra API integration survey](docs/research/palabra-api-integration-survey.md)：
-  官方 API/SDK 證據與本 adapter 的整合決策。
-- [Palabra terminology research](docs/research/palabra-low-latency-terminology-deep-research.md)
-  與 [realtime translation survey](docs/research/realtime-translation-competitive-survey.md)：
-  研究輸入，不是 acceptance evidence。
-- [Same-room benchmark protocol](docs/prototypes/same-room-benchmark-protocol.md)：
-  歷史規劃 prototype，不代表目前 workload 結果。
+  官方 API/SDK 研究輸入，不是 acceptance evidence。

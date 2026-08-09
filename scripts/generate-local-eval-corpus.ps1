@@ -3,6 +3,10 @@ param(
   [string]$OutputDirectory = "./work/tmp/local-eval-corpus",
   [string]$VoiceName = "",
   [string]$Language = "en-US",
+  [ValidateRange(1, 10)]
+  [int]$MaxEntries = 6,
+  [ValidateRange(0, 3)]
+  [int]$MaxAliasesPerEntry = 1,
   [ValidateRange(-10, 10)]
   [int]$Rate = 0
 )
@@ -92,6 +96,40 @@ function Get-Aliases {
   return @($trimmed -split "[|;`n]" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
 }
 
+function Get-TermKey {
+  param([Parameter(Mandatory)][string]$Value)
+  return ($Value.Normalize([System.Text.NormalizationForm]::FormKC).Trim() -replace "\s+", " ").ToLowerInvariant()
+}
+
+function New-ConfuserPhrase {
+  param(
+    [Parameter(Mandatory)][string]$Phrase,
+    [Parameter(Mandatory)][int]$Attempt
+  )
+  $characters = $Phrase.Trim().ToCharArray()
+  for ($index = 0; $index -lt $characters.Length; $index += 1) {
+    if ([char]::IsLetterOrDigit($characters[$index])) {
+      $code = [int][char]$characters[$index]
+      $replacement = if ($code -ge 0xFFFE - $Attempt) { [char]($code - $Attempt) } else { [char]($code + $Attempt) }
+      $characters[$index] = $replacement
+      return -join $characters
+    }
+  }
+  return ($Phrase.Trim() + " $Attempt")
+}
+
+$selectedRows = @($rows | Select-Object -First $MaxEntries)
+$knownPhrases = [System.Collections.Generic.HashSet[string]]::new(
+  [System.StringComparer]::OrdinalIgnoreCase
+)
+foreach ($row in $selectedRows) {
+  [void]$knownPhrases.Add((Get-TermKey -Value ([string]$row.source)))
+  foreach ($alias in (Get-Aliases -Value ([string]$row.aliases))) {
+    [void]$knownPhrases.Add((Get-TermKey -Value $alias))
+  }
+}
+$sourceGlossarySha256 = (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
 function Get-StableFileName {
   param(
     [string]$EntryId,
@@ -161,7 +199,7 @@ try {
   $fixtures = [System.Collections.Generic.List[object]]::new()
   $usedSapi = $false
   $usedFfmpegFallback = $false
-  foreach ($row in $rows) {
+  foreach ($row in $selectedRows) {
     $entryId = [string]$row.id
     $source = [string]$row.source
     $targetExact = [string]$row.target_exact
@@ -174,19 +212,67 @@ try {
     }
 
     $phrases = [System.Collections.Generic.List[object]]::new()
-    $phrases.Add([ordered]@{ kind = "source"; phrase = $source.Trim() })
+    $phrases.Add([ordered]@{
+      kind = "source"
+      direction = "A_TO_B"
+      phrase = $source.Trim()
+      targetExact = $targetExact.Trim()
+      visibility = "public"
+      expectation = "target_exact_present"
+    })
+    $aliasCount = 0
     foreach ($alias in (Get-Aliases -Value ([string]$row.aliases))) {
-      $phrases.Add([ordered]@{ kind = "alias"; phrase = $alias })
+      if ($aliasCount -ge $MaxAliasesPerEntry) { break }
+      $phrases.Add([ordered]@{
+        kind = "alias"
+        direction = "A_TO_B"
+        phrase = $alias
+        targetExact = $targetExact.Trim()
+        visibility = "holdout"
+        expectation = "target_exact_present"
+      })
+      $aliasCount += 1
     }
+    $confuser = $null
+    for ($attempt = 1; $attempt -le 32; $attempt += 1) {
+      $candidateConfuser = New-ConfuserPhrase -Phrase $source -Attempt $attempt
+      if (-not $knownPhrases.Contains((Get-TermKey -Value $candidateConfuser))) {
+        $confuser = $candidateConfuser
+        break
+      }
+    }
+    if ($null -eq $confuser) {
+      throw "Unable to generate a non-glossary confuser for $entryId."
+    }
+    $phrases.Add([ordered]@{
+      kind = "confuser"
+      direction = "A_TO_B"
+      phrase = $confuser
+      targetExact = $targetExact.Trim()
+      visibility = "holdout"
+      expectation = "target_exact_absent"
+    })
+    # Render the reverse direction from its own target-language phrase.  The
+    # replay harness injects fixture text, but the corpus remains honest about
+    # the audio it carries for each direction.
+    $phrases.Add([ordered]@{
+      kind = "source"
+      direction = "B_TO_A"
+      phrase = $targetExact.Trim()
+      targetExact = $source.Trim()
+      visibility = "holdout"
+      expectation = "target_exact_present"
+    })
 
     $seen = [System.Collections.Generic.HashSet[string]]::new(
       [System.StringComparer]::OrdinalIgnoreCase
     )
     foreach ($candidate in $phrases) {
-      if (-not $seen.Add($candidate.phrase)) {
+      if (-not $seen.Add($candidate.direction + "`0" + $candidate.phrase)) {
         continue
       }
-      $fileName = Get-StableFileName -EntryId $entryId -Kind $candidate.kind -Phrase $candidate.phrase
+      $fileKind = if ($candidate.direction -eq "B_TO_A") { "reverse" } else { [string]$candidate.kind }
+      $fileName = Get-StableFileName -EntryId $entryId -Kind $fileKind -Phrase $candidate.phrase
       $wavePath = [System.IO.Path]::Combine($outputPath, $fileName)
       $stream = $null
       $speakError = $null
@@ -265,9 +351,12 @@ try {
       $fixtures.Add([ordered]@{
         fixtureId = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
         entryId = $entryId
+        direction = $candidate.direction
         phraseKind = $candidate.kind
+        visibility = $candidate.visibility
+        expectation = $candidate.expectation
         phrase = $candidate.phrase
-        targetExact = $targetExact.Trim()
+        targetExact = $candidate.targetExact
         wavPath = $fileName
         wavSha256 = $wavSha256
       })
@@ -286,7 +375,7 @@ try {
 
 
   $manifest = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     generatedAtUtc = [DateTimeOffset]::UtcNow.ToString("O")
     generator = $manifestGenerator
     voice = $manifestVoice
@@ -299,6 +388,7 @@ try {
       bitsPerSample = 16
     }
     sourceGlossary = [System.IO.Path]::GetFileName($inputPath)
+    sourceGlossarySha256 = $sourceGlossarySha256
     fixtures = @($fixtures)
   }
   [System.IO.File]::WriteAllText(

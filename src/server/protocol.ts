@@ -26,20 +26,14 @@ export function decodeGlossaryContents(contentsBase64: string): Uint8Array {
 
 export const sideSchema = z.enum(["A", "B"]);
 export const laneSchema = z.enum(["A_TO_B", "B_TO_A"]);
-export const translationProfileSchema = z.enum([
-  "native_live_baseline",
-  "glossary_controlled",
-  "palabra_live",
-  "local_eval",
-  "deterministic_test",
-]);
+export const translationModeSchema = z.enum(["fast", "balanced", "accurate"]);
 
 export const createSessionRequestSchema = z.object({
   languages: z.object({
     A: z.string().trim().min(2).max(64),
     B: z.string().trim().min(2).max(64),
   }),
-  translationProfileId: translationProfileSchema,
+  translationMode: translationModeSchema,
   glossaryVersion: z.string().trim().min(1).max(256).optional(),
   recordingConsent: z.literal(true),
 }).refine(

@@ -8,19 +8,18 @@ import {
   GlossaryVersionNotFoundError,
 } from "./adapters/glossary/file-repository.js";
 import {
-  NativeRealtimeTranslateAdapter,
-  OpenAILiveTranscribeAdapter,
-  OpenAITextTranslator,
-  OpenAITtsAdapter,
+  createOpenAITranslationAdapter,
+  OPENAI_CONTROLLED_TRANSLATION_CAPABILITIES,
+  OPENAI_NATIVE_TRANSLATION_CAPABILITIES,
 } from "./adapters/openai/index.js";
-import { PalabraTranslationAdapter } from "./adapters/palabra/index.js";
-import { DeterministicTranslationAdapter } from "./adapters/translation/deterministic.js";
-import { ControlledTranslationAdapter } from "./adapters/translation/glossary-controlled.js";
-import { createLocalEvalTranslationAdapter } from "./adapters/translation/local-eval.js";
-import { TranslationProfileRouter } from "./adapters/translation/profile-router.js";
+import {
+  PALABRA_TRANSLATION_CAPABILITIES,
+  PalabraTranslationAdapter,
+} from "./adapters/palabra/index.js";
 import type { AppConfig } from "./config.js";
 import type { CompiledGlossary, GlossarySpec } from "./core/glossary.js";
 import { ModularGuardedDuplexRelay } from "./core/relay.js";
+import { resolveTranslationBehavior } from "./core/translation-behavior.js";
 import type {
   EventCursor,
   EvidencePort,
@@ -30,8 +29,9 @@ import type {
   SessionEvent,
   SessionSnapshot,
   SessionSpec,
+  TranslationCapabilities,
+  TranslationModeCapability,
   TranslationPort,
-  TranslationProfile,
 } from "./core/types.js";
 import {
   createMediaRuntime,
@@ -39,6 +39,7 @@ import {
 } from "./media-runtime.js";
 import {
   createServerApp,
+  type ConfiguredTranslation,
   type EvidenceHealth,
   type GlossaryImportResult,
   type GlossaryRegistry,
@@ -51,7 +52,7 @@ import {
 
 export interface ApplicationComposition {
   readonly app: Awaited<ReturnType<typeof createServerApp>>;
-  readonly translationProfiles: readonly TranslationProfile[];
+  readonly translation: ConfiguredTranslation;
   readonly operatorUrl: string;
   readonly telephonyTestDriver?: TelephonyTestDriver;
 }
@@ -82,7 +83,7 @@ class HealthTrackedEvidence implements EvidencePort {
   }
 }
 
-class ManagedRelay implements GuardedDuplexRelay {
+export class ManagedRelay implements GuardedDuplexRelay {
   readonly #delegate: GuardedDuplexRelay;
   readonly #active = new Set<string>();
   readonly #ending = new Map<string, Promise<void>>();
@@ -119,8 +120,12 @@ class ManagedRelay implements GuardedDuplexRelay {
     await ending;
   }
 
-  events(sessionId: string, after?: EventCursor): AsyncIterable<SessionEvent> {
-    return this.#delegate.events(sessionId, after);
+  events(
+    sessionId: string,
+    after?: EventCursor,
+    signal?: AbortSignal,
+  ): AsyncIterable<SessionEvent> {
+    return this.#delegate.events(sessionId, after, signal);
   }
 
   async close(): Promise<void> {
@@ -232,65 +237,171 @@ function glossaryIdFromVersion(version: string): string | undefined {
   return version.slice(0, separator);
 }
 
-function translationRouter(config: AppConfig): TranslationProfileRouter {
-  const profiles = new Map<TranslationProfile, TranslationPort>([
-    ["deterministic_test", new DeterministicTranslationAdapter()],
-    ["local_eval", createLocalEvalTranslationAdapter({
-      transcriptByLane: {
-        A_TO_B: config.localEvalTranscriptAToB,
-        B_TO_A: config.localEvalTranscriptBToA,
-      },
-      confidence: config.localEvalConfidence,
-      translationMode: config.localEvalTranslationMode,
-    })],
-  ]);
+interface TranslationRuntime {
+  readonly port: TranslationPort;
+  readonly configuration: ConfiguredTranslation;
+}
 
-  if (config.openaiApiKey !== undefined) {
-    profiles.set(
-      "native_live_baseline",
-      new NativeRealtimeTranslateAdapter({
-        apiKey: config.openaiApiKey,
-        model: config.openaiRealtimeModel,
-      }),
-    );
-    profiles.set(
-      "glossary_controlled",
-      new ControlledTranslationAdapter({
-        transcriber: new OpenAILiveTranscribeAdapter({
-          apiKey: config.openaiApiKey,
-          model: config.openaiTranscribeModel,
-          prompt: "Manufacturing support call. Preserve product names, model numbers, " +
-            "part numbers, acronyms, and technical terms exactly.",
-        }),
-        translator: new OpenAITextTranslator({
-          apiKey: config.openaiApiKey,
-          model: config.openaiTextModel,
-        }),
-        tts: new OpenAITtsAdapter({
-          apiKey: config.openaiApiKey,
-          model: config.openaiTtsModel,
-          voice: config.openaiTtsVoice,
-        }),
-      }),
-    );
-  }
-  if (config.palabraApiKey !== undefined) {
-    profiles.set(
-      "palabra_live",
-      new PalabraTranslationAdapter({
-        apiKey: config.palabraApiKey,
-        inputChunkMs: config.palabraInputChunkMs,
-      }),
-    );
-  }
-
-  const router = new TranslationProfileRouter(profiles);
-  if (!router.has(config.translationProfile)) {
+function requireServerKey(
+  value: string | undefined,
+  name: "OPENAI_API_KEY" | "PALABRA_API_KEY",
+  provider: AppConfig["translationProvider"],
+): string {
+  if (value === undefined || value.trim() === "") {
     throw new TypeError(
-      "Configured translation profile " + config.translationProfile + " is unavailable",
+      name + " is required for TRANSLATION_PROVIDER=" + provider,
     );
   }
-  return router;
+  return value;
+}
+
+function staticCapabilities(
+  provider: AppConfig["translationProvider"],
+): TranslationCapabilities {
+  switch (provider) {
+    case "palabra":
+      return PALABRA_TRANSLATION_CAPABILITIES;
+    case "openai_native":
+      return OPENAI_NATIVE_TRANSLATION_CAPABILITIES;
+    case "openai_controlled":
+      return OPENAI_CONTROLLED_TRANSLATION_CAPABILITIES;
+  }
+}
+
+function assertModeCapability(
+  capabilities: TranslationCapabilities,
+  capability: TranslationModeCapability,
+): void {
+  const behavior = resolveTranslationBehavior(capability.mode);
+  if (capability.behaviorVersion !== behavior.version) {
+    throw new TypeError(
+      capabilities.providerId + " " + capability.mode +
+        " is incompatible with translation behavior version " + behavior.version,
+    );
+  }
+  if (
+    behavior.requirements.revisions &&
+    !capabilities.supportsProvisionalRevisions
+  ) {
+    throw new TypeError(
+      capabilities.providerId + " cannot satisfy provisional revisions for " + capability.mode,
+    );
+  }
+  if (behavior.requirements.cancellation && !capabilities.supportsCancellation) {
+    throw new TypeError(
+      capabilities.providerId + " cannot satisfy interruption cancellation for " + capability.mode,
+    );
+  }
+  if (
+    capability.deterministicGlossary &&
+    !capabilities.supportsDeterministicGlossary
+  ) {
+    throw new TypeError(
+      capabilities.providerId + " advertises deterministic glossary support inconsistently",
+    );
+  }
+  if (
+    behavior.transcriptPolicy === "final_only" &&
+    !capabilities.supportsFinality
+  ) {
+    throw new TypeError(
+      capabilities.providerId + " cannot satisfy final transcript policy for " + capability.mode,
+    );
+  }
+}
+
+function validateTranslationConfiguration(
+  config: AppConfig,
+  capabilities: TranslationCapabilities,
+): void {
+  if (capabilities.providerId !== config.translationProvider) {
+    throw new TypeError(
+      "Configured provider " + config.translationProvider +
+        " does not match " + capabilities.providerId + " capabilities",
+    );
+  }
+  for (const capability of capabilities.supportedModes) {
+    assertModeCapability(capabilities, capability);
+  }
+  const defaultCapability = capabilities.supportedModes.find(
+    (capability) => capability.mode === config.translationMode,
+  );
+  if (defaultCapability === undefined) {
+    throw new TypeError(
+      "TRANSLATION_PROVIDER=" + config.translationProvider +
+        " does not support TRANSLATION_MODE=" + config.translationMode,
+    );
+  }
+  if (config.translationBehavior.mode !== config.translationMode) {
+    throw new TypeError("Configured translation behavior does not match TRANSLATION_MODE");
+  }
+  if (defaultCapability.behaviorVersion !== config.translationBehavior.version) {
+    throw new TypeError(
+      "Configured translation behavior version " +
+        config.translationBehavior.version + " is unsupported",
+    );
+  }
+}
+
+function translationRuntime(config: AppConfig): TranslationRuntime {
+  const capabilities = staticCapabilities(config.translationProvider);
+  validateTranslationConfiguration(config, capabilities);
+
+  let port: TranslationPort;
+  switch (config.translationProvider) {
+    case "palabra":
+      port = new PalabraTranslationAdapter({
+        apiKey: requireServerKey(
+          config.palabraApiKey,
+          "PALABRA_API_KEY",
+          config.translationProvider,
+        ),
+        inputChunkMs: config.palabraInputChunkMs,
+      });
+      break;
+    case "openai_native":
+      port = createOpenAITranslationAdapter({
+        provider: "openai_native",
+        apiKey: requireServerKey(
+          config.openaiApiKey,
+          "OPENAI_API_KEY",
+          config.translationProvider,
+        ),
+        native: {
+          model: config.openaiRealtimeModel,
+        },
+      });
+      break;
+    case "openai_controlled":
+      port = createOpenAITranslationAdapter({
+        provider: "openai_controlled",
+        apiKey: requireServerKey(
+          config.openaiApiKey,
+          "OPENAI_API_KEY",
+          config.translationProvider,
+        ),
+        controlled: {
+          transcribeModel: config.openaiTranscribeModel,
+          textModel: config.openaiTextModel,
+          ttsModel: config.openaiTtsModel,
+          ttsVoice: config.openaiTtsVoice,
+        },
+      });
+      break;
+  }
+
+  if (port.capabilities.providerId !== capabilities.providerId) {
+    throw new TypeError(
+      "Configured " + config.translationProvider + " adapter returned mismatched capabilities",
+    );
+  }
+  return Object.freeze({
+    port,
+    configuration: Object.freeze({
+      ...capabilities,
+      defaultMode: config.translationMode,
+    }),
+  });
 }
 
 function evidencePort(config: AppConfig): HealthTrackedEvidence {
@@ -333,18 +444,17 @@ export async function composeApplication(config: AppConfig): Promise<Application
     publicBaseUrl: config.publicBaseUrl,
     access,
   });
-  const translation = translationRouter(config);
+  const translation = translationRuntime(config);
   const evidence = evidencePort(config);
   const glossaries = new FileGlossaryRegistry(
     new FileGlossaryRepository({ directory: config.glossaryDirectory }),
   );
   const relay = new ManagedRelay(new ModularGuardedDuplexRelay({
     media: media.port,
-    translation,
+    translation: translation.port,
     evidence,
     endpointGrant: media.endpointGrant,
   }));
-  const translationProfiles = translation.available();
   const https = await httpsOptions(config);
   const app = await createServerApp({
     relay,
@@ -361,8 +471,7 @@ export async function composeApplication(config: AppConfig): Promise<Application
       },
     },
     access,
-    translationProfiles,
-    defaultTranslationProfile: config.translationProfile,
+    translation: translation.configuration,
     evidenceHealth: evidence.health,
     ...(https === undefined ? {} : { https }),
   });
@@ -374,7 +483,7 @@ export async function composeApplication(config: AppConfig): Promise<Application
 
   return Object.freeze({
     app,
-    translationProfiles,
+    translation: translation.configuration,
     operatorUrl,
     ...(media.telephonyTestDriver === undefined
       ? {}

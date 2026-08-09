@@ -110,6 +110,13 @@ describe("keyless deterministic healing and signed release gate", () => {
     assert.equal(gate.customerOwnerAcceptanceVerdict, "NOT_RUN");
     assert.equal(gate.productAcceptanceVerdict, "NOT_RUN");
     assert.equal(gate.providerAcceptanceVerdict, "NOT_RUN");
+    assert.deepEqual(gate.localReleaseEvidence, {
+      targetExact: true,
+      zeroRegression: true,
+      alertsClear: true,
+      latency: true,
+      evidenceComplete: true,
+    });
     assert.equal(gate.approvedProfileHash, approved.approvedProfile.profileHash);
     assert.equal(gate.reasons.length, 0);
 

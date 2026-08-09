@@ -1,5 +1,16 @@
 import type { AudioFrame } from "./audio.js";
 import type { CompiledGlossary, GlossaryAlert, GlossarySpec } from "./glossary.js";
+import type {
+  TranslationBehavior,
+  TranslationMode,
+  TranslationProviderId,
+} from "./translation-behavior.js";
+
+export type {
+  TranslationBehavior,
+  TranslationMode,
+  TranslationProviderId,
+} from "./translation-behavior.js";
 
 export const SIDES = ["A", "B"] as const;
 export type Side = (typeof SIDES)[number];
@@ -9,15 +20,6 @@ export type Lane = (typeof LANES)[number];
 export const MEDIA_PROFILES = ["browser_pair", "fake_telephony"] as const;
 export type MediaProfile = (typeof MEDIA_PROFILES)[number];
 
-export const TRANSLATION_PROFILES = [
-  "native_live_baseline",
-  "glossary_controlled",
-  "palabra_live",
-  "local_eval",
-  "deterministic_test",
-] as const;
-export type TranslationProfile = (typeof TRANSLATION_PROFILES)[number];
-
 export interface ParticipantSpec {
   readonly language: string;
   readonly displayName?: string;
@@ -26,7 +28,8 @@ export interface ParticipantSpec {
 export interface SessionSpec {
   readonly sideA: ParticipantSpec;
   readonly sideB: ParticipantSpec;
-  readonly profile: TranslationProfile;
+  readonly provider: TranslationProviderId;
+  readonly mode: TranslationMode;
   readonly glossary?: GlossarySpec;
   readonly maxQueueFrames?: number;
 }
@@ -65,6 +68,7 @@ export interface SessionSnapshot {
     readonly B: ParticipantEndpointGrant;
   }>;
   readonly generations: Readonly<Record<Lane, number>>;
+  readonly behavior: TranslationBehavior;
   readonly glossary?: GlossaryReference;
   readonly eventCursor: EventCursor;
   readonly openedAtMs: number;
@@ -111,11 +115,17 @@ export interface ParticipantStateEvent extends SessionEventBase {
 }
 export interface TranscriptEvent extends SessionEventBase {
   readonly type: "source_transcript" | "target_transcript";
+  readonly turnId: string;
+  readonly segmentId: string;
+  readonly revision: number;
   readonly text: string;
   readonly final: boolean;
 }
 export interface AudioPlayoutEvent extends SessionEventBase {
   readonly type: "audio_playout";
+  readonly turnId: string;
+  readonly segmentId: string;
+  readonly playoutSequence: number;
   readonly frame: AudioFrame;
   readonly latencyMs: number;
 }
@@ -173,9 +183,10 @@ export interface GenerationRef {
   readonly generation: number;
 }
 export interface LaneContext extends GenerationRef {
+  readonly turnId: string;
   readonly sourceLanguage: string;
   readonly targetLanguage: string;
-  readonly profile: TranslationProfile;
+  readonly behavior: TranslationBehavior;
   readonly glossary?: CompiledGlossary;
 }
 export interface TranslationRequest {
@@ -183,26 +194,35 @@ export interface TranslationRequest {
   readonly context: LaneContext;
   readonly signal: AbortSignal;
 }
-interface TranslationEventBase extends GenerationRef { readonly emittedAtMs: number; }
-export interface TranslationAudioEvent extends TranslationEventBase {
-  readonly type: "audio";
-  readonly frame: AudioFrame;
+interface TranslationEventBase extends GenerationRef {
+  readonly turnId: string;
+  readonly segmentId: string;
+  /** A higher revision fully replaces the prior event for this segment. */
+  readonly revision: number;
+  readonly finality: "provisional" | "final";
+  readonly evidenceRef?: string;
+  readonly emittedAtMs: number;
 }
-export interface TranslationTranscriptDeltaEvent extends TranslationEventBase {
-  readonly type: "source_transcript_delta" | "target_transcript_delta";
-  readonly delta: string;
+export interface TranslationAudioEvent extends TranslationEventBase {
+  readonly kind: "audio";
+  readonly frame: AudioFrame;
+  readonly playoutSequence: number;
+}
+export interface TranslationTranscriptEvent extends TranslationEventBase {
+  readonly kind: "source_transcript" | "target_transcript";
+  readonly text: string;
 }
 export interface TranslationTerminologyEvent extends TranslationEventBase {
-  readonly type: "terminology";
+  readonly kind: "terminology";
   readonly status: "bound" | "authorized" | "bypassed";
   readonly glossaryHash: string;
   readonly entryIds: readonly string[];
   readonly text: string;
   readonly guaranteedTargetExact: readonly string[];
 }
-export interface TranslationCompletedEvent extends TranslationEventBase { readonly type: "completed"; }
+export interface TranslationCompletedEvent extends TranslationEventBase { readonly kind: "completed"; }
 export interface TranslationErrorEvent extends TranslationEventBase {
-  readonly type: "error";
+  readonly kind: "error";
   readonly error: Readonly<{
     readonly code: string;
     readonly message: string;
@@ -211,11 +231,29 @@ export interface TranslationErrorEvent extends TranslationEventBase {
 }
 export type TranslationEvent =
   | TranslationAudioEvent
-  | TranslationTranscriptDeltaEvent
+  | TranslationTranscriptEvent
   | TranslationTerminologyEvent
   | TranslationCompletedEvent
   | TranslationErrorEvent;
+
+export interface TranslationModeCapability {
+  readonly mode: TranslationMode;
+  readonly behaviorVersion: TranslationBehavior["version"];
+  readonly deterministicGlossary: boolean;
+  readonly degradation?: string;
+}
+
+export interface TranslationCapabilities {
+  readonly providerId: TranslationProviderId;
+  readonly supportedModes: readonly TranslationModeCapability[];
+  readonly supportsProvisionalRevisions: boolean;
+  readonly supportsFinality: boolean;
+  readonly supportsCancellation: boolean;
+  readonly supportsDeterministicGlossary: boolean;
+}
+
 export interface TranslationPort {
+  readonly capabilities: TranslationCapabilities;
   prepare(context: LaneContext): Promise<void>;
   translate(request: TranslationRequest): AsyncIterable<TranslationEvent>;
   cancel(generation: GenerationRef): Promise<void>;

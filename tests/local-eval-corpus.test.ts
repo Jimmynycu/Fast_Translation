@@ -47,7 +47,7 @@ function canonicalWave(frameCount = 2): Uint8Array {
 
 function manifest(wavSha256: string, wavPath = "mistake-proofing.wav"): Readonly<Record<string, unknown>> {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     generatedAtUtc: "2026-08-06T00:00:00.000Z",
     generator: "test fixture",
     voice: "deterministic test tone",
@@ -60,11 +60,15 @@ function manifest(wavSha256: string, wavPath = "mistake-proofing.wav"): Readonly
       bitsPerSample: 16,
     },
     sourceGlossary: "terms.csv",
+    sourceGlossarySha256: "a".repeat(64),
     fixtures: [
       {
         fixtureId: "mistake-proofing-source",
         entryId: "mistake-proofing",
+        direction: "A_TO_B",
         phraseKind: "source",
+        visibility: "public",
+        expectation: "target_exact_present",
         phrase: "mistake proofing",
         targetExact: "防呆",
         wavPath,
@@ -73,9 +77,36 @@ function manifest(wavSha256: string, wavPath = "mistake-proofing.wav"): Readonly
       {
         fixtureId: "mistake-proofing-alias",
         entryId: "mistake-proofing",
+        direction: "A_TO_B",
         phraseKind: "alias",
+        visibility: "holdout",
+        expectation: "target_exact_present",
         phrase: "poka yoke",
         targetExact: "防呆",
+        wavPath,
+        wavSha256,
+      },
+      {
+        fixtureId: "mistake-proofing-confuser",
+        entryId: "mistake-proofing",
+        direction: "A_TO_B",
+        phraseKind: "confuser",
+        visibility: "holdout",
+        expectation: "target_exact_absent",
+        phrase: "mistake poofing",
+        targetExact: "防呆",
+        wavPath,
+        wavSha256,
+      },
+      {
+        fixtureId: "mistake-proofing-reverse",
+        entryId: "mistake-proofing",
+        direction: "B_TO_A",
+        phraseKind: "source",
+        visibility: "holdout",
+        expectation: "target_exact_present",
+        phrase: "防呆",
+        targetExact: "mistake proofing",
         wavPath,
         wavSha256,
       },
@@ -103,7 +134,14 @@ describe("keyless local evaluation corpus replay", () => {
         targetLanguage: "zh-TW",
       });
 
-      assert.deepEqual(report.summary, { total: 2, passed: 2, failed: 0 });
+      assert.deepEqual(report.summary, {
+        total: 4,
+        passed: 4,
+        failed: 0,
+        positiveTotal: 3,
+        confuserTotal: 1,
+        directions: { A_TO_B: 3, B_TO_A: 1 },
+      });
       assert.deepEqual(report.claims, {
         transcriptSource: "manifest_fixture_text",
         fixtureTranscriptInjected: true,
@@ -112,11 +150,24 @@ describe("keyless local evaluation corpus replay", () => {
         mediaPath: "wav_pcm16le24k_to_mulaw8k_to_fake_telephony_to_harness",
         outputSpeech: "deterministic_local_pcm_fixture",
       });
+      assert.deepEqual(report.verification, {
+        mechanism: "PASS",
+        liveProvider: "NOT_RUN",
+        overall: "NOT_RUN",
+        liveProviderRequiredServerKey: true,
+      });
       for (const fixture of report.fixtures) {
         assert.equal(fixture.observedSourceFinal, fixture.fixtureTranscript);
-        assert.equal(fixture.observedTargetFinal, "防呆");
+        if (fixture.expectation === "target_exact_present") {
+          assert.equal(fixture.targetExactObserved, true);
+        } else {
+          assert.equal(fixture.targetExactObserved, false);
+        }
         assert.equal(fixture.targetExactMatched, true);
-        assert.equal(fixture.glossaryAuthorized, true);
+        assert.equal(
+          fixture.glossaryAuthorized,
+          fixture.expectation === "target_exact_present",
+        );
         assert.ok(fixture.sourceAudioFrames > 0);
         assert.ok(fixture.playoutAudioFrames > 0);
         assert.ok(fixture.telephonyOutputFrames > 0);

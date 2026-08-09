@@ -277,22 +277,27 @@ interface PlayoutPort {
 - queue 超過 latency budget 時丟 stale audio，不用無限 buffer 假裝可靠。
 - metrics、logging、caption UI 都不能阻塞 media loop。
 
-### 9.2 Config-only adapter swap
+### 9.2 Provider configuration and session capability contract
 
 ~~~ini
-# 現階段
-APP_PROFILE=local
-TRANSLATION_PROFILE=term_guarded_selective
-MEDIA_INGRESS=browser_webrtc
-MEDIA_EGRESS=local_speaker
+# Server process: select exactly one provider.
+TRANSLATION_PROVIDER=palabra
 
-# 電話階段只換 composition
-APP_PROFILE=twilio
-MEDIA_INGRESS=twilio_media_streams
-MEDIA_EGRESS=twilio_media_streams
+# Default UI choice, validated against the selected provider.
+TRANSLATION_MODE=balanced
+MEDIA_PROFILE=browser_pair
 ~~~
 
-DuplexSession、TerminologyGuard、TranslationPort 與驗收 harness 不改；Twilio/SIP 的 8 kHz μ-law/A-law、RTP、call SID 只能存在 adapter 內。
+The provider remains fixed for the lifetime of the server. `TRANSLATION_MODE`
+does not impose a single mode on every session: each session selects from the
+chosen provider's advertised `/api/capabilities` modes and pins the selected
+mode's behavior version and full/degraded state. A glossary version is allowed
+only when that mode advertises `deterministicGlossary`; provider labels and
+legacy profile names are not a glossary guarantee.
+
+DuplexSession、TerminologyGuard、TranslationPort 與驗收 harness retain these
+provider-independent boundaries; phone-media research (Twilio/SIP 8 kHz
+μ-law/A-law、RTP、call SID) remains inside its media adapter.
 
 ## 10. Selective Commit：怎麼做到「稍慢，但專有名詞完全可控」
 
@@ -463,7 +468,7 @@ Palabra 的 flush_task 會取消 current phrase 的 transcription、translation 
 5. WAV replay harness、latency／term exactness dashboard、generation-aware playout。
 6. Phone/Twilio 只做 fake contract；不申請號碼、不改 PBX。
 
-Go/no-go 順序：先證明 critical term 三層 100% → 再證明 latency relative gates → 再證明 barge-in → 最後才把 APP_PROFILE 換成 Twilio/SIP。
+Go/no-go 順序：先證明 critical term 三層 100% → 再證明 latency relative gates → 再證明 barge-in → 最後才進入 Twilio/SIP media-adapter POC。
 
 ## 16. 主要來源
 

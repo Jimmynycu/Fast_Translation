@@ -1,7 +1,16 @@
 import WebSocket from "ws";
 import { randomBytes } from "node:crypto";
 import { CANONICAL_AUDIO, createAudioFrame, type AudioFrame } from "../../core/audio.js";
-import type { GenerationRef, LaneContext, TranslationErrorEvent, TranslationEvent, TranslationPort, TranslationRequest } from "../../core/types.js";
+import type {
+  GenerationRef,
+  LaneContext,
+  TranslationBehavior,
+  TranslationCapabilities,
+  TranslationErrorEvent,
+  TranslationEvent,
+  TranslationPort,
+  TranslationRequest,
+} from "../../core/types.js";
 
 export interface PalabraWebSocketLike {
   readonly readyState: number;
@@ -33,15 +42,46 @@ export interface PalabraTranslationAdapterOptions {
 }
 
 const DEFAULT_ENDPOINT = "wss://streaming.palabra.ai/streaming-api/{hash}/v1/speech-to-speech/stream";
-const SILENCE_MS = 300;
+const BALANCED_CONFIRMATION_MS = 700;
+const TRAILING_SILENCE_MS = 320;
 const SAMPLE_RATE = CANONICAL_AUDIO.sampleRateHz;
 const BYTES_PER_MS = SAMPLE_RATE * 2 / 1000;
 const DEFAULTS = Object.freeze({ connect: 10000, readiness: 15000, poll: 2000, turn: 45000, settle: 35, close: 2000, eos: 1 });
 const MAX_RETIRED_PROVIDER_IDS = 128;
 
+export const PALABRA_TRANSLATION_CAPABILITIES = Object.freeze({
+  providerId: "palabra",
+  supportedModes: [
+    { mode: "fast", behaviorVersion: 1, deterministicGlossary: false },
+    { mode: "balanced", behaviorVersion: 1, deterministicGlossary: false },
+    {
+      mode: "accurate",
+      behaviorVersion: 1,
+      deterministicGlossary: false,
+      degradation: "Palabra account glossaries cannot provide a deterministic pinned glossary.",
+    },
+  ],
+  supportsProvisionalRevisions: true,
+  supportsFinality: true,
+  supportsCancellation: true,
+  supportsDeterministicGlossary: false,
+} satisfies TranslationCapabilities);
 
 interface Envelope { readonly type: string; readonly data: Record<string, unknown>; }
 interface TaskWaiter { readonly resolve: (value: "running" | "not_found" | "other") => void; readonly reject: (error: unknown) => void; }
+interface LaneOutputSequence { generation: number; next: number; }
+interface PreparedTask {
+  readonly sourceLanguage: string;
+  readonly targetLanguage: string;
+  readonly behaviorVersion: TranslationBehavior["version"];
+  readonly mode: TranslationBehavior["mode"];
+}
+interface SegmentState {
+  readonly segmentId: string;
+  revision: number;
+  text: string;
+  finality: TranslationEvent["finality"];
+}
 interface LaneSession {
   readonly key: string;
   readonly sessionId: string;
@@ -55,21 +95,25 @@ interface LaneSession {
   taskWaiters: TaskWaiter[];
   turn: Turn | undefined;
   closePromise: Promise<void> | undefined;
-  context: Readonly<{ sourceLanguage: string; targetLanguage: string }> | undefined;
+  context: PreparedTask | undefined;
   preparationError: PalabraAdapterError | undefined;
   retiredProviderIds: Set<string>;
   retiredProviderIdOrder: string[];
 }
 interface Turn {
+  readonly lane: LaneSession;
   readonly context: LaneContext;
-  readonly queue: EventQueue<TranslationEvent>;
-  readonly sourceTexts: Map<string, string>;
-  readonly targetTexts: Map<string, string>;
+  readonly queue: EventQueue;
+  readonly segments: Map<string, SegmentState>;
   readonly providerIds: Set<string>;
   readonly validatedProviderIds: Set<string>;
   readonly abortListener: () => void;
   acceptEvents: boolean;
-  freshValidated: boolean;
+  sawValidated: boolean;
+  nextSegmentId: number;
+  nextAudioSegmentId: number;
+  droppedAudioFrames: number;
+  queueTrimMetricFinal: boolean;
   readonly inputStopPromise: Promise<void>;
   readonly signal: AbortSignal;
   wakeInputStop: () => void;
@@ -81,7 +125,6 @@ interface Turn {
   lastInputCapturedAtMs: number | undefined;
   lastInputSentAtMs: number | undefined;
   pendingAudio: Uint8Array<ArrayBufferLike>;
-  outputSequence: number;
   lastCapturedAtMs: number;
   sawFinalTarget: boolean;
   sawLastAudio: boolean;
@@ -104,6 +147,7 @@ export class PalabraAdapterError extends Error {
 }
 
 export class PalabraTranslationAdapter implements TranslationPort {
+  readonly capabilities = PALABRA_TRANSLATION_CAPABILITIES;
   readonly #apiKey: string;
   readonly #factory: PalabraWebSocketFactory;
   readonly #endpoint: string;
@@ -119,6 +163,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
   readonly #closeMs: number;
   readonly #eosSec: number;
   readonly #lanes = new Map<string, LaneSession>();
+  readonly #playoutSequences = new Map<string, LaneOutputSequence>();
 
   constructor(options: PalabraTranslationAdapterOptions) {
     if (typeof options.apiKey !== "string" || options.apiKey.trim() === "") throw new PalabraAdapterError("PALABRA_CONFIGURATION", "Palabra credentials are not configured.", false);
@@ -144,8 +189,8 @@ export class PalabraTranslationAdapter implements TranslationPort {
 
   async prepare(context: LaneContext): Promise<void> {
     rejectGlossary(context);
-    let lane = this.#lane(context);
-    if (lane.prepared && !lane.closed) return;
+    const lane = this.#lane(context);
+    if (lane.prepared && !lane.closed && sameTask(lane.context, context)) return;
     if (lane.preparePromise) return await lane.preparePromise;
     const operation = this.#prepare(lane, context);
     lane.preparePromise = operation;
@@ -181,17 +226,15 @@ export class PalabraTranslationAdapter implements TranslationPort {
       yield this.#error(context, "PALABRA_GLOSSARY_UNSUPPORTED", "Palabra account glossaries cannot represent the pinned local glossary.", false);
       return;
     }
-    let lane: LaneSession;
     if (request.signal.aborted) return;
+    let lane = this.#lane(context);
+    if (lane.turn?.lifecycle === "active") {
+      await this.#cancelTurn(lane, lane.turn);
+    }
     try { if (!(await this.#prepareUntil(context, request.signal))) return; lane = this.#lane(context); }
     catch (error: unknown) {
       yield this.#error(context, error instanceof PalabraAdapterError ? error.code : "PALABRA_PREPARE", error instanceof PalabraAdapterError ? error.message : "The translation service could not be prepared.", error instanceof PalabraAdapterError ? error.retryable : true);
       return;
-    }
-    if (lane.turn?.lifecycle === "active") {
-      await this.#cancelTurn(lane, lane.turn);
-      try { if (!(await this.#prepareUntil(context, request.signal))) return; lane = this.#lane(context); }
-      catch { yield this.#error(context, "PALABRA_RECONNECT", "The translation service could not reconnect.", true); return; }
     }
     const turn = this.#newTurn(lane, context, request.signal);
     lane.turn = turn;
@@ -213,23 +256,29 @@ export class PalabraTranslationAdapter implements TranslationPort {
   }
 
   async closeSession(sessionId: string): Promise<void> {
-    await Promise.all([...this.#lanes.values()].filter((lane) => lane.sessionId === sessionId).map((lane) => this.#closeLane(lane, { remove: true, graceful: true })));
+    const lanes = [...this.#lanes.values()].filter((lane) => lane.sessionId === sessionId);
+    await Promise.all(lanes.map((lane) => this.#closeLane(lane, { remove: true, graceful: true })));
+    for (const key of this.#playoutSequences.keys()) {
+      if (key.startsWith(sessionId + "\u0000")) this.#playoutSequences.delete(key);
+    }
   }
 
   async #prepare(lane: LaneSession, context: LaneContext): Promise<void> {
     if (lane.closed) throw new PalabraAdapterError("PALABRA_CONNECTION", "The translation service connection is unavailable.", true);
-    if (lane.context && (lane.context.sourceLanguage !== context.sourceLanguage || lane.context.targetLanguage !== context.targetLanguage)) {
-      await this.#closeLane(lane);
-      lane = this.#lane(context);
-    }
     await this.#ensureSocket(lane);
-    if (lane.prepared) return;
+    if (lane.prepared && sameTask(lane.context, context)) return;
     lane.preparationError = undefined;
-    lane.context = Object.freeze({ sourceLanguage: context.sourceLanguage, targetLanguage: context.targetLanguage });
-    this.#send(lane, { message_type: "set_task", data: taskConfig(context.sourceLanguage, context.targetLanguage) });
+    lane.prepared = false;
+    this.#send(lane, { message_type: "set_task", data: taskConfig(context.sourceLanguage, context.targetLanguage, context.behavior) });
     try {
       await this.#waitReady(lane);
       lane.prepared = true;
+      lane.context = Object.freeze({
+        sourceLanguage: context.sourceLanguage,
+        targetLanguage: context.targetLanguage,
+        behaviorVersion: context.behavior.version,
+        mode: context.behavior.mode,
+      });
     } catch (error) { lane.prepared = false; throw error; }
   }
 
@@ -365,19 +414,27 @@ export class PalabraTranslationAdapter implements TranslationPort {
     }
     const turn = lane.turn;
     if (!turn || turn.lifecycle !== "active" || !turn.acceptEvents) return;
-    if (envelope.type === "validated_transcription") {
+    if (envelope.type === "partial_transcription") {
+      if (turn.context.behavior.transcriptPolicy === "provisional_revisions" && this.#acceptTranscriptEvent(lane, turn, data)) {
+        this.#transcript(turn, data, false, "provisional");
+      }
+    } else if (envelope.type === "partial_translated_transcription") {
+      if (turn.context.behavior.transcriptPolicy === "provisional_revisions" && this.#acceptTranslatedEvent(lane, turn, data)) {
+        this.#transcript(turn, data, true, "provisional");
+      }
+    } else if (envelope.type === "validated_transcription") {
       const providerId = providerEventId(data);
       if (providerId && lane.retiredProviderIds.has(providerId)) return;
-      turn.freshValidated = true;
+      turn.sawValidated = true;
       if (providerId) {
         turn.providerIds.add(providerId);
         turn.validatedProviderIds.add(providerId);
       }
-      this.#transcript(turn, data, false);
+      this.#transcript(turn, data, false, "final");
     } else if (envelope.type === "translated_transcription") {
-      if (this.#acceptFreshProviderEvent(lane, turn, data)) this.#transcript(turn, data, true);
+      if (this.#acceptTranslatedEvent(lane, turn, data)) this.#transcript(turn, data, true, "final");
     } else if (envelope.type === "output_audio_data") {
-      if (this.#acceptFreshProviderEvent(lane, turn, data)) this.#audio(turn, data);
+      if (this.#acceptAudioEvent(lane, turn, data)) this.#audio(lane, turn, data);
     }
   }
 
@@ -385,34 +442,82 @@ export class PalabraTranslationAdapter implements TranslationPort {
     lane.taskWaiters.shift()?.resolve(status);
   }
 
-  #acceptFreshProviderEvent(lane: LaneSession, turn: Turn, data: Record<string, unknown>): boolean {
-    if (!turn.freshValidated) return false;
+  #acceptTranscriptEvent(lane: LaneSession, turn: Turn, data: Record<string, unknown>): boolean {
     const providerId = providerEventId(data);
     if (providerId && lane.retiredProviderIds.has(providerId)) return false;
-    if (providerId && turn.validatedProviderIds.size > 0 && !turn.validatedProviderIds.has(providerId)) return false;
     if (providerId) turn.providerIds.add(providerId);
     return true;
   }
 
-  #transcript(turn: Turn, data: Record<string, unknown>, target: boolean): void {
-    const transcription = asRecord(data.transcription) ?? data;
-    const text = typeof transcription.text === "string" ? transcription.text : "";
-    const id = target
-      ? (scalarId(transcription.transcription_id) ?? "text:" + text) + ":" + (scalarId(transcription.translation_part_id) ?? "0")
-      : scalarId(transcription.transcription_id) ?? "text:" + text;
-    const texts = target ? turn.targetTexts : turn.sourceTexts;
-    const previous = texts.get(id);
-    if (previous !== undefined) {
-      if (previous === text) return;
-      turn.queue.push(this.#error(turn.context, "PALABRA_TRANSCRIPT_REVISION", "The translation service returned a conflicting final transcript.", true));
-      return;
+  #acceptTranslatedEvent(lane: LaneSession, turn: Turn, data: Record<string, unknown>): boolean {
+    const providerId = providerEventId(data);
+    if (providerId && lane.retiredProviderIds.has(providerId)) return false;
+    if (turn.context.behavior.transcriptPolicy === "final_only") {
+      if (!turn.sawValidated || (providerId !== undefined && !turn.validatedProviderIds.has(providerId))) return false;
     }
-    texts.set(id, text);
-    if (text) turn.queue.push({ type: target ? "target_transcript_delta" : "source_transcript_delta", sessionId: turn.context.sessionId, lane: turn.context.lane, generation: turn.context.generation, emittedAtMs: this.#now(), delta: text });
-    if (target) { turn.sawFinalTarget = true; this.#maybeComplete(turn); }
+    if (providerId) turn.providerIds.add(providerId);
+    return true;
   }
 
-  #audio(turn: Turn, data: Record<string, unknown>): void {
+  #acceptAudioEvent(lane: LaneSession, turn: Turn, data: Record<string, unknown>): boolean {
+    const providerId = providerEventId(data);
+    // An output packet with no stable provider ID cannot be fenced after flush.
+    // Keep local playout safe rather than risk replaying stale speech.
+    if (!providerId || lane.retiredProviderIds.has(providerId)) return false;
+    if (turn.context.behavior.transcriptPolicy === "final_only" && !turn.validatedProviderIds.has(providerId)) return false;
+    turn.providerIds.add(providerId);
+    return true;
+  }
+
+  #transcript(
+    turn: Turn,
+    data: Record<string, unknown>,
+    target: boolean,
+    finality: TranslationEvent["finality"],
+  ): void {
+    const transcription = asRecord(data.transcription) ?? data;
+    const text = typeof transcription.text === "string" ? transcription.text : "";
+    const segment = this.#segment(turn, data, target);
+    if (segment.finality === "final") return;
+    if (segment.text === text && segment.finality === finality) return;
+    segment.text = text;
+    segment.finality = finality;
+    segment.revision += 1;
+    if (text) {
+      turn.queue.push({
+        kind: target ? "target_transcript" : "source_transcript",
+        sessionId: turn.context.sessionId,
+        lane: turn.context.lane,
+        generation: turn.context.generation,
+        turnId: turn.context.turnId,
+        segmentId: segment.segmentId,
+        revision: segment.revision,
+        finality,
+        emittedAtMs: this.#now(),
+        text,
+      });
+    }
+    if (target && finality === "final") {
+      turn.sawFinalTarget = true;
+      this.#maybeComplete(turn);
+    }
+  }
+
+  #segment(turn: Turn, data: Record<string, unknown>, target: boolean): SegmentState {
+    const key = providerSegmentKey(data, target);
+    const existing = turn.segments.get(key);
+    if (existing) return existing;
+    const segment: SegmentState = {
+      segmentId: turn.context.turnId + ":segment:" + turn.nextSegmentId++,
+      revision: -1,
+      text: "",
+      finality: "provisional",
+    };
+    turn.segments.set(key, segment);
+    return segment;
+  }
+
+  #audio(lane: LaneSession, turn: Turn, data: Record<string, unknown>): void {
     if (typeof data.data !== "string") {
       turn.queue.push(this.#error(turn.context, "PALABRA_INVALID_AUDIO", "The translation service returned invalid audio.", true));
       return;
@@ -422,24 +527,84 @@ export class PalabraTranslationAdapter implements TranslationPort {
     catch { turn.queue.push(this.#error(turn.context, "PALABRA_INVALID_AUDIO", "The translation service returned invalid audio.", true)); return; }
     turn.pendingAudio = join(turn.pendingAudio, bytes);
     while (turn.pendingAudio.byteLength >= CANONICAL_AUDIO.bytesPerFrame) {
-      this.#emitAudio(turn, turn.pendingAudio.slice(0, CANONICAL_AUDIO.bytesPerFrame));
+      const finality = data.last_chunk === true && turn.pendingAudio.byteLength === CANONICAL_AUDIO.bytesPerFrame
+        ? "final"
+        : "provisional";
+      this.#emitAudio(lane, turn, turn.pendingAudio.slice(0, CANONICAL_AUDIO.bytesPerFrame), finality);
       turn.pendingAudio = turn.pendingAudio.slice(CANONICAL_AUDIO.bytesPerFrame);
     }
     if (data.last_chunk === true) {
       turn.sawLastAudio = true;
-      this.#flushAudio(turn);
+      this.#flushAudio(turn, "final");
       this.#maybeComplete(turn);
     }
   }
 
-  #emitAudio(turn: Turn, pcm: Uint8Array): void {
+  #emitAudio(
+    lane: LaneSession,
+    turn: Turn,
+    pcm: Uint8Array,
+    finality: TranslationEvent["finality"],
+  ): void {
     const now = this.#now();
     const capturedAtMs = Math.max(Number.isFinite(now) && now >= 0 ? now : 0, turn.lastCapturedAtMs);
     turn.lastCapturedAtMs = capturedAtMs;
-    turn.queue.push({ type: "audio", sessionId: turn.context.sessionId, lane: turn.context.lane, generation: turn.context.generation, emittedAtMs: capturedAtMs, frame: createAudioFrame({ sessionId: turn.context.sessionId, lane: turn.context.lane, generation: turn.context.generation, sequence: turn.outputSequence++, capturedAtMs, pcm16le: pcm }) });
+    let output = this.#playoutSequences.get(lane.key);
+    if (!output || output.generation !== turn.context.generation) {
+      output = { generation: turn.context.generation, next: 0 };
+      this.#playoutSequences.set(lane.key, output);
+    }
+    const sequence = output.next++;
+    const droppedOldest = turn.queue.push({
+      kind: "audio",
+      sessionId: turn.context.sessionId,
+      lane: turn.context.lane,
+      generation: turn.context.generation,
+      turnId: turn.context.turnId,
+      segmentId: turn.context.turnId + ":audio:" + turn.nextAudioSegmentId++,
+      revision: 0,
+      finality,
+      emittedAtMs: capturedAtMs,
+      playoutSequence: sequence,
+      frame: createAudioFrame({ sessionId: turn.context.sessionId, lane: turn.context.lane, generation: turn.context.generation, sequence, capturedAtMs, pcm16le: pcm }),
+    });
+    if (droppedOldest) {
+      turn.droppedAudioFrames += 1;
+      turn.queue.upsert(this.#queueTrimMetric(turn, "provisional"), (event) =>
+        event.kind === "error" && event.segmentId === turn.context.turnId + ":local-audio-queue",
+      );
+    }
   }
 
-  #flushAudio(turn: Turn): void {
+  #queueTrimMetric(turn: Turn, finality: TranslationEvent["finality"]): TranslationErrorEvent {
+    return {
+      kind: "error",
+      sessionId: turn.context.sessionId,
+      lane: turn.context.lane,
+      generation: turn.context.generation,
+      turnId: turn.context.turnId,
+      segmentId: turn.context.turnId + ":local-audio-queue",
+      revision: turn.droppedAudioFrames - 1 + (finality === "final" ? 1 : 0),
+      finality,
+      evidenceRef: "palabra:local-audio-queue",
+      emittedAtMs: this.#now(),
+      error: {
+        code: "PALABRA_LOCAL_AUDIO_QUEUE_TRIMMED",
+        message: "Dropped " + turn.droppedAudioFrames + " queued audio frame(s) to honor the " + turn.context.behavior.maxBufferedAudioMs + " ms local playout budget.",
+        retryable: true,
+      },
+    };
+  }
+
+  #finalizeQueueTrimMetric(turn: Turn): void {
+    if (turn.droppedAudioFrames === 0 || turn.queueTrimMetricFinal) return;
+    turn.queueTrimMetricFinal = true;
+    turn.queue.upsert(this.#queueTrimMetric(turn, "final"), (event) =>
+      event.kind === "error" && event.segmentId === turn.context.turnId + ":local-audio-queue",
+    );
+  }
+
+  #flushAudio(turn: Turn, finality: TranslationEvent["finality"]): void {
     if (!turn.pendingAudio.byteLength) return;
     if (turn.pendingAudio.byteLength % 2) {
       turn.queue.push(this.#error(turn.context, "PALABRA_INVALID_AUDIO", "The translation service returned an incomplete PCM16 sample.", true));
@@ -449,7 +614,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     const pcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame);
     pcm.set(turn.pendingAudio);
     turn.pendingAudio = new Uint8Array(0);
-    this.#emitAudio(turn, pcm);
+    this.#emitAudio(turn.lane, turn, pcm, finality);
   }
 
   async #pumpInput(lane: LaneSession, turn: Turn, request: TranslationRequest): Promise<void> {
@@ -492,7 +657,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
       chunk.set(buffer);
       await this.#sendInput(lane, turn, chunk);
     }
-    const silenceBytes = Math.ceil(BYTES_PER_MS * SILENCE_MS);
+    const silenceBytes = Math.ceil(BYTES_PER_MS * TRAILING_SILENCE_MS);
     let zeroBytes = buffer.byteLength ? this.#chunkBytes - buffer.byteLength : 0;
     while (turn.lifecycle === "active" && zeroBytes < silenceBytes) {
       const size = Math.min(this.#chunkBytes, silenceBytes - zeroBytes);
@@ -522,7 +687,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     const inputStopPromise = new Promise<void>((resolve) => { wakeInputStop = resolve; });
     let turn!: Turn;
     const abortListener = (): void => { if (turn.lifecycle === "active") void this.#cancelTurn(lane, turn); };
-    turn = { context, queue: new EventQueue<TranslationEvent>(), sourceTexts: new Map(), targetTexts: new Map(), providerIds: new Set(), validatedProviderIds: new Set(), abortListener, acceptEvents: false, freshValidated: false, signal, inputStopPromise, wakeInputStop, lifecycle: "active", inputStopped: false, inputIterator: undefined, inputReturnRequested: false, lastInputSequence: undefined, lastInputCapturedAtMs: undefined, lastInputSentAtMs: undefined, pendingAudio: new Uint8Array(0), outputSequence: 0, lastCapturedAtMs: 0, sawFinalTarget: false, sawLastAudio: false, inputFinished: false, completionTimer: undefined, hardTimer: undefined };
+    turn = { lane, context, queue: new EventQueue(maximumBufferedAudioFrames(context.behavior)), segments: new Map(), providerIds: new Set(), validatedProviderIds: new Set(), abortListener, acceptEvents: false, sawValidated: false, nextSegmentId: 0, nextAudioSegmentId: 0, droppedAudioFrames: 0, queueTrimMetricFinal: false, signal, inputStopPromise, wakeInputStop, lifecycle: "active", inputStopped: false, inputIterator: undefined, inputReturnRequested: false, lastInputSequence: undefined, lastInputCapturedAtMs: undefined, lastInputSentAtMs: undefined, pendingAudio: new Uint8Array(0), lastCapturedAtMs: 0, sawFinalTarget: false, sawLastAudio: false, inputFinished: false, completionTimer: undefined, hardTimer: undefined };
     turn.hardTimer = setTimeout(() => { if (turn.lifecycle === "active") this.#failTurn(turn, "PALABRA_TURN_TIMEOUT", "The translation service timed out while finishing the turn.", true); }, this.#turnMs);
     signal.addEventListener("abort", abortListener, { once: true });
     return turn;
@@ -538,8 +703,19 @@ export class PalabraTranslationAdapter implements TranslationPort {
     turn.lifecycle = "completed";
     if (turn.hardTimer) clearTimeout(turn.hardTimer);
     if (turn.completionTimer) clearTimeout(turn.completionTimer);
-    this.#flushAudio(turn);
-    turn.queue.push({ type: "completed", sessionId: turn.context.sessionId, lane: turn.context.lane, generation: turn.context.generation, emittedAtMs: this.#now() });
+    this.#flushAudio(turn, "final");
+    this.#finalizeQueueTrimMetric(turn);
+    turn.queue.push({
+      kind: "completed",
+      sessionId: turn.context.sessionId,
+      lane: turn.context.lane,
+      generation: turn.context.generation,
+      turnId: turn.context.turnId,
+      segmentId: turn.context.turnId + ":completed",
+      revision: 0,
+      finality: "final",
+      emittedAtMs: this.#now(),
+    });
     turn.queue.end();
   }
 
@@ -549,6 +725,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     if (turn.hardTimer) clearTimeout(turn.hardTimer);
     if (turn.completionTimer) clearTimeout(turn.completionTimer);
     this.#stopInput(turn);
+    this.#finalizeQueueTrimMetric(turn);
     turn.queue.push(this.#error(turn.context, code, message, retryable));
     turn.queue.end();
   }
@@ -568,6 +745,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     if (turn.hardTimer) clearTimeout(turn.hardTimer);
     if (turn.completionTimer) clearTimeout(turn.completionTimer);
     this.#stopInput(turn);
+    this.#finalizeQueueTrimMetric(turn);
     turn.queue.end();
     let flushed = false;
     if (lane.socket && !lane.closed) {
@@ -599,7 +777,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     if (lane.closePromise) return await lane.closePromise;
     const operation = (async (): Promise<void> => {
       lane.intentionalClose = true;
-      if (lane.turn?.lifecycle === "active") { lane.turn.lifecycle = "cancelled"; this.#stopInput(lane.turn); lane.turn.queue.end(); }
+      if (lane.turn?.lifecycle === "active") { lane.turn.lifecycle = "cancelled"; this.#stopInput(lane.turn); this.#finalizeQueueTrimMetric(lane.turn); lane.turn.queue.end(); }
       const socket = lane.socket;
        if (!socket) { lane.closed = true; lane.prepared = false; if (options.remove && this.#lanes.get(lane.key) === lane) this.#lanes.delete(lane.key); return; }
        if (options.graceful && lane.opened && !lane.closed) {
@@ -651,8 +829,19 @@ export class PalabraTranslationAdapter implements TranslationPort {
     return lane;
   }
 
-  #error(context: GenerationRef, code: string, message: string, retryable: boolean): TranslationErrorEvent {
-    return { type: "error", sessionId: context.sessionId, lane: context.lane, generation: context.generation, emittedAtMs: this.#now(), error: { code, message, retryable } };
+  #error(context: LaneContext, code: string, message: string, retryable: boolean): TranslationErrorEvent {
+    return {
+      kind: "error",
+      sessionId: context.sessionId,
+      lane: context.lane,
+      generation: context.generation,
+      turnId: context.turnId,
+      segmentId: context.turnId + ":error:" + safeCode(code),
+      revision: 0,
+      finality: "final",
+      emittedAtMs: this.#now(),
+      error: { code, message, retryable },
+    };
   }
 }
 
@@ -665,6 +854,16 @@ function hashFactory(value: string | (() => string) | undefined): () => string {
   return () => randomBytes(16).toString("hex");
 }
 function laneKey(ref: GenerationRef): string { return ref.sessionId + "\u0000" + ref.lane; }
+function sameTask(
+  current: PreparedTask | undefined,
+  next: Pick<LaneContext, "sourceLanguage" | "targetLanguage" | "behavior">,
+): boolean {
+  return current !== undefined &&
+    current.sourceLanguage === next.sourceLanguage &&
+    current.targetLanguage === next.targetLanguage &&
+    current.behaviorVersion === next.behavior.version &&
+    current.mode === next.behavior.mode;
+}
 function positiveMs(value: number, field: string): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > 2147483647) throw new PalabraAdapterError("PALABRA_CONFIGURATION", field + " must be a positive whole number of milliseconds.", false);
   return value;
@@ -687,16 +886,75 @@ function mapPalabraLanguage(value: string): string {
   const trimmed = value.trim();
   return PALABRA_LANGUAGE_MAP[trimmed.toLowerCase()] ?? trimmed;
 }
-function taskConfig(source: string, target: string): Record<string, unknown> {
+function taskConfig(source: string, target: string, behavior: TranslationBehavior): Record<string, unknown> {
+  const settings = modeSettings(behavior);
   return {
     input_stream: { content_type: "audio", source: { type: "ws", format: "pcm_s16le", sample_rate: SAMPLE_RATE, channels: 1 } },
     output_stream: { content_type: "audio", target: { type: "ws", format: "pcm_s16le" } },
     pipeline: {
-      transcription: { source_language: mapPalabraLanguage(source), segment_confirmation_silence_threshold: SILENCE_MS / 1000 },
-      translations: [{ target_language: mapPalabraLanguage(target), translate_partial_transcriptions: false, speech_generation: {} }],
-      allowed_message_types: ["validated_transcription", "translated_transcription", "output_audio_data"],
+      transcription: {
+        source_language: mapPalabraLanguage(source),
+        segment_confirmation_silence_threshold: settings.confirmationMs / 1000,
+        sentence_splitter: { enabled: settings.sentenceSplitter },
+      },
+      translations: [{ target_language: mapPalabraLanguage(target), translate_partial_transcriptions: settings.translatePartials, speech_generation: {} }],
+      translation_queue_configs: {
+        global: {
+          desired_queue_level_ms: settings.desiredProviderQueueMs,
+          max_queue_level_ms: settings.maxProviderQueueMs,
+          auto_tempo: true,
+          min_tempo: 1.15,
+          max_tempo: 1.45,
+        },
+      },
+      allowed_message_types: settings.allowedMessageTypes,
     },
   };
+}
+function modeSettings(behavior: TranslationBehavior): Readonly<{
+  confirmationMs: number;
+  sentenceSplitter: boolean;
+  translatePartials: boolean;
+  /** Palabra-managed TTS backlog, not the local playout budget. */
+  desiredProviderQueueMs: number;
+  maxProviderQueueMs: number;
+  allowedMessageTypes: readonly string[];
+}> {
+  if (behavior.version !== 1) {
+    throw new PalabraAdapterError("PALABRA_CONFIGURATION", "The translation behavior version is not supported by Palabra.", false);
+  }
+  switch (behavior.mode) {
+    case "fast":
+      return {
+        confirmationMs: 400,
+        sentenceSplitter: true,
+        translatePartials: true,
+        desiredProviderQueueMs: 2000,
+        maxProviderQueueMs: 5000,
+        allowedMessageTypes: ["partial_transcription", "partial_translated_transcription", "validated_transcription", "translated_transcription", "output_audio_data"],
+      };
+    case "balanced":
+      return {
+        confirmationMs: BALANCED_CONFIRMATION_MS,
+        sentenceSplitter: true,
+        translatePartials: false,
+        desiredProviderQueueMs: 5000,
+        maxProviderQueueMs: 20000,
+        allowedMessageTypes: ["validated_transcription", "translated_transcription", "output_audio_data"],
+      };
+    case "accurate":
+      return {
+        confirmationMs: 1200,
+        sentenceSplitter: false,
+        translatePartials: false,
+        desiredProviderQueueMs: 10000,
+        maxProviderQueueMs: 30000,
+        allowedMessageTypes: ["validated_transcription", "translated_transcription", "output_audio_data"],
+      };
+  }
+}
+function maximumBufferedAudioFrames(behavior: TranslationBehavior): number {
+  return Math.max(1, Math.floor(behavior.maxBufferedAudioMs / CANONICAL_AUDIO.frameDurationMs));
 }
 function parseEnvelope(raw: unknown): Envelope | null {
   const parsed = parseValue(raw);
@@ -719,6 +977,14 @@ function scalarId(value: unknown): string | undefined { return typeof value === 
 function providerEventId(data: Record<string, unknown>): string | undefined {
   const transcription = asRecord(data.transcription);
   return scalarId(transcription?.transcription_id) ?? scalarId(data.transcription_id);
+}
+function providerSegmentKey(data: Record<string, unknown>, target: boolean): string {
+  const providerId = providerEventId(data);
+  if (!providerId) return target ? "target\u0000fallback" : "source\u0000fallback";
+  if (!target) return "source\u0000" + providerId;
+  const transcription = asRecord(data.transcription);
+  const partId = scalarId(transcription?.translation_part_id) ?? scalarId(data.translation_part_id) ?? "0";
+  return "target\u0000" + providerId + "\u0000" + partId;
 }
 function safeCode(value: string): string {
   const code = value.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_").slice(0, 64);
@@ -745,22 +1011,53 @@ function join(left: Uint8Array<ArrayBufferLike>, right: Uint8Array<ArrayBufferLi
 }
 function wait(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms))); }
 
-class EventQueue<T> implements AsyncIterable<T> {
-  readonly #values: T[] = [];
-  readonly #waiters: Array<(result: IteratorResult<T>) => void> = [];
+class EventQueue implements AsyncIterable<TranslationEvent> {
+  readonly #values: TranslationEvent[] = [];
+  readonly #waiters: Array<(result: IteratorResult<TranslationEvent>) => void> = [];
+  readonly #maxBufferedAudioFrames: number;
   #ended = false;
-  push(value: T): void {
+  constructor(maxBufferedAudioFrames: number) {
+    this.#maxBufferedAudioFrames = maxBufferedAudioFrames;
+  }
+  push(value: TranslationEvent): boolean {
+    if (this.#ended) return false;
+    const waiter = this.#waiters.shift();
+    if (waiter) {
+      waiter({ done: false, value });
+      return false;
+    }
+    const droppedOldest = value.kind === "audio" && this.#trimAudio();
+    this.#values.push(value);
+    return droppedOldest;
+  }
+  upsert(value: TranslationEvent, matches: (current: TranslationEvent) => boolean): void {
     if (this.#ended) return;
     const waiter = this.#waiters.shift();
-    if (waiter) waiter({ done: false, value }); else this.#values.push(value);
+    if (waiter) {
+      waiter({ done: false, value });
+      return;
+    }
+    const index = this.#values.findIndex(matches);
+    if (index >= 0) this.#values[index] = value;
+    else this.#values.push(value);
+  }
+  #trimAudio(): boolean {
+    let dropped = false;
+    while (this.#values.filter((event) => event.kind === "audio").length >= this.#maxBufferedAudioFrames) {
+      const oldestAudio = this.#values.findIndex((event) => event.kind === "audio");
+      if (oldestAudio < 0) return dropped;
+      this.#values.splice(oldestAudio, 1);
+      dropped = true;
+    }
+    return dropped;
   }
   end(): void {
     if (this.#ended) return;
     this.#ended = true;
     for (const waiter of this.#waiters.splice(0)) waiter({ done: true, value: undefined });
   }
-  [Symbol.asyncIterator](): AsyncIterator<T> {
-    return { next: async (): Promise<IteratorResult<T>> => {
+  [Symbol.asyncIterator](): AsyncIterator<TranslationEvent> {
+    return { next: async (): Promise<IteratorResult<TranslationEvent>> => {
       const value = this.#values.shift();
       if (value !== undefined) return { done: false, value };
       if (this.#ended) return { done: true, value: undefined };

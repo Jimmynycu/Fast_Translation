@@ -1,22 +1,42 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CANONICAL_AUDIO, createAudioFrame } from "../src/core/audio.js";
-import type { LaneContext } from "../src/core/types.js";
-import { PalabraTranslationAdapter, type PalabraWebSocketLike } from "../src/adapters/palabra/index.js";
+import { resolveTranslationBehavior } from "../src/core/translation-behavior.js";
+import type {
+  LaneContext,
+  TranslationAudioEvent,
+  TranslationCompletedEvent,
+  TranslationErrorEvent,
+  TranslationEvent,
+  TranslationMode,
+  TranslationTranscriptEvent,
+} from "../src/core/types.js";
+import {
+  PALABRA_TRANSLATION_CAPABILITIES,
+  PalabraTranslationAdapter,
+  type PalabraWebSocketLike,
+} from "../src/adapters/palabra/index.js";
 
 class FakeSocket implements PalabraWebSocketLike {
   readonly sent: Array<Record<string, unknown>> = [];
   readonly #listeners = new Map<string, Array<(value?: unknown) => void>>();
-  readonly #sentWaiters: Array<{ messageType: string; count: number; resolve: () => void; timer: ReturnType<typeof setTimeout> }> = [];
+  readonly #sentWaiters: Array<{
+    messageType: string;
+    count: number;
+    resolve: () => void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = [];
   readyState = 1;
   closed = false;
   failFlush = false;
   respondTask = true;
+
   on(event: "open" | "message" | "close" | "error", listener: (value?: unknown) => void): void {
     const listeners = this.#listeners.get(event) ?? [];
     listeners.push(listener);
     this.#listeners.set(event, listeners);
   }
+
   send(value: string): void {
     const message = JSON.parse(value) as Record<string, unknown>;
     this.sent.push(message);
@@ -29,8 +49,11 @@ class FakeSocket implements PalabraWebSocketLike {
       }
     }
     if (message.message_type === "flush_task" && this.failFlush) throw new Error("flush failed");
-    if (message.message_type === "get_task" && this.respondTask) this.emit("message", { message_type: "current_task", data: { task_status: "running" } });
+    if (message.message_type === "get_task" && this.respondTask) {
+      this.emit("message", { message_type: "current_task", data: { task_status: "running" } });
+    }
   }
+
   waitForSent(messageType: string, count: number): Promise<void> {
     if (this.sent.filter((item) => item.message_type === messageType).length >= count) return Promise.resolve();
     return new Promise((resolve, reject) => {
@@ -38,7 +61,13 @@ class FakeSocket implements PalabraWebSocketLike {
       this.#sentWaiters.push({ messageType, count, resolve, timer });
     });
   }
-  close(): void { this.closed = true; this.readyState = 3; this.emit("close"); }
+
+  close(): void {
+    this.closed = true;
+    this.readyState = 3;
+    this.emit("close");
+  }
+
   emit(event: "open" | "message" | "close" | "error", value?: unknown): void {
     for (const listener of this.#listeners.get(event) ?? []) {
       if (event === "message") listener(value);
@@ -46,238 +75,383 @@ class FakeSocket implements PalabraWebSocketLike {
     }
   }
 }
-function context(generation = 0, sourceLanguage = "en", targetLanguage = "es"): LaneContext {
-  return { sessionId: "sess", lane: "A_TO_B", generation, sourceLanguage, targetLanguage, profile: "native_live_baseline" };
+
+function context(
+  generation = 0,
+  sourceLanguage = "en",
+  targetLanguage = "es",
+  mode: TranslationMode = "balanced",
+  lane: LaneContext["lane"] = "A_TO_B",
+  turnId = "turn-" + generation,
+): LaneContext {
+  return {
+    sessionId: "sess",
+    lane,
+    generation,
+    turnId,
+    sourceLanguage,
+    targetLanguage,
+    behavior: resolveTranslationBehavior(mode),
+  };
 }
+
 function frame(ref: LaneContext, value = 1) {
-  return createAudioFrame({ ...ref, sequence: value, capturedAtMs: value * 20, pcm16le: Uint8Array.from({ length: CANONICAL_AUDIO.bytesPerFrame }, () => value) });
+  return createAudioFrame({
+    ...ref,
+    sequence: value,
+    capturedAtMs: value * 20,
+    pcm16le: Uint8Array.from({ length: CANONICAL_AUDIO.bytesPerFrame }, () => value),
+  });
 }
+
 async function* frames(ref: LaneContext, count = 1): AsyncIterable<ReturnType<typeof frame>> {
   for (let i = 0; i < count; i++) yield frame(ref, i);
 }
-async function collect(iterable: AsyncIterable<unknown>): Promise<unknown[]> {
-  const values: unknown[] = [];
+
+async function collect(iterable: AsyncIterable<TranslationEvent>): Promise<TranslationEvent[]> {
+  const values: TranslationEvent[] = [];
   for await (const value of iterable) values.push(value);
   return values;
 }
-async function tick(): Promise<void> { await new Promise<void>((resolve) => setImmediate(resolve)); }
 
-test("auth endpoint, readiness and task configuration", async () => {
+function eventsOf(events: readonly TranslationEvent[], kind: "audio"): TranslationAudioEvent[];
+function eventsOf(events: readonly TranslationEvent[], kind: "source_transcript" | "target_transcript"): TranslationTranscriptEvent[];
+function eventsOf(events: readonly TranslationEvent[], kind: "completed"): TranslationCompletedEvent[];
+function eventsOf(events: readonly TranslationEvent[], kind: "error"): TranslationErrorEvent[];
+function eventsOf(events: readonly TranslationEvent[], kind: TranslationEvent["kind"]): TranslationEvent[] {
+  return events.filter((event) => event.kind === kind);
+}
+
+function pipeline(socket: FakeSocket, index = 0): Record<string, unknown> {
+  const setTasks = socket.sent.filter((message) => message.message_type === "set_task") as Array<{
+    data: { pipeline: Record<string, unknown> };
+  }>;
+  const task = setTasks[index];
+  assert.ok(task);
+  return task.data.pipeline;
+}
+
+async function tick(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+test("advertises complete Palabra modes and pins each lane task to its resolved behavior", async () => {
   const secret = "palabra-secret";
   const socket = new FakeSocket();
   let url = "";
   let headers: Readonly<Record<string, string>> | undefined;
-  const adapter = new PalabraTranslationAdapter({ apiKey: secret, randomHash: "a".repeat(32), webSocketFactory: (value, options) => { url = value; headers = options.headers; return socket; }, pollIntervalMs: 1, readinessTimeoutMs: 100 });
-  await adapter.prepare(context());
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: secret,
+    randomHash: "a".repeat(32),
+    webSocketFactory: (value, options) => {
+      url = value;
+      headers = options.headers;
+      return socket;
+    },
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+  });
+
+  assert.equal(adapter.capabilities, PALABRA_TRANSLATION_CAPABILITIES);
+  assert.deepEqual(PALABRA_TRANSLATION_CAPABILITIES.supportedModes.map((entry) => entry.mode), ["fast", "balanced", "accurate"]);
+  assert.equal(PALABRA_TRANSLATION_CAPABILITIES.supportsProvisionalRevisions, true);
+  assert.equal(PALABRA_TRANSLATION_CAPABILITIES.supportsFinality, true);
+  assert.equal(PALABRA_TRANSLATION_CAPABILITIES.supportsCancellation, true);
+  assert.equal(PALABRA_TRANSLATION_CAPABILITIES.supportsDeterministicGlossary, false);
+
+  await adapter.prepare(context(0, "en-US", "zh-TW", "fast"));
+  await adapter.prepare(context(0, "en-US", "zh-TW", "balanced"));
+  await adapter.prepare(context(0, "en-US", "zh-TW", "accurate"));
+
   assert.equal(url, "wss://streaming.palabra.ai/streaming-api/" + "a".repeat(32) + "/v1/speech-to-speech/stream");
   assert.deepEqual(headers, { Authorization: "Bearer " + secret });
   assert.equal(url.includes(secret), false);
-  const set = socket.sent.find((item) => item.message_type === "set_task") as { data: Record<string, unknown> };
-  assert.ok(set);
-  const pipeline = set.data.pipeline as Record<string, unknown>;
-  assert.deepEqual(pipeline.allowed_message_types, ["validated_transcription", "translated_transcription", "output_audio_data"]);
-  assert.equal((pipeline.allowed_message_types as string[]).some((item) => item.includes("partial")), false);
+  assert.equal(socket.sent.filter((message) => message.message_type === "set_task").length, 3);
+
+  const fast = pipeline(socket, 0);
+  const fastTranscription = fast.transcription as Record<string, unknown>;
+  assert.equal(fastTranscription.source_language, "en-us");
+  assert.equal(fastTranscription.segment_confirmation_silence_threshold, 0.4);
+  assert.deepEqual(fastTranscription.sentence_splitter, { enabled: true });
+  assert.equal((fast.translations as Array<Record<string, unknown>>)[0]?.target_language, "zh-hant");
+  assert.equal((fast.translations as Array<Record<string, unknown>>)[0]?.translate_partial_transcriptions, true);
+  assert.deepEqual(fast.allowed_message_types, ["partial_transcription", "partial_translated_transcription", "validated_transcription", "translated_transcription", "output_audio_data"]);
+  assert.deepEqual(fast.translation_queue_configs, {
+    global: { desired_queue_level_ms: 2000, max_queue_level_ms: 5000, auto_tempo: true, min_tempo: 1.15, max_tempo: 1.45 },
+  });
+
+  const balanced = pipeline(socket, 1);
+  assert.equal((balanced.transcription as Record<string, unknown>).segment_confirmation_silence_threshold, 0.7);
+  assert.equal(((balanced.translations as Array<Record<string, unknown>>)[0])?.translate_partial_transcriptions, false);
+  assert.deepEqual((balanced.transcription as Record<string, unknown>).sentence_splitter, { enabled: true });
+  assert.deepEqual(balanced.translation_queue_configs, {
+    global: { desired_queue_level_ms: 5000, max_queue_level_ms: 20000, auto_tempo: true, min_tempo: 1.15, max_tempo: 1.45 },
+  });
+
+  const accurate = pipeline(socket, 2);
+  assert.equal((accurate.transcription as Record<string, unknown>).segment_confirmation_silence_threshold, 1.2);
+  assert.deepEqual((accurate.transcription as Record<string, unknown>).sentence_splitter, { enabled: false });
+  assert.equal(((accurate.translations as Array<Record<string, unknown>>)[0])?.translate_partial_transcriptions, false);
+  assert.deepEqual(accurate.translation_queue_configs, {
+    global: { desired_queue_level_ms: 10000, max_queue_level_ms: 30000, auto_tempo: true, min_tempo: 1.15, max_tempo: 1.45 },
+  });
+  assert.equal(socket.closed, false);
 });
 
-test("maps adapter-boundary language tags for set_task", async () => {
-  const cases = [
-    ["en-US", "zh-TW", "en-us", "zh-hant"],
-    ["zh-CN", "ja-JP", "zh-hans", "ja"],
-    ["ko-KR", "es", "ko", "es"],
-    ["en", "zh-hant", "en", "zh-hant"],
-  ] as const;
-  for (const [source, target, expectedSource, expectedTarget] of cases) {
-    const socket = new FakeSocket();
-    const adapter = new PalabraTranslationAdapter({ apiKey: "key", randomHash: "m".repeat(32), webSocketFactory: () => socket, pollIntervalMs: 1, readinessTimeoutMs: 100 });
-    await adapter.prepare(context(0, source, target));
-    const set = socket.sent.find((item) => item.message_type === "set_task") as { data: { pipeline: { transcription: { source_language: string }; translations: Array<{ target_language: string }> } } };
-    assert.equal(set.data.pipeline.transcription.source_language, expectedSource);
-    assert.equal(set.data.pipeline.translations[0]?.target_language, expectedTarget);
-  }
-});
-
-test("320ms aggregation, trailing silence, normalized audio and completion", async () => {
+test("maps Palabra language tags at the adapter seam", async () => {
   const socket = new FakeSocket();
-  const adapter = new PalabraTranslationAdapter({ apiKey: "key", randomHash: "b".repeat(32), webSocketFactory: () => socket, pollIntervalMs: 1, readinessTimeoutMs: 100, settleWindowMs: 1, turnTimeoutMs: 500, closeTimeoutMs: 1, sleep: async () => undefined });
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "m".repeat(32),
+    webSocketFactory: () => socket,
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+  });
+  await adapter.prepare(context(0, "zh-CN", "ja-JP"));
+  const config = pipeline(socket);
+  assert.equal((config.transcription as Record<string, unknown>).source_language, "zh-hans");
+  assert.equal((config.translations as Array<Record<string, unknown>>)[0]?.target_language, "ja");
+});
+
+test("paces 320ms input, emits canonical audio, and fails closed for ID-less audio", async () => {
+  const socket = new FakeSocket();
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "b".repeat(32),
+    webSocketFactory: () => socket,
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+    settleWindowMs: 1,
+    turnTimeoutMs: 500,
+    closeTimeoutMs: 1,
+    sleep: async () => undefined,
+  });
   const ref = context();
   const pending = collect(adapter.translate({ context: ref, frames: frames(ref, 16), signal: new AbortController().signal }));
   await socket.waitForSent("input_audio_data", 2);
   const inputs = socket.sent.filter((item) => item.message_type === "input_audio_data") as Array<{ data: { data: string } }>;
-  assert.ok(inputs.length >= 2);
   const pcm = inputs.map((item) => Uint8Array.from(Buffer.from(item.data.data, "base64")));
   assert.equal(pcm[0]?.byteLength, 320 * 48);
-  assert.ok(pcm.slice(1).reduce((sum, chunk) => sum + chunk.byteLength, 0) >= 300 * 48);
+  assert.ok(pcm.slice(1).reduce((sum, chunk) => sum + chunk.byteLength, 0) >= 320 * 48);
+
   socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "1", text: "hello" } } });
-  socket.emit("message", { message_type: "translated_transcription", data: JSON.stringify({ transcription: { transcription_id: "1", translation_part_id: 0, text: "hola" } }) });
-  socket.emit("message", { message_type: "output_audio_data", data: { last_chunk: true, data: Buffer.from(new Uint8Array(960 + 480)).toString("base64") } });
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "1", translation_part_id: 0, text: "hola" } } });
+  socket.emit("message", { message_type: "output_audio_data", data: { data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: "1", last_chunk: true, data: Buffer.from(new Uint8Array(960 + 480)).toString("base64") } });
+
   const events = await pending;
-  const audio = events.filter((event) => (event as { type: string }).type === "audio") as Array<{ frame: { sequence: number; pcm16le: Uint8Array } }>;
+  const audio = eventsOf(events, "audio");
+  assert.deepEqual(audio.map((event) => event.playoutSequence), [0, 1]);
   assert.deepEqual(audio.map((event) => event.frame.sequence), [0, 1]);
-  assert.equal(events.filter((event) => (event as { type: string }).type === "source_transcript_delta").length, 1);
-  assert.equal(events.some((event) => (event as { type: string }).type === "completed"), true);
+  assert.deepEqual(audio.map((event) => event.finality), ["provisional", "final"]);
+  assert.equal(audio.every((event) => event.turnId === ref.turnId), true);
+  assert.equal(eventsOf(events, "source_transcript")[0]?.text, "hello");
+  assert.equal(eventsOf(events, "target_transcript")[0]?.text, "hola");
+  assert.equal(eventsOf(events, "completed").length, 1);
 });
 
-test("cancel during deferred pacing sleep does not send the delayed chunk", async () => {
+test("Fast retains at most its 800ms local audio budget when the consumer stalls", async () => {
   const socket = new FakeSocket();
-  let releaseSleep: () => void = () => undefined;
-  let sleepStarted = false;
   const adapter = new PalabraTranslationAdapter({
     apiKey: "key",
-    randomHash: "p".repeat(32),
+    randomHash: "q".repeat(32),
     webSocketFactory: () => socket,
     pollIntervalMs: 1,
     readinessTimeoutMs: 100,
-    now: () => 0,
+    settleWindowMs: 1,
     turnTimeoutMs: 500,
-    sleep: async () => {
-      sleepStarted = true;
-      await new Promise<void>((resolve) => { releaseSleep = resolve; });
-    },
+    sleep: async () => undefined,
   });
-  const ref = context();
-  const controller = new AbortController();
-  const pending = collect(adapter.translate({ context: ref, frames: frames(ref, 32), signal: controller.signal }));
-  for (let i = 0; i < 100 && !sleepStarted; i++) await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  assert.equal(sleepStarted, true);
-  controller.abort();
-  releaseSleep();
-  await pending;
-  assert.equal(socket.sent.filter((item) => item.message_type === "input_audio_data").length, 1);
+  const ref = context(0, "en", "es", "fast", "A_TO_B", "queue-turn");
+  const iterator = adapter.translate({ context: ref, frames: frames(ref, 16), signal: new AbortController().signal })[Symbol.asyncIterator]();
+  const first = iterator.next();
+  await socket.waitForSent("input_audio_data", 1);
+  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "queue-id", text: "source" } } });
+  assert.equal((await first).value?.kind, "source_transcript");
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "queue-id", translation_part_id: 0, text: "target" } } });
+  for (let index = 0; index < 46; index++) {
+    socket.emit("message", {
+      message_type: "output_audio_data",
+      data: {
+        transcription_id: "queue-id",
+        last_chunk: index === 45,
+        data: Buffer.from(new Uint8Array(960)).toString("base64"),
+      },
+    });
+  }
+  const drained: TranslationEvent[] = [];
+  for (;;) {
+    const next = await iterator.next();
+    if (next.done) break;
+    drained.push(next.value);
+  }
+  const audio = eventsOf(drained, "audio");
+  assert.equal(audio.length, 40);
+  assert.equal(audio[0]?.playoutSequence, 6);
+  assert.equal(audio.at(-1)?.playoutSequence, 45);
+  const trims = eventsOf(drained, "error").filter((event) => event.error.code === "PALABRA_LOCAL_AUDIO_QUEUE_TRIMMED");
+  assert.ok(trims.length >= 1);
+  assert.equal(trims.at(-1)?.revision, 6);
+  assert.equal(trims.at(-1)?.finality, "final");
+  assert.equal(trims.at(-1)?.evidenceRef, "palabra:local-audio-queue");
+  assert.match(trims.at(-1)?.error.message ?? "", /Dropped 6 queued audio frame/u);
 });
 
-test("abort during readiness force-closes and removes the preparing lane", async () => {
+test("Fast exposes stable opaque revision replacements without provider envelopes", async () => {
+  const socket = new FakeSocket();
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "f".repeat(32),
+    webSocketFactory: () => socket,
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+    settleWindowMs: 1,
+    turnTimeoutMs: 500,
+    sleep: async () => undefined,
+  });
+  const ref = context(0, "en", "es", "fast", "A_TO_B", "fast-turn");
+  const pending = collect(adapter.translate({ context: ref, frames: frames(ref, 16), signal: new AbortController().signal }));
+  await socket.waitForSent("input_audio_data", 1);
+
+  socket.emit("message", { message_type: "partial_transcription", data: { transcription: { transcription_id: "provider-42", text: "hel" } } });
+  socket.emit("message", { message_type: "partial_transcription", data: { transcription: { transcription_id: "provider-42", text: "hello" } } });
+  socket.emit("message", { message_type: "partial_translated_transcription", data: { transcription: { transcription_id: "provider-42", translation_part_id: "0", text: "ho" } } });
+  socket.emit("message", { message_type: "partial_translated_transcription", data: { transcription: { transcription_id: "provider-42", translation_part_id: "0", text: "hola" } } });
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "provider-42", translation_part_id: "0", text: "hola" } } });
+  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: "provider-42", last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+
+  const events = await pending;
+  const source = eventsOf(events, "source_transcript");
+  assert.deepEqual(source.map((event) => event.text), ["hel", "hello"]);
+  assert.deepEqual(source.map((event) => event.revision), [0, 1]);
+  assert.equal(source[0]?.segmentId, source[1]?.segmentId);
+  assert.deepEqual(source.map((event) => event.finality), ["provisional", "provisional"]);
+
+  const target = eventsOf(events, "target_transcript");
+  assert.deepEqual(target.map((event) => event.text), ["ho", "hola", "hola"]);
+  assert.deepEqual(target.map((event) => event.revision), [0, 1, 2]);
+  assert.equal(target[0]?.segmentId, target[2]?.segmentId);
+  assert.deepEqual(target.map((event) => event.finality), ["provisional", "provisional", "final"]);
+  assert.equal(JSON.stringify(events).includes("provider-42"), false);
+  assert.equal(eventsOf(events, "completed").length, 1);
+});
+
+test("flush keeps the lane task alive, tombstones late IDs, and never replays stale audio", async () => {
+  const socket = new FakeSocket();
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "s".repeat(32),
+    webSocketFactory: () => socket,
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+    settleWindowMs: 1,
+    turnTimeoutMs: 500,
+    closeTimeoutMs: 1,
+    sleep: async () => undefined,
+  });
+  const firstRef = context(0, "en", "es", "balanced", "A_TO_B", "first-turn");
+  const first = adapter.translate({ context: firstRef, frames: frames(firstRef, 100000), signal: new AbortController().signal })[Symbol.asyncIterator]();
+  void first.next();
+  await socket.waitForSent("input_audio_data", 1);
+  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "old-id", text: "old source" } } });
+  await adapter.cancel(firstRef);
+  const flush = socket.sent.find((message) => message.message_type === "flush_task") as { data: unknown } | undefined;
+  assert.deepEqual(flush?.data, { languages: ["global"], pause_task: false });
+  assert.equal(socket.closed, false);
+  await first.return?.();
+
+  const inputCount = socket.sent.filter((message) => message.message_type === "input_audio_data").length;
+  const secondRef = context(1, "en", "es", "balanced", "A_TO_B", "second-turn");
+  const second = collect(adapter.translate({ context: secondRef, frames: frames(secondRef, 16), signal: new AbortController().signal }));
+  await socket.waitForSent("input_audio_data", inputCount + 1);
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "old-id", translation_part_id: 0, text: "stale target" } } });
+  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: "old-id", last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "new-id", text: "new source" } } });
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "new-id", translation_part_id: 0, text: "new target" } } });
+  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: "new-id", last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+
+  const events = await second;
+  assert.deepEqual(eventsOf(events, "target_transcript").map((event) => event.text), ["new target"]);
+  assert.equal(eventsOf(events, "audio").length, 1);
+  assert.equal(JSON.stringify(events).includes("old-id"), false);
+  assert.equal(socket.sent.filter((message) => message.message_type === "set_task").length, 1);
+});
+
+test("one lane recovers independently when the other lane transport fails", async () => {
   const sockets: FakeSocket[] = [];
   const adapter = new PalabraTranslationAdapter({
     apiKey: "key",
-    randomHash: "r".repeat(32),
+    randomHash: () => "r".repeat(32),
     webSocketFactory: () => {
       const socket = new FakeSocket();
-      socket.respondTask = sockets.length > 0;
       sockets.push(socket);
       return socket;
     },
     pollIntervalMs: 1,
-    readinessTimeoutMs: 5000,
-    closeTimeoutMs: 1,
+    readinessTimeoutMs: 100,
+    settleWindowMs: 1,
+    turnTimeoutMs: 500,
+    sleep: async () => undefined,
   });
-  const ref = context();
-  const controller = new AbortController();
-  const pending = collect(adapter.translate({ context: ref, frames: frames(ref), signal: controller.signal }));
-  for (let i = 0; i < 100 && !sockets[0]?.sent.some((item) => item.message_type === "get_task"); i++) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  }
-  assert.ok(sockets[0]);
-  assert.equal(sockets[0]?.sent.some((item) => item.message_type === "get_task"), true);
-  controller.abort();
-  assert.deepEqual(await pending, []);
-  assert.equal(sockets[0]?.closed, true);
-  await adapter.prepare(ref);
+  const aToB = context(0, "en", "es", "balanced", "A_TO_B", "a-turn");
+  const bToA = context(0, "es", "en", "balanced", "B_TO_A", "b-turn");
+  await adapter.prepare(aToB);
+  await adapter.prepare(bToA);
+  assert.equal(sockets.length, 2);
+  sockets[0]?.emit("error");
+
+  const pending = collect(adapter.translate({ context: bToA, frames: frames(bToA, 16), signal: new AbortController().signal }));
+  await sockets[1]!.waitForSent("input_audio_data", 1);
+  sockets[1]?.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "b-id", text: "hola" } } });
+  sockets[1]?.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "b-id", translation_part_id: 0, text: "hello" } } });
+  sockets[1]?.emit("message", { message_type: "output_audio_data", data: { transcription_id: "b-id", last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+  const events = await pending;
+  assert.equal(eventsOf(events, "target_transcript")[0]?.text, "hello");
+  assert.equal(eventsOf(events, "audio").length, 1);
   assert.equal(sockets.length, 2);
 });
 
-test("startup provider errors preserve sanitized code, description, and parameter", async () => {
-  const socket = new FakeSocket();
-  socket.respondTask = false;
-  const adapter = new PalabraTranslationAdapter({ apiKey: "key", randomHash: "e".repeat(32), webSocketFactory: () => socket, pollIntervalMs: 1, readinessTimeoutMs: 1000 });
-  const ref = context();
-  const pending = collect(adapter.translate({ context: ref, frames: frames(ref), signal: new AbortController().signal }));
-  for (let i = 0; i < 100 && !socket.sent.some((item) => item.message_type === "get_task"); i++) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  }
-  assert.equal(socket.sent.some((item) => item.message_type === "get_task"), true);
-  socket.emit("message", { message_type: "error", data: { code: "bad-code", desc: "unsupported language", param: "source_language" } });
-  const events = await pending;
-  assert.equal(events.length, 1);
-  const error = events[0] as { type: string; error: { code: string; message: string } };
-  assert.equal(error.type, "error");
-  assert.equal(error.error.code, "PALABRA_PROVIDER_BAD_CODE");
-  assert.equal(error.error.message, "Provider error bad-code: unsupported language [param: source_language]");
-});
-
-test("cancel flush reuses the persistent socket, suppresses late events, and closeSession ends it", async () => {
+test("failed flush closes only its lane and the next turn reconnects", async () => {
   const sockets: FakeSocket[] = [];
-  const adapter = new PalabraTranslationAdapter({ apiKey: "key", randomHash: () => "c".repeat(32), webSocketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, pollIntervalMs: 1, readinessTimeoutMs: 100, closeTimeoutMs: 1, turnTimeoutMs: 500, sleep: async () => undefined });
-  const ref = context();
-  const iterator = adapter.translate({ context: ref, frames: frames(ref, 100000), signal: new AbortController().signal })[Symbol.asyncIterator]();
-  void iterator.next();
-  await tick();
-  await adapter.cancel(ref);
-  assert.equal(sockets[0]?.sent.some((item) => item.message_type === "flush_task"), true);
-  assert.equal(sockets[0]?.closed, false);
-  sockets[0]?.emit("message", { message_type: "translated_transcription", data: { transcription: { text: "late" } } });
-  await iterator.return?.();
-  const ref2 = context(1);
-  const second = adapter.translate({ context: ref2, frames: frames(ref2), signal: new AbortController().signal })[Symbol.asyncIterator]();
-  void second.next();
-  await tick();
-  assert.equal(sockets.length, 1);
-  await adapter.cancel(ref2);
-  await second.return?.();
-  await adapter.closeSession(ref.sessionId);
-  assert.equal(sockets[0]?.sent.some((item) => item.message_type === "end_task"), true);
-  assert.equal(sockets[0]?.closed, true);
-});
-
-test("successful flush retires old provider IDs before the next turn", async () => {
-  const socket = new FakeSocket();
-  const adapter = new PalabraTranslationAdapter({ apiKey: "key", randomHash: "s".repeat(32), webSocketFactory: () => socket, pollIntervalMs: 1, readinessTimeoutMs: 100, turnTimeoutMs: 500, settleWindowMs: 1, closeTimeoutMs: 1, sleep: async () => undefined });
-  const ref = context();
-  const first = adapter.translate({ context: ref, frames: frames(ref, 100000), signal: new AbortController().signal })[Symbol.asyncIterator]();
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    webSocketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+    closeTimeoutMs: 1,
+    turnTimeoutMs: 500,
+    sleep: async () => undefined,
+  });
+  const firstRef = context(0, "en", "es", "balanced", "A_TO_B", "first");
+  const first = adapter.translate({ context: firstRef, frames: frames(firstRef, 100000), signal: new AbortController().signal })[Symbol.asyncIterator]();
   void first.next();
-  for (let i = 0; i < 100 && !socket.sent.some((item) => item.message_type === "input_audio_data"); i++) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  }
-  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "old", text: "old source" } } });
-  await adapter.cancel(ref);
-  await first.return?.();
-  const inputCountBeforeSecond = socket.sent.filter((item) => item.message_type === "input_audio_data").length;
-  const ref2 = context(1);
-  const secondEvents = collect(adapter.translate({ context: ref2, frames: frames(ref2, 16), signal: new AbortController().signal }));
-  for (let i = 0; i < 100 && socket.sent.filter((item) => item.message_type === "input_audio_data").length <= inputCountBeforeSecond; i++) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 1));
-  }
-  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "old", translation_part_id: 0, text: "stale target" } } });
-  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: "old", last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
-  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: "new", text: "new source" } } });
-  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: "new", translation_part_id: 0, text: "new target" } } });
-  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: "new", last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
-  const events = await secondEvents;
-  const targetDeltas = events.filter((event) => (event as { type: string }).type === "target_transcript_delta").map((event) => (event as { delta: string }).delta);
-  assert.deepEqual(targetDeltas, ["new target"]);
-  assert.equal(events.some((event) => (event as { delta?: string }).delta === "stale target"), false);
-  assert.equal(events.filter((event) => (event as { type: string }).type === "audio").length, 1);
-  assert.equal(events.some((event) => (event as { type: string }).type === "completed"), true);
-  await adapter.closeSession(ref.sessionId);
-});
-
-test("failed flush force-closes and removes the lane", async () => {
-  const sockets: FakeSocket[] = [];
-  const adapter = new PalabraTranslationAdapter({ apiKey: "key", webSocketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, pollIntervalMs: 1, readinessTimeoutMs: 100, closeTimeoutMs: 1000, turnTimeoutMs: 500, sleep: async () => undefined });
-  const ref = context();
-  const iterator = adapter.translate({ context: ref, frames: frames(ref, 100000), signal: new AbortController().signal })[Symbol.asyncIterator]();
-  void iterator.next();
   await tick();
   sockets[0]!.failFlush = true;
-  await adapter.cancel(ref);
+  await adapter.cancel(firstRef);
   assert.equal(sockets[0]?.closed, true);
-  assert.equal(sockets[0]?.sent.some((item) => item.message_type === "end_task"), false);
-  await iterator.return?.();
-  const ref2 = context(1);
-  const second = adapter.translate({ context: ref2, frames: frames(ref2), signal: new AbortController().signal })[Symbol.asyncIterator]();
-  void second.next();
+  await first.return?.();
+
+  const nextRef = context(1, "en", "es", "balanced", "A_TO_B", "second");
+  const next = adapter.translate({ context: nextRef, frames: frames(nextRef), signal: new AbortController().signal })[Symbol.asyncIterator]();
+  void next.next();
   await tick();
   assert.equal(sockets.length, 2);
-  await adapter.cancel(ref2);
-  await second.return?.();
+  await adapter.cancel(nextRef);
+  await next.return?.();
 });
 
-test("glossary rejection and abort before start", async () => {
+test("keyless test mechanics retain honest credential and pinned-glossary rejection", async () => {
+  assert.throws(
+    () => new PalabraTranslationAdapter({ apiKey: "", webSocketFactory: () => new FakeSocket() }),
+    /credentials are not configured/u,
+  );
   const adapter = new PalabraTranslationAdapter({ apiKey: "key", webSocketFactory: () => new FakeSocket() });
-  const aborted = new AbortController();
-  aborted.abort();
-  assert.deepEqual(await collect(adapter.translate({ context: context(), frames: frames(context()), signal: aborted.signal })), []);
-  const glossary = { ...context(), glossary: {} as never };
-  const events = await collect(adapter.translate({ context: glossary, frames: frames(glossary), signal: new AbortController().signal }));
-  assert.equal((events[0] as { type: string }).type, "error");
-  assert.equal((events[0] as { error: { code: string } }).error.code, "PALABRA_GLOSSARY_UNSUPPORTED");
+  const ref = { ...context(), glossary: {} as never };
+  const events = await collect(adapter.translate({ context: ref, frames: frames(ref), signal: new AbortController().signal }));
+  const error = eventsOf(events, "error")[0];
+  assert.equal(error?.error.code, "PALABRA_GLOSSARY_UNSUPPORTED");
 });

@@ -20,6 +20,7 @@ import {
 import {
   benchmarkArtifactSha256,
   readAndValidateKeylessBenchmark,
+  type BenchmarkAcceptanceScore,
 } from "./runner.js";
 
 export interface DeterministicHealingProposalArtifact {
@@ -62,6 +63,7 @@ export interface LocalReleaseGateArtifact {
   readonly trustAnchorSource: "operator_supplied_test_key";
   readonly customerOwnerAcceptanceVerdict: "NOT_RUN";
   readonly localPocReleaseVerdict: "PASS" | "FAIL";
+  readonly localReleaseEvidence: BenchmarkAcceptanceScore["localReleaseEvidence"];
   readonly providerAcceptanceVerdict: "NOT_RUN";
   readonly productAcceptanceVerdict: "NOT_RUN";
   readonly reasons: readonly string[];
@@ -353,6 +355,12 @@ export async function evaluateLocalReleaseGate(input: Readonly<{
   if (benchmark.score.armVerdicts.GLOSSARY_CONTROLLED.verdict !== "PASS") {
     reasons.push("GLOSSARY_CONTROLLED local arm did not complete every gate");
   }
+  const evidence = benchmark.score.localReleaseEvidence;
+  if (!evidence.targetExact) reasons.push("target_exact gate did not pass");
+  if (!evidence.zeroRegression) reasons.push("zero-regression gate did not pass");
+  if (!evidence.alertsClear) reasons.push("runtime alert gate did not pass");
+  if (!evidence.latency) reasons.push("latency evidence gate did not pass");
+  if (!evidence.evidenceComplete) reasons.push("normalized event evidence gate did not pass");
   const body = {
     schemaVersion: 1 as const,
     kind: "local_poc_release_gate" as const,
@@ -365,6 +373,7 @@ export async function evaluateLocalReleaseGate(input: Readonly<{
     trustAnchorSource: input.approvedProfile.trustAnchorSource,
     customerOwnerAcceptanceVerdict: input.approvedProfile.customerOwnerAcceptanceVerdict,
     localPocReleaseVerdict: reasons.length === 0 ? "PASS" as const : "FAIL" as const,
+    localReleaseEvidence: evidence,
     providerAcceptanceVerdict: "NOT_RUN" as const,
     productAcceptanceVerdict: "NOT_RUN" as const,
     reasons: Object.freeze(reasons),

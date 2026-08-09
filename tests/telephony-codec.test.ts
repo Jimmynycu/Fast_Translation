@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  TELEPHONY_PCMU_FORMAT,
   assertCanonicalFrame,
   assertTelephonyFrame,
+  createPcmuSilenceFrame,
   decodeMulaw8kToPcm16le24k,
   decodeMulawSample,
   encodeMulawSample,
@@ -10,6 +12,21 @@ import {
 } from "../src/adapters/media/telephony-codec.js";
 
 describe("G.711 mu-law phone adapter codec", () => {
+  it("pins a keyless PCMU fixture to 8 kHz mono 20 ms packets", () => {
+    assert.deepEqual(TELEPHONY_PCMU_FORMAT, {
+      codec: "PCMU",
+      sampleRateHz: 8_000,
+      channels: 1,
+      frameDurationMs: 20,
+      samplesPerFrame: 160,
+      bytesPerFrame: 160,
+    });
+    const silence = createPcmuSilenceFrame();
+    assertTelephonyFrame(silence);
+    assert.equal(silence.byteLength, TELEPHONY_PCMU_FORMAT.bytesPerFrame);
+    assert.equal(silence.every((sample) => sample === 0xff), true);
+  });
+
   it("uses the standard positive and negative zero codes", () => {
     assert.equal(decodeMulawSample(0xff), 0);
     assert.equal(decodeMulawSample(0x7f), 0);
@@ -50,7 +67,8 @@ describe("G.711 mu-law phone adapter codec", () => {
     assert.ok(Math.abs(decodeMulawSample(phone[0] ?? 0) - 8_000) < 500);
   });
 
-  it("rejects partial canonical sample groups", () => {
-    assert.throws(() => encodePcm16le24kToMulaw8k(new Uint8Array(8)), /groups of three/);
+  it("rejects packets that are not exactly one 20 ms transport or canonical frame", () => {
+    assert.throws(() => decodeMulaw8kToPcm16le24k(new Uint8Array(159)), /PCMU frame/u);
+    assert.throws(() => encodePcm16le24kToMulaw8k(new Uint8Array(8)), /24 kHz PCM16LE frame/u);
   });
 });

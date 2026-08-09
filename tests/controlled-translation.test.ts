@@ -5,15 +5,16 @@ import {
   type ControlledTranscriptionEvent,
   type ControlledTranscriptionPort,
   type ControlledTranscriptionRequest,
-  type ControlledTtsPort,
   type ControlledTextTranslationPort,
+  type ControlledTtsPort,
 } from "../src/adapters/translation/glossary-controlled.js";
-import { DeterministicTranslationAdapter } from "../src/adapters/translation/deterministic.js";
 import { CANONICAL_AUDIO, createAudioFrame } from "../src/core/audio.js";
 import { compileGlossary } from "../src/core/glossary.js";
+import { resolveTranslationBehavior } from "../src/core/translation-behavior.js";
 import type {
   GenerationRef,
   TranslationEvent,
+  TranslationTranscriptEvent,
   TranslationRequest,
 } from "../src/core/types.js";
 
@@ -21,9 +22,10 @@ const context = {
   sessionId: "session-1",
   lane: "A_TO_B" as const,
   generation: 3,
+  turnId: "controlled-turn-1",
   sourceLanguage: "en",
   targetLanguage: "zh-TW",
-  profile: "glossary_controlled" as const,
+  behavior: resolveTranslationBehavior("accurate"),
   glossary: compileGlossary({
     id: "factory-terms",
     version: "v1",
@@ -33,7 +35,7 @@ const context = {
       id: "spindle",
       source: "spindle",
       aliases: ["main spindle"],
-      targetExact: "\u4e3b\u8ef8",
+      targetExact: "主軸",
     }],
   }),
 } as const;
@@ -54,42 +56,43 @@ async function* frames() {
   yield frame(1);
 }
 
-function request(): TranslationRequest {
-  return {
-    frames: frames(),
-    context,
-    signal: new AbortController().signal,
-  };
+function request(signal = new AbortController().signal): TranslationRequest {
+  return { frames: frames(), context, signal };
 }
 
-async function collect(iterable: AsyncIterable<TranslationEvent>) {
+async function collect(iterable: AsyncIterable<TranslationEvent>): Promise<TranslationEvent[]> {
   const events: TranslationEvent[] = [];
   for await (const event of iterable) events.push(event);
   return events;
 }
 
 class TranscriptFake implements ControlledTranscriptionPort {
-  inputs: string[] = [];
-  requests: ControlledTranscriptionRequest[] = [];
+  readonly inputs: string[] = [];
+  readonly requests: ControlledTranscriptionRequest[] = [];
+
   constructor(readonly event: ControlledTranscriptionEvent) {}
-  async *transcribe(input: ControlledTranscriptionRequest) {
+
+  async *transcribe(input: ControlledTranscriptionRequest): AsyncIterable<ControlledTranscriptionEvent> {
     this.requests.push(input);
     for await (const event of input.events) this.inputs.push(event.type);
     yield this.event;
   }
+
   async cancel(_generation: GenerationRef): Promise<void> {}
 }
 
 class TextFake implements ControlledTextTranslationPort {
-  requests: string[] = [];
+  readonly requests: string[] = [];
+
   constructor(readonly result: (text: string) => string | Promise<string>) {}
+
   async translate(input: {
     readonly text: string;
     readonly sourceLanguage: string;
     readonly targetLanguage: string;
     readonly opaqueTokens?: readonly string[];
     readonly signal?: AbortSignal;
-  }) {
+  }): Promise<string> {
     this.requests.push(input.text);
     return this.result(input.text);
   }
@@ -97,8 +100,9 @@ class TextFake implements ControlledTextTranslationPort {
 
 class TtsFake implements ControlledTtsPort {
   readonly outputFormat = CANONICAL_AUDIO;
-  spoken: string[] = [];
-  async *synthesize(input: { readonly text: string; readonly signal?: AbortSignal }) {
+  readonly spoken: string[] = [];
+
+  async *synthesize(input: { readonly text: string; readonly signal?: AbortSignal }): AsyncIterable<Uint8Array> {
     this.spoken.push(input.text);
     yield new Uint8Array(500).fill(7);
     yield new Uint8Array(500).fill(8);
@@ -113,13 +117,13 @@ function transcript(text: string, confidence?: number): ControlledTranscriptionE
     generation: context.generation,
     emittedAtMs: 5,
     itemId: "item-1",
-    turnId: "turn-1",
+    turnId: context.turnId,
     transcript: text,
     ...(confidence === undefined ? {} : { confidence }),
   };
 }
 
-test("rejects a TTS adapter whose bytes are not canonical 24 kHz mono PCM16LE", () => {
+test("requires canonical TTS and accurate behavior", async () => {
   const tts = new TtsFake();
   Object.defineProperty(tts, "outputFormat", {
     value: { ...CANONICAL_AUDIO, sampleRateHz: 16_000 },
@@ -132,130 +136,234 @@ test("rejects a TTS adapter whose bytes are not canonical 24 kHz mono PCM16LE", 
     }),
     /24 kHz mono PCM16LE/u,
   );
+
+  const adapter = new ControlledTranslationAdapter({
+    transcriber: new TranscriptFake(transcript("spindle")),
+    translator: new TextFake((text) => text),
+    tts: new TtsFake(),
+  });
+  assert.deepEqual(adapter.capabilities.supportedModes, [{
+    mode: "accurate",
+    behaviorVersion: 1,
+    deterministicGlossary: true,
+  }]);
+  await assert.rejects(
+    adapter.prepare({ ...context, behavior: resolveTranslationBehavior("fast") }),
+    /accurate behavior/u,
+  );
+  await assert.rejects(
+    collect(adapter.translate({
+      ...request(),
+      context: { ...context, behavior: resolveTranslationBehavior("fast") },
+    })),
+    /accurate behavior/u,
+  );
+
+  const { glossary: _ignoredGlossary, ...glossaryFreeContext } = context;
+  await adapter.prepare(glossaryFreeContext);
+  const glossaryFreeEvents = await collect(adapter.translate({
+    frames: frames(),
+    context: glossaryFreeContext,
+    signal: new AbortController().signal,
+  }));
+  assert.ok(glossaryFreeEvents.some((event) =>
+    event.kind === "target_transcript" && event.text === "spindle"
+  ));
 });
 
-test("restores target_exact before streaming canonical audio", async () => {
+test("commits target_exact before final target text and canonical audio", async () => {
   const transcriber = new TranscriptFake(transcript("Inspect the spindle today.", 0.99));
   const translator = new TextFake((text) =>
-    text.replace("Inspect the ", "\u4eca\u65e5\u6aa2\u67e5").replace(" today.", "\u3002")
+    text.replace("Inspect the ", "今日檢查").replace(" today.", "。")
   );
   const tts = new TtsFake();
-  const adapter = new ControlledTranslationAdapter({
-    transcriber,
-    translator,
-    tts,
-    now: () => 10,
-  });
+  const adapter = new ControlledTranslationAdapter({ transcriber, translator, tts, now: () => 10 });
+  await adapter.prepare(context);
   const events = await collect(adapter.translate(request()));
 
   assert.match(translator.requests[0] ?? "", /GLOSSARY_0001/u);
-  const terminology = events.filter((event) => event.type === "terminology");
-  assert.deepEqual(
-    terminology.map((event) => event.status),
-    ["bound", "authorized"],
+  const terminology = events.filter(
+    (event): event is Extract<TranslationEvent, { kind: "terminology" }> => event.kind === "terminology",
   );
-  const authorized = terminology.find((event) => event.status === "authorized");
-  assert.deepEqual(
-    authorized?.guaranteedTargetExact,
-    ["\u4e3b\u8ef8"],
-  );
+  assert.deepEqual(terminology.map((event) => event.status), ["bound", "authorized"]);
+  assert.equal(terminology[0]?.finality, "provisional");
+  assert.deepEqual(terminology[1]?.guaranteedTargetExact, ["主軸"]);
+  assert.equal(terminology[1]?.finality, "final");
   assert.deepEqual(transcriber.inputs, ["audio", "audio", "speech_end"]);
   assert.deepEqual(transcriber.requests[0]?.keywords, ["spindle", "main spindle"]);
   assert.deepEqual(transcriber.requests[0]?.languages, ["en"]);
-  assert.deepEqual(tts.spoken, ["\u4eca\u65e5\u6aa2\u67e5\u4e3b\u8ef8\u3002"]);
-  const targetTranscript = events.find(
-    (event) => event.type === "target_transcript_delta",
+  assert.deepEqual(tts.spoken, ["今日檢查主軸。"]);
+
+  const targets = events.filter(
+    (event): event is TranslationTranscriptEvent => event.kind === "target_transcript",
   );
-  assert.equal(
-    targetTranscript?.type === "target_transcript_delta"
-      ? targetTranscript.delta
-      : undefined,
-    "\u4eca\u65e5\u6aa2\u67e5\u4e3b\u8ef8\u3002",
+  assert.deepEqual(targets.map((event) => ({ text: event.text, finality: event.finality })), [{
+    text: "今日檢查主軸。",
+    finality: "final",
+  }]);
+  const audio = events.filter(
+    (event): event is Extract<TranslationEvent, { kind: "audio" }> => event.kind === "audio",
   );
-  const audio = events.filter((event) => event.type === "audio");
   assert.equal(audio.length, 2);
   assert.equal(audio[1]?.frame.pcm16le[40], 0);
-  assert.equal(events.at(-1)?.type, "completed");
+  assert.deepEqual(audio.map((event) => event.playoutSequence), [0, 1]);
+  assert.equal(events.at(-1)?.kind, "completed");
 });
 
-test("placeholder miss alerts and still speaks best effort", async () => {
+test("placeholder loss fails open with an alert and uninterrupted playback", async () => {
   const tts = new TtsFake();
   const adapter = new ControlledTranslationAdapter({
     transcriber: new TranscriptFake(transcript("Inspect the spindle.")),
-    translator: new TextFake(() => "\u6aa2\u67e5\u96f6\u4ef6\u3002"),
+    translator: new TextFake(() => "檢查零件。"),
     tts,
     now: () => 10,
   });
   const events = await collect(adapter.translate(request()));
 
-  assert.deepEqual(tts.spoken, ["\u6aa2\u67e5\u96f6\u4ef6\u3002"]);
+  assert.deepEqual(tts.spoken, ["檢查零件。"]);
   assert.ok(events.some((event) =>
-    event.type === "error" &&
-    event.error.code === "GLOSSARY_PLACEHOLDER_MISSING"
+    event.kind === "error" && event.error.code === "GLOSSARY_PLACEHOLDER_MISSING"
   ));
-  assert.ok(events.some((event) => event.type === "audio"));
+  assert.ok(events.some((event) => event.kind === "target_transcript"));
+  assert.ok(events.some((event) => event.kind === "audio"));
 });
 
-test("low confidence alerts without interrupting audio", async () => {
-  const tts = new TtsFake();
-  const adapter = new ControlledTranslationAdapter({
+test("low-confidence and unknown-or-ambiguous terminology alerts fail open", async () => {
+  const lowConfidenceTts = new TtsFake();
+  const lowConfidence = new ControlledTranslationAdapter({
     transcriber: new TranscriptFake(transcript("General sentence.", 0.42)),
-    translator: new TextFake(() => "\u4e00\u822c\u53e5\u5b50\u3002"),
-    tts,
+    translator: new TextFake(() => "一般句子。"),
+    tts: lowConfidenceTts,
     minimumConfidence: 0.8,
     now: () => 10,
   });
-  const events = await collect(adapter.translate(request()));
-
-  assert.ok(events.some((event) =>
-    event.type === "error" &&
-    event.error.code === "TRANSCRIPTION_LOW_CONFIDENCE"
+  const lowConfidenceEvents = await collect(lowConfidence.translate(request()));
+  assert.ok(lowConfidenceEvents.some((event) =>
+    event.kind === "error" && event.error.code === "TRANSCRIPTION_LOW_CONFIDENCE"
   ));
-  assert.deepEqual(tts.spoken, ["\u4e00\u822c\u53e5\u5b50\u3002"]);
-  assert.ok(events.some((event) => event.type === "audio"));
-});
+  assert.ok(lowConfidenceEvents.some((event) => event.kind === "audio"));
 
-test("glossary near-miss heuristic alerts when provider confidence is unavailable", async () => {
-  const tts = new TtsFake();
-  const adapter = new ControlledTranslationAdapter({
+  const uncertaintyTts = new TtsFake();
+  const uncertainty = new ControlledTranslationAdapter({
     transcriber: new TranscriptFake(transcript("Inspect the spindel today.")),
-    translator: new TextFake(() => "\u6aa2\u67e5\u8a2d\u5099\u3002"),
-    tts,
+    translator: new TextFake(() => "檢查設備。"),
+    tts: uncertaintyTts,
     now: () => 10,
   });
-  const events = await collect(adapter.translate(request()));
-
-  const alert = events.find((event) =>
-    event.type === "error" &&
-    event.error.code === "TRANSCRIPTION_LOW_CONFIDENCE"
+  const uncertaintyEvents = await collect(uncertainty.translate(request()));
+  const alert = uncertaintyEvents.find((event) =>
+    event.kind === "error" && event.error.code === "GLOSSARY_UNKNOWN_OR_AMBIGUOUS_TERM"
   );
-  assert.equal(alert?.type, "error");
-  if (alert?.type === "error") assert.match(alert.error.message, /spindle/u);
-  assert.ok(events.some((event) => event.type === "audio"));
+  assert.equal(alert?.kind, "error");
+  if (alert?.kind === "error") assert.match(alert.error.message, /spindle/u);
+  assert.ok(uncertaintyEvents.some((event) => event.kind === "audio"));
 });
 
-test("translation failure falls back to speaking source text", async () => {
-  const tts = new TtsFake();
+test("exact glossary source suppresses a near alias for the same entry", async () => {
+  const abbeGlossary = compileGlossary({
+    id: "metrology-terms",
+    version: "v1",
+    sourceLanguage: "en",
+    targetLanguage: "zh-TW",
+    entries: [{
+      id: "abbe-offset",
+      source: "Abbe offset",
+      aliases: ["Abbey offset"],
+      targetExact: "阿貝偏移",
+    }],
+  });
   const adapter = new ControlledTranslationAdapter({
+    transcriber: new TranscriptFake(transcript("Verify the Abbe offset before release.")),
+    translator: new TextFake((text) => text),
+    tts: new TtsFake(),
+    now: () => 10,
+  });
+  const events = await collect(adapter.translate({
+    frames: frames(),
+    context: { ...context, glossary: abbeGlossary },
+    signal: new AbortController().signal,
+  }));
+  const terminology = events.filter(
+    (event): event is Extract<TranslationEvent, { kind: "terminology" }> => event.kind === "terminology",
+  );
+
+  assert.equal(events.some((event) => event.kind === "error"), false);
+  assert.deepEqual(terminology.map((event) => event.status), ["bound", "authorized"]);
+  assert.deepEqual(terminology[1]?.guaranteedTargetExact, ["阿貝偏移"]);
+});
+
+test("exact glossary match does not suppress a near miss for another entry", async () => {
+  const glossary = compileGlossary({
+    id: "metrology-and-machining-terms",
+    version: "v1",
+    sourceLanguage: "en",
+    targetLanguage: "zh-TW",
+    entries: [{
+      id: "abbe-offset",
+      source: "Abbe offset",
+      aliases: ["Abbey offset"],
+      targetExact: "阿貝偏移",
+    }, {
+      id: "spindle",
+      source: "spindle",
+      aliases: [],
+      targetExact: "主軸",
+    }],
+  });
+  const adapter = new ControlledTranslationAdapter({
+    transcriber: new TranscriptFake(transcript("Verify the Abbe offset and spindel.")),
+    translator: new TextFake((text) => text),
+    tts: new TtsFake(),
+    now: () => 10,
+  });
+  const events = await collect(adapter.translate({
+    frames: frames(),
+    context: { ...context, glossary },
+    signal: new AbortController().signal,
+  }));
+  const alert = events.find((event) =>
+    event.kind === "error" && event.error.code === "GLOSSARY_UNKNOWN_OR_AMBIGUOUS_TERM"
+  );
+
+  assert.equal(alert?.kind, "error");
+  if (alert?.kind === "error") {
+    assert.match(alert.error.message, /spindle/u);
+    assert.doesNotMatch(alert.error.message, /Abbe offset/u);
+  }
+});
+
+test("translation failure emits a glossary-bypass fallback alert before source playback", async () => {
+  const failureTts = new TtsFake();
+  const failedAdapter = new ControlledTranslationAdapter({
     transcriber: new TranscriptFake(transcript("Inspect the spindle.")),
     translator: new TextFake(() => { throw new Error("provider unavailable"); }),
-    tts,
+    tts: failureTts,
     now: () => 10,
   });
-  const events = await collect(adapter.translate(request()));
+  const failedEvents = await collect(failedAdapter.translate(request()));
+  assert.deepEqual(failureTts.spoken, ["Inspect the spindle."]);
+  const fallbackAlertIndex = failedEvents.findIndex((event) =>
+    event.kind === "error" && event.error.code === "GLOSSARY_BYPASSED_TRANSLATION_FALLBACK"
+  );
+  const fallbackTargetIndex = failedEvents.findIndex((event) =>
+    event.kind === "target_transcript" && event.text === "Inspect the spindle."
+  );
+  const fallbackAudioIndex = failedEvents.findIndex((event) => event.kind === "audio");
+  const terminology = failedEvents.filter(
+    (event): event is Extract<TranslationEvent, { kind: "terminology" }> => event.kind === "terminology",
+  );
+  const bypass = terminology.find((event) => event.status === "bypassed");
+  assert.deepEqual(terminology.map((event) => event.status), ["bound", "bypassed"]);
+  assert.deepEqual(bypass?.guaranteedTargetExact, []);
+  assert.equal(terminology.some((event) => event.status === "authorized"), false);
+  assert.ok(fallbackAlertIndex >= 0, "fallback alert must be observable");
+  assert.ok(fallbackTargetIndex > fallbackAlertIndex, "alert must precede fallback target text");
+  assert.ok(fallbackAudioIndex > fallbackTargetIndex, "target text must precede fallback audio");
 
-  assert.deepEqual(tts.spoken, ["Inspect the spindle."]);
-  assert.ok(events.some((event) =>
-    event.type === "error" && event.error.code === "TEXT_TRANSLATION_FAILED"
-  ));
-  assert.ok(events.some((event) => event.type === "audio"));
-});
-
-test("cancellation during text translation emits no fallback alert, target, or audio", async () => {
   const controller = new AbortController();
   let markStarted: (() => void) | undefined;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
-  const translator: ControlledTextTranslationPort = {
+  const pendingTranslator: ControlledTextTranslationPort = {
     async translate(input) {
       markStarted?.();
       return new Promise<string>((_resolve, reject) => {
@@ -267,33 +375,19 @@ test("cancellation during text translation emits no fallback alert, target, or a
       });
     },
   };
-  const tts = new TtsFake();
-  const adapter = new ControlledTranslationAdapter({
+  const cancelledTts = new TtsFake();
+  const cancelled = new ControlledTranslationAdapter({
     transcriber: new TranscriptFake(transcript("Inspect the spindle.")),
-    translator,
-    tts,
+    translator: pendingTranslator,
+    tts: cancelledTts,
     now: () => 10,
   });
-  const collecting = collect(adapter.translate({
-    ...request(),
-    signal: controller.signal,
-  }));
+  const collecting = collect(cancelled.translate(request(controller.signal)));
   await started;
   controller.abort(new Error("barge-in"));
-  const events = await collecting;
-
-  assert.deepEqual(tts.spoken, []);
-  assert.equal(events.some((event) => event.type === "error"), false);
-  assert.equal(events.some((event) => event.type === "target_transcript_delta"), false);
-  assert.equal(events.some((event) => event.type === "audio"), false);
-});
-test("deterministic adapter echoes frames and honors cancel", async () => {
-  const adapter = new DeterministicTranslationAdapter({ now: () => 12 });
-  const events = await collect(adapter.translate(request()));
-  assert.equal(events.filter((event) => event.type === "audio").length, 2);
-  await adapter.cancel(context);
-  assert.deepEqual(
-    (await collect(adapter.translate(request()))).map((event) => event.type),
-    ["completed"],
-  );
+  const cancelledEvents = await collecting;
+  assert.deepEqual(cancelledTts.spoken, []);
+  assert.equal(cancelledEvents.some((event) => event.kind === "error"), false);
+  assert.equal(cancelledEvents.some((event) => event.kind === "target_transcript"), false);
+  assert.equal(cancelledEvents.some((event) => event.kind === "audio"), false);
 });

@@ -9,7 +9,10 @@ import {
   type EvidenceRecord,
   type EvidenceSessionEventRecord,
 } from "../../core/types.js";
-import { readEncryptedEvidence } from "./encrypted-file.js";
+import {
+  readVerifiedEncryptedEvidence,
+  type EvidenceSeal,
+} from "./encrypted-file.js";
 
 export interface ExportedWavFile {
   readonly path: string;
@@ -22,10 +25,11 @@ export interface ExportedWavFile {
 }
 
 export interface EvidenceExportManifest {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly kind: "decrypted_four_track_evidence_export";
   readonly sessionId: string;
   readonly encryptedSourceSha256: string;
+  readonly evidenceSeal: EvidenceSeal;
   readonly recordCount: number;
   readonly eventCount: number;
   readonly originCapturedAtMs: number;
@@ -295,10 +299,11 @@ export async function exportEncryptedEvidence(
     throw new RangeError("outputDirectory is required");
   }
 
-  const records = await readEncryptedEvidence<EvidenceRecord>(
+  const verified = await readVerifiedEncryptedEvidence<EvidenceRecord>(
     options.encryptedPath,
     options.key,
   );
+  const records = verified.records;
   const encryptedBytes = await readFile(options.encryptedPath);
   const sessionId = validateRecords(records);
   const tracks = audioByTrack(records);
@@ -345,10 +350,11 @@ export async function exportEncryptedEvidence(
     EVIDENCE_AUDIO_TRACKS.map((track) => [track, tracks[track].length]),
   ) as Record<EvidenceAudioTrack, number>);
   const body = {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     kind: "decrypted_four_track_evidence_export" as const,
     sessionId,
     encryptedSourceSha256: sha256(encryptedBytes),
+    evidenceSeal: verified.seal,
     recordCount: records.length,
     eventCount: eventRecords.length,
     originCapturedAtMs,

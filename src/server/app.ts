@@ -11,7 +11,6 @@ import { CANONICAL_AUDIO, destinationForLane, sourceForLane } from "../core/audi
 import type { GlossarySpec } from "../core/glossary.js";
 import { RelaySessionError } from "../core/relay.js";
 import {
-  TRANSLATION_PROFILES,
   type GuardedDuplexRelay,
   type Lane,
   type MediaProfile,
@@ -19,7 +18,10 @@ import {
   type SessionEvent,
   type SessionSnapshot,
   type Side,
-  type TranslationProfile,
+  type TranslationCapabilities,
+  type TranslationMode,
+  type TranslationModeCapability,
+  type TranslationProviderId,
 } from "../core/types.js";
 import type { ServerAccessControl } from "./access.js";
 import {
@@ -57,6 +59,10 @@ export interface BrowserMediaGateway {
 
 export type EvidenceHealth = "healthy" | "degraded";
 
+export interface ConfiguredTranslation extends TranslationCapabilities {
+  readonly defaultMode: TranslationMode;
+}
+
 export interface ServerAppOptions {
   readonly relay: GuardedDuplexRelay;
   readonly glossaries: GlossaryRegistry;
@@ -66,8 +72,7 @@ export interface ServerAppOptions {
   readonly webRoot?: string;
   readonly logger?: FastifyServerOptions["logger"];
   readonly https?: HttpsServerOptions;
-  readonly translationProfiles?: readonly TranslationProfile[];
-  readonly defaultTranslationProfile?: TranslationProfile;
+  readonly translation: ConfiguredTranslation;
   readonly evidenceHealth?: () => EvidenceHealth;
 }
 
@@ -88,6 +93,7 @@ class ApiError extends Error {
     readonly statusCode: number,
     readonly code: string,
     message: string,
+    readonly details: Readonly<Record<string, unknown>> = {},
   ) {
     super(message);
     this.name = "ApiError";
@@ -201,14 +207,28 @@ export function mapSessionEvent(event: SessionEvent): UiEventEnvelope {
     case "source_transcript":
       return {
         ...base,
-        type: event.final ? "source_stable" : "source_partial",
-        data: { text: event.text, final: event.final, ...sides },
+        type: "source_segment",
+        data: {
+          text: event.text,
+          turnId: event.turnId,
+          segmentId: event.segmentId,
+          revision: event.revision,
+          final: event.final,
+          ...sides,
+        },
       };
     case "target_transcript":
       return {
         ...base,
-        type: "target_committed",
-        data: { text: event.text, final: event.final, ...sides },
+        type: "target_segment",
+        data: {
+          text: event.text,
+          turnId: event.turnId,
+          segmentId: event.segmentId,
+          revision: event.revision,
+          final: event.final,
+          ...sides,
+        },
       };
     case "audio_playout": {
       const latencyMs = event.latencyMs;
@@ -218,7 +238,9 @@ export function mapSessionEvent(event: SessionEvent): UiEventEnvelope {
         data: {
           firstAudioMs: latencyMs,
           latencyMs,
-          sequence: event.frame.sequence,
+          turnId: event.turnId,
+          segmentId: event.segmentId,
+          sequence: event.playoutSequence,
           ...sides,
         },
       };
@@ -296,10 +318,124 @@ function relayCommand(
   };
 }
 
-function errorPayload(code: string, message: string): Readonly<{
-  error: Readonly<{ code: string; message: string }>;
+function errorPayload(
+  code: string,
+  message: string,
+  details: Readonly<Record<string, unknown>> = {},
+): Readonly<{ error: Readonly<Record<string, unknown>> }> {
+  return { error: { code, message, ...details } };
+}
+
+function capabilityDegradation(capability: TranslationModeCapability): Readonly<{
+  state: "full" | "degraded";
+  reason?: string;
 }> {
-  return { error: { code, message } };
+  return capability.degradation === undefined
+    ? Object.freeze({ state: "full" as const })
+    : Object.freeze({ state: "degraded" as const, reason: capability.degradation });
+}
+
+function modeCapability(
+  translation: ConfiguredTranslation,
+  mode: TranslationMode,
+): TranslationModeCapability | undefined {
+  return translation.supportedModes.find((candidate) => candidate.mode === mode);
+}
+
+function configureTranslation(value: ConfiguredTranslation): ConfiguredTranslation {
+  if (
+    value === undefined ||
+    typeof value.providerId !== "string" ||
+    !["palabra", "openai_native", "openai_controlled"].includes(value.providerId) ||
+    !Array.isArray(value.supportedModes) ||
+    value.supportedModes.length === 0
+  ) {
+    throw new TypeError("translation must advertise a configured provider and supported modes");
+  }
+  const modes = new Set<TranslationMode>();
+  for (const capability of value.supportedModes) {
+    if (
+      !["fast", "balanced", "accurate"].includes(capability.mode) ||
+      modes.has(capability.mode) ||
+      !Number.isSafeInteger(capability.behaviorVersion) ||
+      capability.behaviorVersion < 1 ||
+      typeof capability.deterministicGlossary !== "boolean" ||
+      (capability.degradation !== undefined &&
+        (typeof capability.degradation !== "string" || capability.degradation.trim().length === 0))
+    ) {
+      throw new TypeError("translation must advertise unique valid mode capabilities");
+    }
+    modes.add(capability.mode);
+  }
+  if (!modes.has(value.defaultMode)) {
+    throw new TypeError("translation defaultMode must be supported");
+  }
+  if (
+    typeof value.supportsProvisionalRevisions !== "boolean" ||
+    typeof value.supportsFinality !== "boolean" ||
+    typeof value.supportsCancellation !== "boolean" ||
+    typeof value.supportsDeterministicGlossary !== "boolean"
+  ) {
+    throw new TypeError("translation capability flags must be explicit booleans");
+  }
+  return Object.freeze({
+    ...value,
+    supportedModes: Object.freeze(value.supportedModes.map((capability) => Object.freeze({
+      ...capability,
+      ...(capability.degradation === undefined
+        ? {}
+        : { degradation: capability.degradation.trim() }),
+    }))),
+  });
+}
+
+function publicTranslationCapabilities(translation: ConfiguredTranslation): Readonly<{
+  provider: TranslationProviderId;
+  supportedModes: readonly Readonly<{
+    mode: TranslationMode;
+    behavior: Readonly<{ version: number }>;
+    deterministicGlossary: boolean;
+    degradation: Readonly<{ state: "full" | "degraded"; reason?: string }>;
+  }>[];
+  defaultMode: TranslationMode;
+}> {
+  return Object.freeze({
+    provider: translation.providerId,
+    supportedModes: Object.freeze(translation.supportedModes.map((capability) => Object.freeze({
+      mode: capability.mode,
+      behavior: Object.freeze({ version: capability.behaviorVersion }),
+      deterministicGlossary: capability.deterministicGlossary,
+      degradation: capabilityDegradation(capability),
+    }))),
+    defaultMode: translation.defaultMode,
+  });
+}
+
+function pinnedSessionTranslation(
+  snapshot: SessionSnapshot,
+  translation: ConfiguredTranslation,
+): Readonly<{
+  provider: TranslationProviderId;
+  translationMode: TranslationMode;
+  behaviorVersion: number;
+  deterministicGlossary: boolean;
+  degradation: Readonly<{ state: "full" | "degraded"; reason?: string }>;
+}> {
+  const capability = modeCapability(translation, snapshot.spec.mode);
+  if (
+    snapshot.spec.provider !== translation.providerId ||
+    capability === undefined ||
+    snapshot.behavior.version !== capability.behaviorVersion
+  ) {
+    throw new TypeError("relay snapshot does not match the configured translation behavior");
+  }
+  return Object.freeze({
+    provider: snapshot.spec.provider,
+    translationMode: snapshot.spec.mode,
+    behaviorVersion: snapshot.behavior.version,
+    deterministicGlossary: capability.deterministicGlossary,
+    degradation: capabilityDegradation(capability),
+  });
 }
 
 function safeSocketError(socket: BrowserMediaSocket, code: string, message: string): void {
@@ -333,25 +469,15 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
   };
   const app = Fastify(fastifyOptions as FastifyServerOptions);
   const evidenceHealth = options.evidenceHealth ?? (() => "healthy");
+  const translation = configureTranslation(options.translation);
   const sessionPayload = (snapshot: SessionSnapshot) => ({
+    ...pinnedSessionTranslation(snapshot, translation),
     sessionId: snapshot.sessionId,
     state: snapshot.status,
     endpointGrants: [snapshot.participants.A, snapshot.participants.B],
     ...(snapshot.glossary === undefined ? {} : { glossaryHash: snapshot.glossary.hash }),
     evidenceHealth: evidenceHealth(),
   });
-
-  const translationProfiles = Object.freeze([
-    ...(options.translationProfiles ?? TRANSLATION_PROFILES),
-  ]);
-  const defaultTranslationProfile =
-    options.defaultTranslationProfile ?? translationProfiles[0];
-  if (
-    defaultTranslationProfile === undefined ||
-    !translationProfiles.includes(defaultTranslationProfile)
-  ) {
-    throw new TypeError("defaultTranslationProfile must be available");
-  }
 
   await app.register(fastifyWebsocket);
   await app.register(fastifyStatic, {
@@ -363,7 +489,7 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
       if (error.statusCode === 401) reply.header("www-authenticate", "Bearer");
-      void reply.code(error.statusCode).send(errorPayload(error.code, error.message));
+      void reply.code(error.statusCode).send(errorPayload(error.code, error.message, error.details));
       return;
     }
     if (error instanceof ZodError) {
@@ -396,8 +522,7 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
     requireOperator(options.access, request.headers.authorization);
     return {
       mediaProfiles: [mediaProfile],
-      translationProfiles,
-      defaultTranslationProfile,
+      translation: publicTranslationCapabilities(translation),
       glossaryImportFormats: ["csv", "xlsx"],
       recording: true,
       audio: {
@@ -432,22 +557,26 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
   app.post("/api/sessions", async (request, reply) => {
     requireOperator(options.access, request.headers.authorization);
     const body = parse(createSessionRequestSchema, request.body);
-    if (!translationProfiles.includes(body.translationProfileId)) {
+    const selectedMode = modeCapability(translation, body.translationMode);
+    if (selectedMode === undefined) {
       throw new ApiError(
-        409,
-        "translation_profile_unavailable",
-        `Translation profile ${body.translationProfileId} is not configured on this server`,
+        422,
+        "translation_mode_unsupported",
+        `Translation mode ${body.translationMode} is not available from the configured provider`,
+        { supportedModes: translation.supportedModes.map((capability) => capability.mode) },
       );
     }
     if (
       body.glossaryVersion !== undefined &&
-      body.translationProfileId !== "glossary_controlled" &&
-      body.translationProfileId !== "local_eval"
+      !selectedMode.deterministicGlossary
     ) {
       throw new ApiError(
         422,
-        "glossary_profile_mismatch",
-        "A glossary version requires a glossary-controlled translation profile",
+        "glossary_unsupported",
+        "The selected translation mode cannot guarantee a pinned glossary",
+        { supportedModes: translation.supportedModes
+          .filter((capability) => capability.deterministicGlossary)
+          .map((capability) => capability.mode) },
       );
     }
     const glossary =
@@ -465,7 +594,8 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
     const snapshot = await options.relay.open({
       sideA: { language: body.languages.A },
       sideB: { language: body.languages.B },
-      profile: body.translationProfileId,
+      provider: translation.providerId,
+      mode: selectedMode.mode,
       ...(glossary === undefined ? {} : { glossary }),
     });
     return reply.code(201).send(sessionPayload(snapshot));

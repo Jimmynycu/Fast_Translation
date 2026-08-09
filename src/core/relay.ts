@@ -3,6 +3,7 @@ import { CANONICAL_AUDIO, destinationForLane, laneFromSource } from "./audio.js"
 import { AsyncQueue } from "./async-queue.js";
 import { GenerationFence } from "./generation-fence.js";
 import { compileGlossary, reverseGlossarySpec, type CompiledGlossary } from "./glossary.js";
+import { resolveTranslationBehavior } from "./translation-behavior.js";
 import type {
   EvidenceAudioTrack,
   EvidencePort,
@@ -22,6 +23,7 @@ import type {
   Side,
   TranslationEvent,
   TranslationPort,
+  TranslationBehavior,
 } from "./types.js";
 
 export class RelaySessionError extends Error {
@@ -56,6 +58,7 @@ export interface GuardedDuplexRelayOptions {
 
 interface LaneRun {
   readonly generation: number;
+  readonly turnId: string;
   readonly input: AsyncQueue<import("./audio.js").AudioFrame>;
   readonly controller: AbortController;
   readonly task: Promise<void>;
@@ -63,8 +66,13 @@ interface LaneRun {
 
 interface TranscriptAccumulator {
   generation: number;
-  source: string;
-  target: string;
+  segments: Map<string, SegmentRevision>;
+}
+
+interface SegmentRevision {
+  revision: number;
+  text: string;
+  final: boolean;
 }
 
 interface SpeechOnset {
@@ -78,6 +86,12 @@ interface PlayoutEvidenceCursor {
   readonly timelineAtMonoMs: number;
 }
 
+interface PlayoutMetadata {
+  readonly turnId: string;
+  readonly segmentId: string;
+  readonly playoutSequence: number;
+}
+
 interface CommandExecution {
   readonly fingerprint: string;
   readonly completion: Promise<void>;
@@ -86,6 +100,7 @@ interface CommandExecution {
 interface SessionRuntime {
   readonly sessionId: string;
   readonly spec: SessionSpec;
+  readonly behavior: TranslationBehavior;
   readonly compiledGlossary?: CompiledGlossary;
   readonly compiledGlossaries?: Readonly<Record<Lane, CompiledGlossary>>;
   readonly participants: Readonly<{ A: ParticipantEndpointGrant; B: ParticipantEndpointGrant }>;
@@ -101,10 +116,14 @@ interface SessionRuntime {
   readonly commands: Map<string, CommandExecution>;
   readonly ingressController: AbortController;
   readonly playoutController: AbortController;
-  readonly backgroundTasks: Promise<void>[];
+  readonly backgroundTasks: Set<Promise<void>>;
   readonly firstAudio: Set<string>;
   readonly speechOnsets: Record<Lane, SpeechOnset | undefined>;
   readonly transcripts: Record<Lane, TranscriptAccumulator>;
+  readonly pendingFrames: Record<Lane, import("./audio.js").AudioFrame[]>;
+  readonly playoutSequences: Record<Lane, { generation: number; sequence: number } | undefined>;
+  readonly playoutMetadata: Map<string, PlayoutMetadata>;
+  readonly playoutMetadataOrder: Record<Lane, string[]>;
   status: SessionStatus;
   cursor: EventCursor;
   openedAtMs: number;
@@ -116,8 +135,10 @@ function freezeSessionSpec(spec: SessionSpec): SessionSpec {
   if (spec.sideA.language.trim().length === 0 || spec.sideB.language.trim().length === 0) {
     throw new RelaySessionError("invalid_spec", "Both participant languages are required");
   }
-  const maxQueueFrames = spec.maxQueueFrames ?? 25;
-  if (!Number.isSafeInteger(maxQueueFrames) || maxQueueFrames < 1) {
+  if (
+    spec.maxQueueFrames !== undefined &&
+    (!Number.isSafeInteger(spec.maxQueueFrames) || spec.maxQueueFrames < 1)
+  ) {
     throw new RelaySessionError("invalid_spec", "maxQueueFrames must be a positive safe integer");
   }
 
@@ -136,10 +157,15 @@ function freezeSessionSpec(spec: SessionSpec): SessionSpec {
   return Object.freeze({
     sideA: Object.freeze({ ...spec.sideA, language: spec.sideA.language.trim() }),
     sideB: Object.freeze({ ...spec.sideB, language: spec.sideB.language.trim() }),
-    profile: spec.profile,
+    provider: spec.provider,
+    mode: spec.mode,
     ...(glossary === undefined ? {} : { glossary }),
-    maxQueueFrames,
+    ...(spec.maxQueueFrames === undefined ? {} : { maxQueueFrames: spec.maxQueueFrames }),
   });
+}
+
+function queueCapacity(spec: SessionSpec, behavior: TranslationBehavior): number {
+  return spec.maxQueueFrames ?? Math.ceil(behavior.maxBufferedAudioMs / CANONICAL_AUDIO.frameDurationMs);
 }
 
 function laneLanguages(spec: SessionSpec, lane: Lane): Readonly<{
@@ -241,6 +267,9 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
 
   async open(specInput: SessionSpec): Promise<SessionSnapshot> {
     const spec = freezeSessionSpec(specInput);
+    const behavior = resolveTranslationBehavior(spec.mode);
+    const inputCapacity = queueCapacity(spec, behavior);
+    this.#validateTranslationSpec(spec, behavior);
     const sessionId = this.#createSessionId();
     if (this.#sessions.has(sessionId)) {
       throw new RelaySessionError("session_exists", `Session ${sessionId} already exists`);
@@ -259,6 +288,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     const runtime: SessionRuntime = {
       sessionId,
       spec,
+      behavior,
       ...(sessionGlossaries === undefined
         ? {}
         : {
@@ -271,8 +301,8 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       fences: { A_TO_B: new GenerationFence(), B_TO_A: new GenerationFence() },
       laneRuns: { A_TO_B: undefined, B_TO_A: undefined },
       playout: {
-        A: new AsyncQueue(spec.maxQueueFrames ?? 25),
-        B: new AsyncQueue(spec.maxQueueFrames ?? 25),
+        A: new AsyncQueue(inputCapacity),
+        B: new AsyncQueue(inputCapacity),
       },
       playoutEvidenceCursors: { A: undefined, B: undefined },
       sourceEvidenceCursors: { A: undefined, B: undefined },
@@ -281,13 +311,17 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       commands: new Map(),
       ingressController: new AbortController(),
       playoutController: new AbortController(),
-      backgroundTasks: [],
+      backgroundTasks: new Set(),
       firstAudio: new Set(),
       speechOnsets: { A_TO_B: undefined, B_TO_A: undefined },
       transcripts: {
-        A_TO_B: { generation: 0, source: "", target: "" },
-        B_TO_A: { generation: 0, source: "", target: "" },
+        A_TO_B: { generation: 0, segments: new Map() },
+        B_TO_A: { generation: 0, segments: new Map() },
       },
+      pendingFrames: { A_TO_B: [], B_TO_A: [] },
+      playoutSequences: { A_TO_B: undefined, B_TO_A: undefined },
+      playoutMetadata: new Map(),
+      playoutMetadataOrder: { A_TO_B: [], B_TO_A: [] },
       status: "waiting",
       cursor: 0,
       openedAtMs,
@@ -298,14 +332,56 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
 
     const snapshot = this.#snapshot(runtime);
     this.#emit(runtime, { type: "session_opened", snapshot });
-    runtime.backgroundTasks.push(this.#runIngress(runtime));
-    runtime.backgroundTasks.push(this.#runPlayout(runtime, "A"));
-    runtime.backgroundTasks.push(this.#runPlayout(runtime, "B"));
+    this.#trackBackground(runtime, this.#runIngress(runtime));
+    this.#trackBackground(runtime, this.#runPlayout(runtime, "A"));
+    this.#trackBackground(runtime, this.#runPlayout(runtime, "B"));
     return this.#snapshot(runtime);
+  }
+
+  #validateTranslationSpec(spec: SessionSpec, behavior: TranslationBehavior): void {
+    const capabilities = this.#translation.capabilities;
+    if (capabilities.providerId !== spec.provider) {
+      throw new RelaySessionError("invalid_spec", "The selected provider does not match the translation port");
+    }
+    const mode = capabilities.supportedModes.find((candidate) => candidate.mode === spec.mode);
+    if (mode === undefined) {
+      throw new RelaySessionError("invalid_spec", "The selected mode is not supported by the translation port");
+    }
+    if (spec.glossary !== undefined && !mode.deterministicGlossary) {
+      throw new RelaySessionError("invalid_spec", "The selected mode does not support deterministic glossary enforcement");
+    }
+    if (
+      (behavior.requirements.revisions &&
+        (!capabilities.supportsProvisionalRevisions || !capabilities.supportsFinality)) ||
+      (behavior.requirements.cancellation && !capabilities.supportsCancellation) ||
+      (behavior.requirements.deterministicGlossary &&
+        (!mode.deterministicGlossary || !capabilities.supportsDeterministicGlossary))
+    ) {
+      throw new RelaySessionError("invalid_spec", "The translation port does not satisfy the selected mode requirements");
+    }
   }
 
   snapshot(sessionId: string): SessionSnapshot {
     return this.#snapshot(this.#requireSession(sessionId));
+  }
+
+  backgroundTaskCount(sessionId: string): number {
+    return this.#requireSession(sessionId).backgroundTasks.size;
+  }
+
+  playoutMetadataCount(sessionId: string, lane?: Lane): number {
+    const runtime = this.#requireSession(sessionId);
+    return lane === undefined
+      ? runtime.playoutMetadata.size
+      : runtime.playoutMetadataOrder[lane].length;
+  }
+
+  #trackBackground(runtime: SessionRuntime, task: Promise<void>): void {
+    runtime.backgroundTasks.add(task);
+    void task.then(
+      () => runtime.backgroundTasks.delete(task),
+      () => runtime.backgroundTasks.delete(task),
+    );
   }
 
   async command(sessionId: string, command: RelayCommand): Promise<void> {
@@ -460,7 +536,11 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         return;
       case "participant_state":
         runtime.connected[event.side] = event.connected;
-        if (!event.connected) this.#finishUtterance(runtime, event.side);
+        if (!event.connected) {
+          runtime.sourceEvidenceCursors[event.side] = undefined;
+          this.#finishUtterance(runtime, event.side);
+          this.#purgePlayoutMetadata(runtime, oppositeInboundLane(event.side));
+        }
         this.#emit(runtime, {
           type: "participant_state",
           side: event.side,
@@ -485,11 +565,6 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         if (runtime.status === "active") {
           runtime.speaking[event.side] = true;
           const ownLane = laneFromSource(event.side);
-          if (runtime.spec.profile !== "native_live_baseline") {
-            this.#cutLane(runtime, ownLane, "operator");
-          } else {
-            this.#resetTranscripts(runtime, ownLane, runtime.fences[ownLane].generation);
-          }
           const generation = runtime.fences[ownLane].generation;
           runtime.firstAudio.delete(`${ownLane}:${generation}`);
           runtime.speechOnsets[ownLane] = Object.freeze({
@@ -504,10 +579,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         return;
       case "audio":
         if (runtime.status !== "active") return;
-        if (
-          runtime.spec.profile !== "native_live_baseline" &&
-          !runtime.speaking[event.side]
-        ) {
+        if (runtime.behavior.inputCommit === "speech_end" && !runtime.speaking[event.side]) {
           return;
         }
         if (event.frame.lane !== laneFromSource(event.side)) {
@@ -521,8 +593,14 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
 
   #finishUtterance(runtime: SessionRuntime, side: Side): void {
     runtime.speaking[side] = false;
-    if (runtime.spec.profile === "native_live_baseline") return;
     const lane = laneFromSource(side);
+    if (runtime.behavior.inputCommit === "speech_end") {
+      const frames = runtime.pendingFrames[lane];
+      if (frames.length > 0) {
+        for (const frame of frames) this.#offerFrame(runtime, lane, frame);
+      }
+      runtime.pendingFrames[lane] = [];
+    }
     const run = runtime.laneRuns[lane];
     if (run !== undefined && !run.input.closed) {
       run.input.close();
@@ -596,12 +674,44 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       });
     }
 
-    const laneRun = this.#ensureLaneRun(runtime, lane);
-    if (laneRun.input.offerLatest(frame) === "dropped_oldest") {
+    if (runtime.behavior.inputCommit === "speech_end") {
+      const pending = runtime.pendingFrames[lane];
+      pending.push(frame);
+      const maxFrames = queueCapacity(runtime.spec, runtime.behavior);
+      if (pending.length > maxFrames) {
+        pending.shift();
+        this.#emitAlert(runtime, lane, generation, "source_queue_trimmed", "Dropped the oldest queued source frame to preserve the latency budget", true);
+      }
+      return;
+    }
+    this.#offerFrame(runtime, lane, frame);
+  }
+
+  #offerFrame(
+    runtime: SessionRuntime,
+    lane: Lane,
+    frame: import("./audio.js").AudioFrame,
+  ): void {
+    let result = this.#ensureLaneRun(runtime, lane).input.offerLatest(frame);
+    if (result === "closed") {
+      result = this.#ensureLaneRun(runtime, lane).input.offerLatest(frame);
+    }
+    if (result === "closed") {
       this.#emitAlert(
         runtime,
         lane,
-        generation,
+        frame.generation,
+        "source_input_closed",
+        "Rejected source frame because its translation input closed before it could be queued",
+        true,
+      );
+      return;
+    }
+    if (result === "dropped_oldest") {
+      this.#emitAlert(
+        runtime,
+        lane,
+        frame.generation,
         "source_queue_trimmed",
         "Dropped the oldest queued source frame to preserve the latency budget",
         true,
@@ -620,9 +730,10 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       sessionId: runtime.sessionId,
       lane,
       generation,
+      turnId: randomUUID(),
       sourceLanguage: languages.sourceLanguage,
       targetLanguage: languages.targetLanguage,
-      profile: runtime.spec.profile,
+      behavior: runtime.behavior,
       ...(glossary === undefined ? {} : { glossary }),
     });
   }
@@ -630,9 +741,13 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
   #ensureLaneRun(runtime: SessionRuntime, lane: Lane): LaneRun {
     const existing = runtime.laneRuns[lane];
     const generation = runtime.fences[lane].generation;
-    if (existing !== undefined && existing.generation === generation) return existing;
+    if (existing !== undefined && existing.generation === generation && !existing.input.closed) {
+      return existing;
+    }
 
-    const input = new AsyncQueue<import("./audio.js").AudioFrame>(runtime.spec.maxQueueFrames ?? 25);
+    const input = new AsyncQueue<import("./audio.js").AudioFrame>(
+      queueCapacity(runtime.spec, runtime.behavior),
+    );
     const controller = new AbortController();
     const context = this.#laneContext(runtime, lane, generation);
 
@@ -640,9 +755,9 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     const task = this.#consumeTranslation(runtime, input, context, controller.signal).finally(() => {
       if (runtime.laneRuns[lane] === laneRun) runtime.laneRuns[lane] = undefined;
     });
-    laneRun = { generation, input, controller, task };
+    laneRun = { generation, turnId: context.turnId, input, controller, task };
     runtime.laneRuns[lane] = laneRun;
-    runtime.backgroundTasks.push(task);
+    this.#trackBackground(runtime, task);
     return laneRun;
   }
 
@@ -670,51 +785,57 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
   ): TranscriptAccumulator {
     const accumulator = runtime.transcripts[lane];
     accumulator.generation = generation;
-    accumulator.source = "";
-    accumulator.target = "";
+    accumulator.segments.clear();
     return accumulator;
   }
 
-  #appendTranscript(
+  #acceptTranscriptRevision(
     runtime: SessionRuntime,
-    lane: Lane,
-    generation: number,
-    field: "source" | "target",
-    delta: string,
-  ): string {
-    const existing = runtime.transcripts[lane];
-    const accumulator = existing.generation === generation
+    event: Extract<TranslationEvent, { kind: "source_transcript" | "target_transcript" }>,
+  ): boolean {
+    const existing = runtime.transcripts[event.lane];
+    const accumulator = existing.generation === event.generation
       ? existing
-      : this.#resetTranscripts(runtime, lane, generation);
-    accumulator[field] += delta;
-    return accumulator[field];
+      : this.#resetTranscripts(runtime, event.lane, event.generation);
+    const key = event.turnId + ":" + event.segmentId;
+    const prior = accumulator.segments.get(key);
+    if (prior?.final || (prior !== undefined && event.revision <= prior.revision)) return false;
+    accumulator.segments.set(key, {
+      revision: event.revision,
+      text: event.text,
+      final: event.finality === "final",
+    });
+    return true;
   }
 
   #handleTranslation(runtime: SessionRuntime, event: TranslationEvent): void {
     if (
       runtime.status !== "active" ||
       event.sessionId !== runtime.sessionId ||
-      !runtime.fences[event.lane].accepts(event.generation)
+      !runtime.fences[event.lane].accepts(event.generation) ||
+      runtime.laneRuns[event.lane]?.generation !== event.generation ||
+      runtime.laneRuns[event.lane]?.turnId !== event.turnId
     ) {
       return;
     }
 
-    switch (event.type) {
-      case "source_transcript_delta": {
-        const text = this.#appendTranscript(runtime, event.lane, event.generation, "source", event.delta);
+    switch (event.kind) {
+      case "source_transcript":
+      case "target_transcript": {
+        if (runtime.behavior.transcriptPolicy === "final_only" && event.finality !== "final") {
+          return;
+        }
+        if (!this.#acceptTranscriptRevision(runtime, event)) return;
         this.#emit(
           runtime,
-          { type: "source_transcript", text, final: false },
-          event.lane,
-          event.generation,
-        );
-        return;
-      }
-      case "target_transcript_delta": {
-        const text = this.#appendTranscript(runtime, event.lane, event.generation, "target", event.delta);
-        this.#emit(
-          runtime,
-          { type: "target_transcript", text, final: false },
+          {
+            type: event.kind,
+            turnId: event.turnId,
+            segmentId: event.segmentId,
+            revision: event.revision,
+            text: event.text,
+            final: event.finality === "final",
+          },
           event.lane,
           event.generation,
         );
@@ -746,25 +867,29 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
           event.error.retryable,
         );
         return;
-      case "completed": {
-        const transcript = runtime.transcripts[event.lane];
-        if (transcript.generation === event.generation) {
-          if (transcript.source.length > 0) {
-            this.#emit(runtime, { type: "source_transcript", text: transcript.source, final: true }, event.lane, event.generation);
-          }
-          if (transcript.target.length > 0) {
-            this.#emit(runtime, { type: "target_transcript", text: transcript.target, final: true }, event.lane, event.generation);
-          }
-        }
+      case "completed":
         return;
-      }
       case "audio": {
+        const previous = runtime.playoutSequences[event.lane];
+        if (previous?.generation === event.generation && event.playoutSequence <= previous.sequence) {
+          return;
+        }
+        runtime.playoutSequences[event.lane] = {
+          generation: event.generation,
+          sequence: event.playoutSequence,
+        };
         const side = destinationForLane(event.lane);
         const frame = Object.freeze({
           ...event.frame,
           sessionId: runtime.sessionId,
           lane: event.lane,
           generation: event.generation,
+          sequence: event.playoutSequence,
+        });
+        this.#storePlayoutMetadata(runtime, event.lane, event.generation, {
+          turnId: event.turnId,
+          segmentId: event.segmentId,
+          playoutSequence: event.playoutSequence,
         });
         if (runtime.playout[side].offerLatest(frame) === "dropped_oldest") {
           this.#emitAlert(
@@ -779,6 +904,44 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         return;
       }
     }
+  }
+
+  #storePlayoutMetadata(
+    runtime: SessionRuntime,
+    lane: Lane,
+    generation: number,
+    metadata: PlayoutMetadata,
+  ): void {
+    const key = lane + ":" + generation + ":" + metadata.playoutSequence;
+    runtime.playoutMetadata.set(key, metadata);
+    const order = runtime.playoutMetadataOrder[lane];
+    order.push(key);
+    const capacity = queueCapacity(runtime.spec, runtime.behavior);
+    if (order.length <= capacity) return;
+    const trimmed = order.shift();
+    if (trimmed !== undefined) runtime.playoutMetadata.delete(trimmed);
+    this.#emitAlert(
+      runtime,
+      lane,
+      generation,
+      "playout_metadata_trimmed",
+      "Trimmed stale playout metadata to preserve the relay memory budget",
+      true,
+    );
+  }
+
+  #purgePlayoutMetadata(
+    runtime: SessionRuntime,
+    lane: Lane,
+    generation?: number,
+  ): void {
+    const prefix = generation === undefined ? lane + ":" : lane + ":" + generation + ":";
+    const order = runtime.playoutMetadataOrder[lane];
+    runtime.playoutMetadataOrder[lane] = order.filter((key) => {
+      if (!key.startsWith(prefix)) return true;
+      runtime.playoutMetadata.delete(key);
+      return false;
+    });
   }
 
   async #runPlayout(runtime: SessionRuntime, side: Side): Promise<void> {
@@ -854,6 +1017,13 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     ) {
       return;
     }
+    const metadataKey = frame.lane + ":" + frame.generation + ":" + frame.sequence;
+    const metadata = runtime.playoutMetadata.get(metadataKey);
+    if (metadata === undefined) return;
+    runtime.playoutMetadata.delete(metadataKey);
+    const order = runtime.playoutMetadataOrder[frame.lane];
+    const orderIndex = order.indexOf(metadataKey);
+    if (orderIndex >= 0) order.splice(orderIndex, 1);
     const timelineAtMonoMs = this.#playoutEvidenceTimeline(runtime, side, frame, startedAtMonoMs);
     if (timelineAtMonoMs === undefined) return;
 
@@ -873,7 +1043,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       : 0;
     this.#emit(
       runtime,
-      { type: "audio_playout", frame, latencyMs },
+      { type: "audio_playout", frame, latencyMs, ...metadata },
       frame.lane,
       frame.generation,
     );
@@ -899,6 +1069,9 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     const nextGeneration = previousGeneration + 1;
     fence.cut(nextGeneration);
     this.#resetTranscripts(runtime, lane, nextGeneration);
+    this.#purgePlayoutMetadata(runtime, lane);
+    runtime.pendingFrames[lane] = [];
+    runtime.playoutSequences[lane] = undefined;
     runtime.speechOnsets[lane] = undefined;
 
     const run = runtime.laneRuns[lane];
@@ -939,7 +1112,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     runtime.playout.B.close();
     runtime.playoutController.abort();
 
-    await Promise.allSettled(runtime.backgroundTasks);
+    await Promise.allSettled([...runtime.backgroundTasks]);
     runtime.closedAtMs = this.#now();
     this.#setStatus(runtime, "closed", commandId);
     this.#emit(runtime, { type: "session_closed", reason });
@@ -1088,6 +1261,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       sessionId: runtime.sessionId,
       status: runtime.status,
       spec: runtime.spec,
+      behavior: runtime.behavior,
       participants: runtime.participants,
       generations: Object.freeze({
         A_TO_B: runtime.fences.A_TO_B.generation,

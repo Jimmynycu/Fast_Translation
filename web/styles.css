@@ -568,6 +568,18 @@ a {
   line-height: 1.5;
 }
 
+.call-status {
+  min-height: 18px;
+  margin: -12px 0 18px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.call-status.is-warning {
+  color: #ffb1b8;
+}
+
 .dashboard {
   padding: 72px 0 110px;
 }

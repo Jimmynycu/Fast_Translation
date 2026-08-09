@@ -1,54 +1,37 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { test } from "node:test";
 import WebSocket, { type RawData } from "ws";
-import { composeApplication } from "../src/composition.js";
-import {
-  EncryptedFileEvidenceStore,
-  readEncryptedEvidence,
-} from "../src/adapters/evidence/encrypted-file.js";
-import { loadConfig } from "../src/config.js";
+import { createPcmuSilenceFrame } from "../src/adapters/media/telephony-codec.js";
 import { CANONICAL_AUDIO } from "../src/core/audio.js";
+import type { GuardedDuplexRelay, SessionEvent } from "../src/core/types.js";
+import { replayLocalEvalCorpus } from "../src/local-eval/corpus-replay.js";
 import { unpackPlayoutAudio } from "../src/server/protocol.js";
-import type { EvidenceRecord } from "../src/core/types.js";
+import {
+  ACCEPTANCE_MODES,
+  acceptanceTemporaryDirectory,
+  canonicalWav,
+  createKeylessBrowserAcceptanceApplication,
+  createKeylessTelephonyAcceptanceFixture,
+  localEvalManifest,
+  type AcceptanceMode,
+  waitUntil,
+} from "./support/acceptance.js";
 
 const WAIT_MS = 5_000;
 
 type JsonObject = Record<string, unknown>;
 
-function isObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+interface RelayEventCollector {
+  readonly events: SessionEvent[];
+  stop(): Promise<void>;
 }
 
-async function getAvailablePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolvePromise, reject) => {
-    const onError = (error: Error): void => reject(error);
-    server.once("error", onError);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", onError);
-      resolvePromise();
-    });
-  });
-
-  const address = server.address();
-  if (
-    address === null ||
-    typeof address === "string"
-  ) {
-    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
-    throw new Error("Could not allocate an E2E server port");
-  }
-  await new Promise<void>((resolvePromise, reject) => {
-    server.close((error) => {
-      if (error === undefined) resolvePromise();
-      else reject(error);
-    });
-  });
-  return address.port;
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function messageData(message: JsonObject): JsonObject {
@@ -68,6 +51,105 @@ function rawBytes(data: RawData): Uint8Array {
   }
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+}
+
+async function getAvailablePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    throw new Error("Could not allocate an E2E server port");
+  }
+  await new Promise<void>((resolvePromise, reject) => {
+    server.close((error) => error === undefined ? resolvePromise() : reject(error));
+  });
+  return address.port;
+}
+
+function collectRelayEvents(relay: GuardedDuplexRelay, sessionId: string): RelayEventCollector {
+  const controller = new AbortController();
+  const events: SessionEvent[] = [];
+  const complete = (async () => {
+    try {
+      for await (const event of relay.events(sessionId, 0, controller.signal)) {
+        events.push(event);
+      }
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) throw error;
+    }
+  })();
+  return {
+    events,
+    async stop(): Promise<void> {
+      controller.abort();
+      await complete;
+    },
+  };
+}
+
+async function openActiveTelephonySession(
+  fixture: ReturnType<typeof createKeylessTelephonyAcceptanceFixture>,
+  mode: AcceptanceMode,
+  maxQueueFrames = 3,
+): Promise<Readonly<{ sessionId: string; collector: RelayEventCollector }>> {
+  const snapshot = await fixture.relay.open({
+    sideA: { language: "en-US" },
+    sideB: { language: "zh-TW" },
+    provider: "openai_controlled",
+    mode,
+    maxQueueFrames,
+  });
+  const collector = collectRelayEvents(fixture.relay, snapshot.sessionId);
+  fixture.media.connect(snapshot.sessionId, "A");
+  fixture.media.connect(snapshot.sessionId, "B");
+  await waitUntil(
+    () => fixture.relay.snapshot(snapshot.sessionId).status === "ready",
+    "Timed out waiting for fake telephony participants",
+  );
+  await fixture.relay.command(snapshot.sessionId, {
+    type: "start",
+    commandId: "start-" + randomUUID(),
+  });
+  assert.equal(fixture.relay.snapshot(snapshot.sessionId).status, "active");
+  return Object.freeze({ sessionId: snapshot.sessionId, collector });
+}
+
+async function closeTelephonySession(
+  fixture: ReturnType<typeof createKeylessTelephonyAcceptanceFixture>,
+  sessionId: string,
+  collector: RelayEventCollector,
+): Promise<void> {
+  try {
+    await fixture.relay.command(sessionId, {
+      type: "end",
+      commandId: "end-" + randomUUID(),
+    });
+  } finally {
+    await collector.stop();
+  }
+}
+
+function transcriptEvents(
+  events: readonly SessionEvent[],
+  type: "source_transcript" | "target_transcript",
+  lane: "A_TO_B" | "B_TO_A",
+): Extract<SessionEvent, { type: "source_transcript" | "target_transcript" }>[] {
+  return events.filter((event): event is Extract<SessionEvent, {
+    type: "source_transcript" | "target_transcript";
+  }> => event.type === type && event.lane === lane);
+}
+
+function audioEventsFor(
+  events: readonly SessionEvent[],
+  lane: "A_TO_B" | "B_TO_A",
+): Extract<SessionEvent, { type: "audio_playout" }>[] {
+  return events.filter((event): event is Extract<SessionEvent, { type: "audio_playout" }> =>
+    event.type === "audio_playout" && event.lane === lane
+  );
 }
 
 function waitForJson(
@@ -143,24 +225,23 @@ function waitForBinary(socket: WebSocket, label: string): Promise<Uint8Array> {
   });
 }
 
-function expectNoBinary(
+function collectBinary(
   socket: WebSocket,
   label: string,
-  durationMs = 200,
-): Promise<void> {
+  durationMs = 300,
+): Promise<readonly Uint8Array[]> {
   return new Promise((resolvePromise, reject) => {
+    const packets: Uint8Array[] = [];
     const timer = setTimeout(() => {
       cleanup();
-      resolvePromise();
+      resolvePromise(Object.freeze(packets));
     }, durationMs);
-    const onMessage = (_data: RawData, isBinary: boolean): void => {
-      if (!isBinary) return;
-      cleanup();
-      reject(new Error("Unexpected binary message: " + label));
+    const onMessage = (data: RawData, isBinary: boolean): void => {
+      if (isBinary) packets.push(Uint8Array.from(rawBytes(data)));
     };
     const onClose = (): void => {
       cleanup();
-      reject(new Error("Socket closed while checking " + label));
+      reject(new Error("Socket closed while collecting " + label));
     };
     const cleanup = (): void => {
       clearTimeout(timer);
@@ -176,7 +257,7 @@ function expectNoJson(
   socket: WebSocket,
   predicate: (message: JsonObject) => boolean,
   label: string,
-  durationMs = 200,
+  durationMs = 250,
 ): Promise<void> {
   return new Promise((resolvePromise, reject) => {
     const timer = setTimeout(() => {
@@ -209,33 +290,6 @@ function expectNoJson(
   });
 }
 
-function collectBinary(
-  socket: WebSocket,
-  label: string,
-  durationMs = 300,
-): Promise<readonly Uint8Array[]> {
-  return new Promise((resolvePromise, reject) => {
-    const packets: Uint8Array[] = [];
-    const timer = setTimeout(() => {
-      cleanup();
-      resolvePromise(Object.freeze(packets));
-    }, durationMs);
-    const onMessage = (data: RawData, isBinary: boolean): void => {
-      if (isBinary) packets.push(Uint8Array.from(rawBytes(data)));
-    };
-    const onClose = (): void => {
-      cleanup();
-      reject(new Error("Socket closed while collecting " + label));
-    };
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      socket.off("message", onMessage);
-      socket.off("close", onClose);
-    };
-    socket.on("message", onMessage);
-    socket.once("close", onClose);
-  });
-}
 async function connectWebSocket(url: string): Promise<WebSocket> {
   const socket = new WebSocket(url);
   await new Promise<void>((resolvePromise, reject) => {
@@ -298,11 +352,7 @@ async function postJson(
     body: JSON.stringify(payload),
   });
   const body: unknown = await response.json();
-  assert.equal(
-    response.status,
-    expectedStatus,
-    "Unexpected response from " + path + ": " + JSON.stringify(body),
-  );
+  assert.equal(response.status, expectedStatus, "Unexpected response from " + path);
   assert.ok(isObject(body));
   return body;
 }
@@ -315,9 +365,7 @@ function mediaUrlFromGrant(
 ): string {
   const grants = response.endpointGrants;
   assert.ok(Array.isArray(grants));
-  const grant = grants.find(
-    (candidate) => isObject(candidate) && candidate.side === side,
-  );
+  const grant = grants.find((candidate) => isObject(candidate) && candidate.side === side);
   assert.ok(isObject(grant));
   assert.equal(grant.kind, "browser_link");
   assert.equal(typeof grant.url, "string");
@@ -340,59 +388,296 @@ function mediaUrlFromGrant(
   return mediaUrl.toString();
 }
 
-test("production composition relays deterministic duplex audio over real HTTP and WebSockets", {
+test("keyless deterministic acceptance exercises Fast, Balanced, and Accurate modes", {
   timeout: 20_000,
 }, async () => {
-  const taskDirectory = resolve(process.cwd(), "work", "tmp", "e2e-harness", randomUUID());
-  const evidenceDirectory = resolve(taskDirectory, "evidence");
-  const evidenceKey = Buffer.alloc(32, 0x5a);
+  for (const mode of ACCEPTANCE_MODES) {
+    const fixture = createKeylessTelephonyAcceptanceFixture();
+    const { sessionId, collector } = await openActiveTelephonySession(fixture, mode);
+    try {
+      fixture.media.speechStarted(sessionId, "A");
+      fixture.media.speechStarted(sessionId, "B");
+      fixture.media.ingestMulaw(sessionId, "A", 0, createPcmuSilenceFrame());
+      fixture.media.ingestMulaw(sessionId, "B", 0, createPcmuSilenceFrame());
+      fixture.media.speechEnded(sessionId, "A");
+      fixture.media.speechEnded(sessionId, "B");
+
+      await waitUntil(
+        () => fixture.media.outbound(sessionId, "A").some((event) => event.type === "audio") &&
+          fixture.media.outbound(sessionId, "B").some((event) => event.type === "audio"),
+        "Timed out waiting for both deterministic translated lanes in " + mode,
+      );
+
+      assert.equal(fixture.translation.prepared.length, 2);
+      assert.equal(fixture.translation.requests.length, 2);
+      for (const context of fixture.translation.requests) {
+        assert.equal(context.behavior.mode, mode);
+        assert.equal(
+          context.behavior.inputCommit,
+          mode === "accurate" ? "speech_end" : "continuous",
+        );
+        assert.equal(
+          context.behavior.transcriptPolicy,
+          mode === "fast" ? "provisional_revisions" : "final_only",
+        );
+      }
+
+      const source = transcriptEvents(collector.events, "source_transcript", "A_TO_B");
+      const target = transcriptEvents(collector.events, "target_transcript", "A_TO_B");
+      if (mode === "fast") {
+        assert.deepEqual(
+          source.map((event) => [event.revision, event.final, event.text]),
+          [
+            [0, false, "[fast source A_TO_B 0] draft"],
+            [1, true, "[fast source A_TO_B 0] replacement"],
+          ],
+          "Fast must surface one replaceable segment followed by its terminal revision",
+        );
+        assert.deepEqual(
+          target.map((event) => [event.revision, event.final, event.text]),
+          [
+            [0, false, "[fast target A_TO_B 0] draft"],
+            [1, true, "[fast target A_TO_B 0] replacement"],
+          ],
+        );
+        assert.equal(
+          source.some((event) => event.text.includes("rejected-after-final")),
+          false,
+          "A terminal segment must reject a later provider revision",
+        );
+      } else {
+        assert.deepEqual(source.map((event) => [event.revision, event.final]), [[0, true]]);
+        assert.deepEqual(target.map((event) => [event.revision, event.final]), [[0, true]]);
+      }
+
+      assert.deepEqual(
+        fixture.evidence.audioTracks(sessionId),
+        ["playout_to_a", "playout_to_b", "source_a", "source_b"],
+        "each deterministic mode must retain independent source and destination tracks",
+      );
+    } finally {
+      await closeTelephonySession(fixture, sessionId, collector);
+    }
+  }
+});
+
+test("keyless relay acceptance fences stale audio, keeps capture lanes independent, bounds queues, and reconnects", {
+  timeout: 20_000,
+}, async () => {
+  const fixture = createKeylessTelephonyAcceptanceFixture();
+  const { sessionId, collector } = await openActiveTelephonySession(fixture, "fast", 1);
+  try {
+    fixture.media.ingestDtmf(sessionId, "A", "5");
+    fixture.media.emitAlert(sessionId, "B", "carrier_notice", "Deterministic carrier notice", true);
+    await waitUntil(
+      () => collector.events.filter((event) =>
+        event.type === "alert" &&
+        (event.alert.code === "telephony_dtmf_received" || event.alert.code === "carrier_notice")
+      ).length === 2,
+      "Telephony alerts did not become relay events",
+    );
+    assert.equal(
+      fixture.evidence.records.filter((record) =>
+        record.type === "session_event" &&
+        record.event.type === "alert" &&
+        (record.event.alert.code === "telephony_dtmf_received" || record.event.alert.code === "carrier_notice")
+      ).length,
+      2,
+      "telephony alerts must be retained in session evidence without synthetic audio",
+    );
+
+    fixture.translation.holdNextFrame("A_TO_B");
+    fixture.media.speechStarted(sessionId, "A");
+    fixture.media.ingestMulaw(sessionId, "A", 0, createPcmuSilenceFrame());
+    await fixture.translation.waitForHeldFrame("A_TO_B");
+
+    fixture.media.ingestMulaw(sessionId, "A", 1, createPcmuSilenceFrame());
+    fixture.media.ingestMulaw(sessionId, "A", 2, createPcmuSilenceFrame());
+    fixture.media.ingestMulaw(sessionId, "A", 3, createPcmuSilenceFrame());
+    await waitUntil(
+      () => collector.events.some((event) =>
+        event.type === "alert" && event.alert.code === "source_queue_trimmed"
+      ),
+      "A bounded source queue did not report trimming",
+    );
+
+    const outboundAStart = fixture.media.outbound(sessionId, "A").length;
+    const outboundBStart = fixture.media.outbound(sessionId, "B").length;
+    fixture.media.speechStarted(sessionId, "B");
+    await waitUntil(
+      () => collector.events.some((event) =>
+        event.type === "generation_cut" &&
+        event.lane === "A_TO_B" &&
+        event.generation === 1 &&
+        event.reason === "barge_in"
+      ),
+      "B speech did not cut the A-to-B destination lane",
+    );
+    await waitUntil(
+      () => fixture.media.outbound(sessionId, "B").slice(outboundBStart).some((event) =>
+        event.type === "clear" && event.generation === 1
+      ),
+      "B did not receive the generation-aware interruption clear",
+    );
+    assert.equal(
+      fixture.media.outbound(sessionId, "A").slice(outboundAStart).some((event) => event.type === "clear"),
+      false,
+      "B barge-in must not clear the unrelated destination A",
+    );
+
+    fixture.translation.releaseHeldFrame("A_TO_B");
+    await waitUntil(
+      () => fixture.translation.cancelled.some((generation) =>
+        generation.lane === "A_TO_B" && generation.generation === 0
+      ),
+      "The stale A-to-B generation was not cancelled",
+    );
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
+    assert.equal(
+      fixture.media.outbound(sessionId, "B").slice(outboundBStart).some((event) =>
+        event.type === "audio" && event.generation === 0
+      ),
+      false,
+      "A late provider event must never revive a cut destination generation",
+    );
+    assert.equal(
+      audioEventsFor(collector.events, "A_TO_B").some((event) => event.generation === 0),
+      false,
+      "No stale A-to-B playout event may escape the generation fence",
+    );
+
+    fixture.media.ingestMulaw(sessionId, "A", 4, createPcmuSilenceFrame());
+    fixture.media.ingestMulaw(sessionId, "B", 0, createPcmuSilenceFrame());
+    fixture.media.speechEnded(sessionId, "A");
+    fixture.media.speechEnded(sessionId, "B");
+    await waitUntil(
+      () => fixture.media.outbound(sessionId, "A").some((event) =>
+        event.type === "audio" && event.generation === 1
+      ) && fixture.media.outbound(sessionId, "B").some((event) =>
+        event.type === "audio" && event.generation === 1
+      ),
+      "Both capture paths did not remain available after the targeted barge-in",
+    );
+    assert.deepEqual(fixture.evidence.audioTracks(sessionId), [
+      "playout_to_a",
+      "playout_to_b",
+      "source_a",
+      "source_b",
+    ]);
+
+    const audioToABeforeReconnect = fixture.media.outbound(sessionId, "A")
+      .filter((event) => event.type === "audio").length;
+    fixture.media.reconnect(sessionId, "A");
+    await waitUntil(
+      () => collector.events.some((event) =>
+        event.type === "participant_state" && event.side === "A" && !event.connected
+      ) && collector.events.some((event) =>
+        event.type === "participant_state" && event.side === "A" && event.connected
+      ),
+      "A reconnection did not retain its participant state transitions",
+    );
+    const bToACutsBeforeReconnectTurn = collector.events.filter((event) =>
+      event.type === "generation_cut" && event.lane === "B_TO_A"
+    ).length;
+    // Force a new B-to-A generation after the reconnect. Besides modelling a
+    // normal resumed turn, this makes the assertion independent of the prior
+    // turn's asynchronous iterator finishing first.
+    fixture.media.speechStarted(sessionId, "A");
+    fixture.media.speechEnded(sessionId, "A");
+    await waitUntil(
+      () => collector.events.filter((event) =>
+        event.type === "generation_cut" && event.lane === "B_TO_A" &&
+        event.reason === "barge_in"
+      ).length > bToACutsBeforeReconnectTurn,
+      "A reconnect turn did not open a fresh B-to-A generation",
+    );
+    fixture.media.speechStarted(sessionId, "B");
+    fixture.media.ingestMulaw(sessionId, "B", 1, createPcmuSilenceFrame());
+    fixture.media.speechEnded(sessionId, "B");
+    await waitUntil(
+      () => fixture.media.outbound(sessionId, "A").filter((event) => event.type === "audio").length >
+        audioToABeforeReconnect,
+      "B-to-A media did not resume after A reconnected",
+    );
+  } finally {
+    await closeTelephonySession(fixture, sessionId, collector);
+  }
+});
+
+test("keyless local evaluation reports mechanism PASS while live provider remains NOT_RUN", {
+  timeout: 20_000,
+}, async () => {
+  const directory = acceptanceTemporaryDirectory("local-eval-verification");
+  const manifestPath = resolve(directory, "manifest.json");
+  const wav = canonicalWav();
+  await mkdir(directory, { recursive: true });
+  await Promise.all([
+    writeFile(resolve(directory, "acceptance.wav"), wav),
+    writeFile(manifestPath, JSON.stringify(localEvalManifest(wav)), "utf8"),
+  ]);
+  try {
+    const report = await replayLocalEvalCorpus({
+      manifestPath,
+      sourceLanguage: "en-US",
+      targetLanguage: "zh-TW",
+    });
+    assert.equal(report.claims.providerCalls, 0);
+    assert.deepEqual(report.verification, {
+      mechanism: "PASS",
+      liveProvider: "NOT_RUN",
+      overall: "NOT_RUN",
+      liveProviderRequiredServerKey: true,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("real HTTP and WebSocket acceptance stays keyless while carrying duplex revisions and four tracks", {
+  timeout: 25_000,
+}, async () => {
   const port = await getAvailablePort();
-  const operatorToken = "e2e-operator-token-0123456789abcdef";
-  const config = loadConfig({
-    PUBLIC_BASE_URL: "http://127.0.0.1:" + port,
-    OPERATOR_TOKEN: operatorToken,
-    TRANSLATION_PROFILE: "deterministic_test",
-    EVIDENCE_PROFILE: "encrypted_local",
-    EVIDENCE_DIRECTORY: evidenceDirectory,
-    EVIDENCE_KEY_BASE64: evidenceKey.toString("base64"),
-    GLOSSARY_DIRECTORY: resolve(taskDirectory, "glossaries"),
-    LOG_LEVEL: "silent",
-  });
-  const composition = await composeApplication(config);
+  const origin = "http://127.0.0.1:" + port;
+  const fixture = await createKeylessBrowserAcceptanceApplication(origin, "fast");
   let socketA: WebSocket | undefined;
   let socketB: WebSocket | undefined;
   let eventSocket: WebSocket | undefined;
 
   try {
-    const origin = await composition.app.listen({
-      host: "127.0.0.1",
-      port,
+    const listenedOrigin = await fixture.app.listen({ host: "127.0.0.1", port });
+    assert.equal(listenedOrigin, origin);
+    const capabilitiesResponse = await fetch(origin + "/api/capabilities", {
+      headers: { authorization: "Bearer " + fixture.operatorToken },
     });
-    const wsOrigin = origin.replace(/^http/u, "ws");
-    const operatorLaunch = new URL(composition.operatorUrl);
-    assert.equal(operatorLaunch.origin, origin);
-    assert.equal(
-      new URLSearchParams(operatorLaunch.hash.slice(1)).get("access"),
-      operatorToken,
+    assert.equal(capabilitiesResponse.status, 200);
+    const capabilities: unknown = await capabilitiesResponse.json();
+    assert.ok(isObject(capabilities));
+    assert.ok(isObject(capabilities.translation));
+    assert.equal(capabilities.translation.provider, "openai_controlled");
+    assert.deepEqual(
+      (capabilities.translation.supportedModes as Array<{ mode?: unknown }>).map((mode) => mode.mode),
+      ["fast", "balanced", "accurate"],
     );
+
     const created = await postJson(origin, "/api/sessions", {
       languages: { A: "en-US", B: "zh-TW" },
-      translationProfileId: "deterministic_test",
+      translationMode: "fast",
       recordingConsent: true,
-    }, 201, operatorToken);
+    }, 201, fixture.operatorToken);
     const sessionId = created.sessionId;
     assert.equal(typeof sessionId, "string");
     if (typeof sessionId !== "string") throw new Error("Missing sessionId");
+    assert.equal(created.provider, "openai_controlled");
+    assert.equal(created.translationMode, "fast");
 
+    const wsOrigin = origin.replace(/^http/u, "ws");
     eventSocket = await connectWebSocket(
       wsOrigin + "/ws/events/" + encodeURIComponent(sessionId) +
-        "?access=" + encodeURIComponent(operatorToken),
+        "?access=" + encodeURIComponent(fixture.operatorToken),
     );
     const readyEvent = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "session_state" &&
-        messageData(message).status === "ready",
+      (message) => message.type === "session_state" && messageData(message).status === "ready",
       "ready session event",
     );
     [socketA, socketB] = await Promise.all([
@@ -403,164 +688,102 @@ test("production composition relays deterministic duplex audio over real HTTP an
 
     const activeEvent = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "session_state" &&
-        messageData(message).status === "active",
+      (message) => message.type === "session_state" && messageData(message).status === "active",
       "active session event",
     );
     await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
       kind: "start",
       commandId: randomUUID(),
-    }, 202, operatorToken);
+    }, 202, fixture.operatorToken);
     await activeEvent;
 
-    const generationCut = waitForJson(
+    const sourceDraft = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "generation_cut" &&
-        message.lane === "A_TO_B" &&
-        message.generation === 1,
-      "first A_TO_B generation cut",
+      (message) => message.type === "source_segment" && message.lane === "A_TO_B" &&
+        messageData(message).revision === 0 && messageData(message).final === false,
+      "provisional source segment",
     );
-    const sourceTranscript = waitForJson(
+    const sourceFinal = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "source_partial" &&
-        message.lane === "A_TO_B",
-      "source transcript",
+      (message) => message.type === "source_segment" && message.lane === "A_TO_B" &&
+        messageData(message).revision === 1 && messageData(message).final === true,
+      "terminal replacement source segment",
     );
-    const targetTranscript = waitForJson(
+    const targetFinal = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "target_committed" &&
-        message.lane === "A_TO_B",
-      "target transcript",
+      (message) => message.type === "target_segment" && message.lane === "A_TO_B" &&
+        messageData(message).revision === 1 && messageData(message).final === true,
+      "terminal replacement target segment",
     );
-    const latencyEvent = waitForJson(
+    const firstPlayout = waitForBinary(socketB, "A-to-B playout");
+    const firstLatency = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "latency" &&
-        message.lane === "A_TO_B",
-      "latency event",
+      (message) => message.type === "latency" && message.lane === "A_TO_B",
+      "A-to-B latency",
     );
-    const playout = waitForBinary(socketB, "B playout audio");
-
     const pcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x2a);
     socketA.send(JSON.stringify({ type: "speech_start" }));
     socketA.send(pcm, { binary: true });
     socketA.send(JSON.stringify({ type: "speech_end" }));
 
-    const [cut, source, target, packet] = await Promise.all([
-      generationCut,
-      sourceTranscript,
-      targetTranscript,
-      playout,
+    const [draft, replacement, target, firstPacket] = await Promise.all([
+      sourceDraft,
+      sourceFinal,
+      targetFinal,
+      firstPlayout,
     ]);
-    assert.equal(messageData(cut).reason, "operator");
-    assert.equal(messageData(source).text, "[deterministic A_TO_B]");
-    assert.equal(messageData(target).text, "[deterministic A_TO_B]");
-
-    const unpacked = unpackPlayoutAudio(packet);
-    assert.equal(unpacked.generation, 1);
-    assert.equal(unpacked.sequence, 0);
+    assert.equal(messageData(draft).text, "[fast source A_TO_B 0] draft");
+    assert.equal(messageData(replacement).text, "[fast source A_TO_B 0] replacement");
+    assert.equal(messageData(target).text, "[fast target A_TO_B 0] replacement");
+    assert.equal(messageData(draft).segmentId, messageData(replacement).segmentId);
+    const unpacked = unpackPlayoutAudio(firstPacket);
     assert.deepEqual(unpacked.pcm16le, pcm);
     socketB.send(JSON.stringify({
       type: "playout_started",
       generation: unpacked.generation,
       sequence: unpacked.sequence,
     }));
+    await firstLatency;
 
-    const latency = await latencyEvent;
-    const latencyMs = messageData(latency).latencyMs;
-    assert.equal(typeof latencyMs, "number");
-    assert.ok(
-      typeof latencyMs === "number" &&
-        Number.isFinite(latencyMs) &&
-        latencyMs >= 0 &&
-        latencyMs < WAIT_MS,
-      "Latency must use one monotonic clock domain, got " + String(latencyMs),
-    );
-
-    const bargeInCut = waitForJson(
+    const bargeCut = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "generation_cut" &&
-        message.lane === "A_TO_B" &&
+      (message) => message.type === "generation_cut" && message.lane === "A_TO_B" &&
         messageData(message).reason === "barge_in",
-      "A_TO_B barge-in generation cut",
+      "A-to-B barge-in cut",
     );
-    const clearOnB = waitForJson(
+    const clearB = waitForJson(
       socketB,
-      (message) =>
-        message.type === "clear" &&
-        message.generation === 2,
-      "generation-aware clear on B",
+      (message) => message.type === "clear" && typeof message.generation === "number",
+      "targeted clear to B",
+    );
+    const noClearA = expectNoJson(
+      socketA,
+      (message) => message.type === "clear",
+      "clear sent to unaffected destination A",
     );
     socketB.send(JSON.stringify({ type: "speech_start" }));
-    const [barge, clear] = await Promise.all([bargeInCut, clearOnB]);
-    assert.equal(barge.generation, 2);
-    assert.equal(clear.generation, 2);
+    const [barge, clear] = await Promise.all([bargeCut, clearB]);
+    assert.equal(barge.generation, clear.generation);
+    await noClearA;
     socketB.send(JSON.stringify({ type: "speech_end" }));
 
-    const pcmA = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x31);
-    const pcmB = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x52);
     const packetsToA = collectBinary(socketA, "simultaneous playout to A");
     const packetsToB = collectBinary(socketB, "simultaneous playout to B");
-    const sourceA = waitForJson(
-      eventSocket,
-      (message) => message.type === "source_partial" && message.lane === "A_TO_B",
-      "simultaneous A source transcript",
-    );
-    const sourceB = waitForJson(
-      eventSocket,
-      (message) => message.type === "source_partial" && message.lane === "B_TO_A",
-      "simultaneous B source transcript",
-    );
-    const latencyA = waitForJson(
-      eventSocket,
-      (message) => message.type === "latency" && message.lane === "A_TO_B",
-      "simultaneous A_TO_B latency",
-    );
-    const latencyB = waitForJson(
-      eventSocket,
-      (message) => message.type === "latency" && message.lane === "B_TO_A",
-      "simultaneous B_TO_A latency",
-    );
-
-    const aStartFence = waitForJson(
-      eventSocket,
-      (message) =>
-        message.type === "generation_cut" &&
-        message.lane === "B_TO_A" &&
-        messageData(message).reason === "barge_in",
-      "A speech-start fence",
-    );
-    const bStartFence = waitForJson(
-      eventSocket,
-      (message) =>
-        message.type === "generation_cut" &&
-        message.lane === "A_TO_B" &&
-        messageData(message).reason === "barge_in",
-      "B speech-start fence",
-    );
+    const pcmA = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x31);
+    const pcmB = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x52);
     socketA.send(JSON.stringify({ type: "speech_start" }));
     socketB.send(JSON.stringify({ type: "speech_start" }));
-    await Promise.all([aStartFence, bStartFence]);
     socketA.send(pcmA, { binary: true });
     socketB.send(pcmB, { binary: true });
     socketA.send(JSON.stringify({ type: "speech_end" }));
     socketB.send(JSON.stringify({ type: "speech_end" }));
-
     const [toA, toB] = await Promise.all([packetsToA, packetsToB]);
-    assert.equal(toA.length, 1, "A must receive only B_TO_A playout");
-    assert.equal(toB.length, 1, "B must receive only A_TO_B playout");
+    assert.equal(toA.length, 1, "A must receive only B-to-A playout");
+    assert.equal(toB.length, 1, "B must receive only A-to-B playout");
     const simultaneousToA = unpackPlayoutAudio(toA[0] ?? new Uint8Array());
     const simultaneousToB = unpackPlayoutAudio(toB[0] ?? new Uint8Array());
-    assert.deepEqual(simultaneousToA.pcm16le, pcmB, "A received its own source audio");
-    assert.deepEqual(simultaneousToB.pcm16le, pcmA, "B received its own source audio");
-    assert.equal(messageData(await sourceA).text, "[deterministic A_TO_B]");
-    assert.equal(messageData(await sourceB).text, "[deterministic B_TO_A]");
-
+    assert.deepEqual(simultaneousToA.pcm16le, pcmB);
+    assert.deepEqual(simultaneousToB.pcm16le, pcmA);
     socketA.send(JSON.stringify({
       type: "playout_started",
       generation: simultaneousToA.generation,
@@ -571,89 +794,6 @@ test("production composition relays deterministic duplex audio over real HTTP an
       generation: simultaneousToB.generation,
       sequence: simultaneousToB.sequence,
     }));
-    await Promise.all([latencyA, latencyB]);
-
-    const stalePcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x73);
-    const stalePlayout = waitForBinary(socketB, "unacknowledged pre-pause playout");
-    socketA.send(JSON.stringify({ type: "speech_start" }));
-    socketA.send(stalePcm, { binary: true });
-    socketA.send(JSON.stringify({ type: "speech_end" }));
-    const stalePacket = unpackPlayoutAudio(await stalePlayout);
-
-    const pausedState = waitForJson(
-      eventSocket,
-      (message) =>
-        message.type === "session_state" && messageData(message).status === "paused",
-      "paused session event",
-    );
-    const pauseClear = waitForJson(
-      socketB,
-      (message) =>
-        message.type === "clear" &&
-        typeof message.generation === "number" &&
-        message.generation > stalePacket.generation,
-      "pause generation clear",
-    );
-    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
-      kind: "pause",
-      commandId: randomUUID(),
-    }, 202, operatorToken);
-    const [, cleared] = await Promise.all([pausedState, pauseClear]);
-    assert.ok(
-      typeof cleared.generation === "number" && cleared.generation > stalePacket.generation,
-    );
-
-    const staleAckIgnored = expectNoJson(
-      eventSocket,
-      (message) =>
-        message.type === "latency" &&
-        message.lane === "A_TO_B" &&
-        message.generation === stalePacket.generation,
-      "latency from stale generation ACK",
-    );
-    socketB.send(JSON.stringify({
-      type: "playout_started",
-      generation: stalePacket.generation,
-      sequence: stalePacket.sequence,
-    }));
-    await staleAckIgnored;
-
-    const noPausedPlayout = expectNoBinary(socketB, "audio sent while paused");
-    socketA.send(JSON.stringify({ type: "speech_start" }));
-    socketA.send(new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x19), { binary: true });
-    socketA.send(JSON.stringify({ type: "speech_end" }));
-    await noPausedPlayout;
-
-    const resumedState = waitForJson(
-      eventSocket,
-      (message) =>
-        message.type === "session_state" && messageData(message).status === "active",
-      "resumed session event",
-    );
-    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
-      kind: "resume",
-      commandId: randomUUID(),
-    }, 202, operatorToken);
-    await resumedState;
-
-    const resumedPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x24);
-    const resumedPlayout = waitForBinary(socketB, "post-resume playout");
-    const resumedLatency = waitForJson(
-      eventSocket,
-      (message) => message.type === "latency" && message.lane === "A_TO_B",
-      "post-resume latency",
-    );
-    socketA.send(JSON.stringify({ type: "speech_start" }));
-    socketA.send(resumedPcm, { binary: true });
-    socketA.send(JSON.stringify({ type: "speech_end" }));
-    const resumedPacket = unpackPlayoutAudio(await resumedPlayout);
-    assert.deepEqual(resumedPacket.pcm16le, resumedPcm);
-    socketB.send(JSON.stringify({
-      type: "playout_started",
-      generation: resumedPacket.generation,
-      sequence: resumedPacket.sequence,
-    }));
-    await resumedLatency;
 
     const participantLeft = waitForJson(
       eventSocket,
@@ -663,89 +803,53 @@ test("production composition relays deterministic duplex audio over real HTTP an
     await closeWebSocket(socketA);
     socketA = undefined;
     await participantLeft;
-    const participantRejoined = waitForJson(
+    const participantJoined = waitForJson(
       eventSocket,
       (message) => message.type === "participant_joined" && messageData(message).side === "A",
-      "participant A rejoin",
+      "participant A reconnect",
     );
     socketA = await connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "A"));
-    await participantRejoined;
+    await participantJoined;
 
-    const rejoinPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x66);
-    const rejoinPlayout = waitForBinary(socketA, "B_TO_A playout after A rejoins");
-    const rejoinLatency = waitForJson(
-      eventSocket,
-      (message) => message.type === "latency" && message.lane === "B_TO_A",
-      "B_TO_A latency after A rejoins",
-    );
+    const reconnectPacket = waitForBinary(socketA, "B-to-A playout after reconnect");
+    const reconnectPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x66);
     socketB.send(JSON.stringify({ type: "speech_start" }));
-    socketB.send(rejoinPcm, { binary: true });
+    socketB.send(reconnectPcm, { binary: true });
     socketB.send(JSON.stringify({ type: "speech_end" }));
-    const rejoinPacket = unpackPlayoutAudio(await rejoinPlayout);
-    assert.deepEqual(rejoinPacket.pcm16le, rejoinPcm);
+    const rejoinedAudio = unpackPlayoutAudio(await reconnectPacket);
+    assert.deepEqual(rejoinedAudio.pcm16le, reconnectPcm);
     socketA.send(JSON.stringify({
       type: "playout_started",
-      generation: rejoinPacket.generation,
-      sequence: rejoinPacket.sequence,
+      generation: rejoinedAudio.generation,
+      sequence: rejoinedAudio.sequence,
     }));
-    await rejoinLatency;
 
+    await waitUntil(
+      () => fixture.evidence.audioTracks(sessionId).length === 4,
+      "WebSocket path did not retain all four audio evidence tracks",
+    );
     const closedEvent = waitForJson(
       eventSocket,
-      (message) =>
-        message.type === "session_state" &&
-        messageData(message).status === "closed",
+      (message) => message.type === "session_state" && messageData(message).status === "closed",
       "closed session event",
     );
     await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
       kind: "end",
       commandId: randomUUID(),
-    }, 202, operatorToken);
+    }, 202, fixture.operatorToken);
     await closedEvent;
-
-    const evidencePath = new EncryptedFileEvidenceStore<EvidenceRecord>({
-      directory: evidenceDirectory,
-      key: evidenceKey,
-    }).filePath(sessionId);
-    const records = await readEncryptedEvidence<EvidenceRecord>(
-      evidencePath,
-      evidenceKey,
-    );
-    const audioRecords = records.filter((record): record is Extract<
-      EvidenceRecord,
-      { type: "audio" }
-    > => record.type === "audio");
-    assert.deepEqual(
-      [...new Set(audioRecords.map((record) => record.track))].sort(),
-      ["playout_to_a", "playout_to_b", "source_a", "source_b"],
-      "recording evidence must contain all four duplex tracks",
-    );
-    const hasAudio = (
-      track: Extract<EvidenceRecord, { type: "audio" }>["track"],
-      expected: Uint8Array,
-    ): boolean => audioRecords.some((record) =>
-      record.track === track &&
-      Buffer.from(record.frame.pcm16le).equals(Buffer.from(expected))
-    );
-    assert.equal(hasAudio("source_a", pcmA), true);
-    assert.equal(hasAudio("playout_to_b", pcmA), true);
-    assert.equal(hasAudio("source_b", pcmB), true);
-    assert.equal(hasAudio("playout_to_a", pcmB), true);
-    assert.equal(
-      hasAudio("playout_to_b", stalePcm),
-      false,
-      "late ACK from a cut generation must not become playout evidence",
-    );
-    assert.ok(records.some((record) =>
-      record.type === "session_event" && record.event.type === "session_closed"
-    ));
+    assert.deepEqual(fixture.evidence.audioTracks(sessionId), [
+      "playout_to_a",
+      "playout_to_b",
+      "source_a",
+      "source_b",
+    ]);
   } finally {
     await Promise.all([
       closeWebSocket(socketA),
       closeWebSocket(socketB),
       closeWebSocket(eventSocket),
     ]);
-    await composition.app.close();
-    await rm(taskDirectory, { recursive: true, force: true });
+    await fixture.app.close();
   }
 });

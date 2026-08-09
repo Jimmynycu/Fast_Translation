@@ -3,15 +3,17 @@ import { test } from "node:test";
 import { createLocalEvalTranslationAdapter } from "../src/adapters/translation/local-eval.js";
 import { CANONICAL_AUDIO, createAudioFrame } from "../src/core/audio.js";
 import { compileGlossary } from "../src/core/glossary.js";
+import { resolveTranslationBehavior } from "../src/core/translation-behavior.js";
 import type { TranslationEvent, TranslationRequest } from "../src/core/types.js";
 
 const context = {
   sessionId: "local-eval-session",
   lane: "A_TO_B" as const,
   generation: 1,
+  turnId: "local-eval-turn-1",
   sourceLanguage: "en-US",
   targetLanguage: "zh-TW",
-  profile: "local_eval" as const,
+  behavior: resolveTranslationBehavior("accurate"),
   glossary: compileGlossary({
     id: "factory",
     version: "v1",
@@ -64,21 +66,25 @@ test("local_eval recognizes a configured alias, restores target_exact, and emits
 
   const events = await collect(adapter.translate(request()));
   const authorized = events.find(
-    (event) => event.type === "terminology" && event.status === "authorized",
+    (event) => event.kind === "terminology" && event.status === "authorized",
   );
-  assert.equal(authorized?.type, "terminology");
-  if (authorized?.type !== "terminology") throw new Error("missing terminology event");
+  assert.equal(authorized?.kind, "terminology");
+  if (authorized?.kind !== "terminology") throw new Error("missing terminology event");
   assert.deepEqual(authorized.guaranteedTargetExact, ["防呆"]);
   assert.match(authorized.text, /防呆/u);
+  assert.equal(authorized.finality, "final");
 
-  const target = events.find((event) => event.type === "target_transcript_delta");
-  assert.equal(target?.type, "target_transcript_delta");
-  if (target?.type === "target_transcript_delta") assert.match(target.delta, /防呆/u);
+  const target = events.find((event) => event.kind === "target_transcript");
+  assert.equal(target?.kind, "target_transcript");
+  if (target?.kind === "target_transcript") {
+    assert.match(target.text, /防呆/u);
+    assert.equal(target.finality, "final");
+  }
 
-  const audio = events.filter((event) => event.type === "audio");
+  const audio = events.filter((event) => event.kind === "audio");
   assert.ok(audio.length > 0);
   for (const event of audio) {
-    if (event.type !== "audio") continue;
+    if (event.kind !== "audio") continue;
     assert.deepEqual(event.frame.format, CANONICAL_AUDIO);
     assert.equal(event.frame.pcm16le.byteLength, CANONICAL_AUDIO.bytesPerFrame);
   }
@@ -97,9 +103,9 @@ test("local_eval fail-open fixture alerts but continues target text and canonica
 
   const events = await collect(adapter.translate(request()));
   assert.ok(events.some((event) =>
-    event.type === "error" && event.error.code === "GLOSSARY_PLACEHOLDER_MISSING"
+    event.kind === "error" && event.error.code === "GLOSSARY_PLACEHOLDER_MISSING"
   ));
-  assert.ok(events.some((event) => event.type === "target_transcript_delta"));
-  assert.ok(events.some((event) => event.type === "audio"));
-  assert.equal(events.at(-1)?.type, "completed");
+  assert.ok(events.some((event) => event.kind === "target_transcript"));
+  assert.ok(events.some((event) => event.kind === "audio"));
+  assert.equal(events.at(-1)?.kind, "completed");
 });

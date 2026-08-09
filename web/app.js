@@ -1,6 +1,9 @@
 import {
+  applySegmentRevision,
   endpointGrantPresentation,
   glossaryUploadContents,
+  normalizeTranslationCapabilities,
+  shouldSendSpeechStartForActiveTransition,
 } from "./public/browser-contract.js";
 import { MediaSocketSupervisor } from "./public/media-socket-supervisor.js";
 
@@ -19,6 +22,7 @@ const state = {
   glossaryVersion: null,
   glossaryDirection: null,
   capabilitiesReady: false,
+  translation: null,
   session: null,
   roomStatus: "waiting",
   eventSocket: null,
@@ -29,9 +33,16 @@ const state = {
   lastCursor: 0,
   seenCursors: new Set(),
   participants: new Set(),
-  partialLines: { A: null, B: null },
-  targetLines: { A: null, B: null },
-  lastLines: { A: null, B: null },
+  segmentStates: {
+    source: { A: new Map(), B: new Map() },
+    target: { A: new Map(), B: new Map() },
+  },
+  segmentLines: {
+    source: { A: new Map(), B: new Map() },
+    target: { A: new Map(), B: new Map() },
+  },
+  laneGenerations: new Map(),
+  lastClearedGeneration: -1,
   latencySamples: [],
   cutCount: 0,
   alertCount: 0,
@@ -42,12 +53,17 @@ const state = {
   pendingMediaMessages: [],
 };
 
-const PROFILE_LABELS = {
-  glossary_controlled: "Glossary controlled",
-  palabra_live: "Palabra live",
-  local_eval: "Local glossary evaluation",
-  native_live_baseline: "Native live baseline",
-  deterministic_test: "Deterministic test",
+const MODE_LABELS = {
+  fast: "Fast — streaming",
+  balanced: "Balanced — stable phrases",
+  accurate: "Accurate — whole sentences",
+};
+
+const PROVIDER_LABELS = {
+  palabra: "Palabra",
+  openai_native: "OpenAI native",
+  openai_controlled: "OpenAI controlled",
+  deterministic: "Deterministic test",
 };
 
 function uniqueId() {
@@ -241,6 +257,14 @@ function updateParticipantConnection(label, online) {
   element.replaceChildren(dot, document.createTextNode(" " + label));
 }
 
+function updateParticipantLiveStatus(message, warning = false) {
+  if (route.role !== "participant") return;
+  const element = $("participant-live-status");
+  if (!element) return;
+  element.textContent = message;
+  element.classList.toggle("is-warning", warning);
+}
+
 function setPreflight(id, outcome) {
   const element = $(id);
   element.classList.toggle("is-pass", outcome === true);
@@ -318,84 +342,141 @@ function renderJoinCards(grants) {
   });
 }
 
-function appendSourceTranscript(side, text, partial, generation) {
-  if (!side || !text) return;
-  const container = $("transcript-" + side.toLowerCase());
-  const empty = container.querySelector(".empty-state");
-  if (empty) empty.remove();
-
-  let line = state.partialLines[side];
-  const generationKey = String(generation ?? "");
-  if (line && line.dataset.generation !== generationKey) line = null;
-  if (!line) {
-    line = document.createElement("article");
-    line.className = "transcript-line";
-    line.dataset.generation = generationKey;
-    const source = document.createElement("p");
-    source.className = "source";
-    const label = document.createElement("small");
-    label.textContent = "Phone " + side + (partial ? " - hearing" : " - source");
-    line.append(source, label);
-    container.append(line);
+function resetSegmentRendering() {
+  for (const kind of ["source", "target"]) {
+    for (const side of ["A", "B"]) {
+      state.segmentStates[kind][side].clear();
+      state.segmentLines[kind][side].clear();
+    }
   }
-
-  line.querySelector(".source").textContent = text;
-  line.classList.toggle("is-partial", partial);
-  line.querySelector("small").textContent =
-    "Phone " + side + (partial ? " - hearing" : " - source");
-
-  if (partial) {
-    state.partialLines[side] = line;
-  } else {
-    state.partialLines[side] = null;
-    state.lastLines[side] = line;
+  state.laneGenerations.clear();
+  if (route.role === "operator") {
+    for (const side of ["A", "B"]) {
+      const container = $("transcript-" + side.toLowerCase());
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = "Waiting for Phone " + side + "…";
+      container.replaceChildren(empty);
+    }
   }
-  container.scrollTop = container.scrollHeight;
 }
 
-function appendTargetTranscript(sourceSide, text, validated, final, generation) {
-  if (!sourceSide || !text) return;
+function segmentUpdate(data) {
+  if (!data || typeof data !== "object") return null;
+  if (
+    typeof data.turnId !== "string" ||
+    data.turnId.trim().length === 0 ||
+    typeof data.segmentId !== "string" ||
+    data.segmentId.trim().length === 0 ||
+    !Number.isSafeInteger(data.revision) ||
+    data.revision < 0 ||
+    typeof data.final !== "boolean"
+  ) {
+    return null;
+  }
+  if (typeof data.text !== "string") return null;
+  return {
+    turnId: data.turnId.trim(),
+    segmentId: data.segmentId.trim(),
+    revision: data.revision,
+    text: data.text,
+    final: data.final,
+  };
+}
+
+function acceptedSegmentGeneration(envelope) {
+  if (typeof envelope.lane !== "string" || !Number.isSafeInteger(envelope.generation)) {
+    return null;
+  }
+  const lane = envelope.lane;
+  const generation = envelope.generation;
+  const current = state.laneGenerations.get(lane);
+  if (current !== undefined && generation < current) return null;
+  if (current === undefined || generation > current) {
+    state.laneGenerations.set(lane, generation);
+  }
+  return { lane, generation };
+}
+
+function renderTranscriptSegment(kind, sourceSide, data, envelope) {
+  if (!sourceSide) return;
+  const update = segmentUpdate(data);
+  const generationRef = acceptedSegmentGeneration(envelope);
+  if (!update || !generationRef) return;
+
   const container = $("transcript-" + sourceSide.toLowerCase());
   const empty = container.querySelector(".empty-state");
   if (empty) empty.remove();
 
-  const generationKey = String(generation ?? "");
-  const candidates = [
-    state.targetLines[sourceSide],
-    state.partialLines[sourceSide],
-    state.lastLines[sourceSide],
-  ];
-  let line = candidates.find(
-    (candidate) => candidate && candidate.dataset.generation === generationKey,
-  );
+  const result = applySegmentRevision(state.segmentStates[kind][sourceSide], {
+    ...update,
+    generation: generationRef.generation,
+  });
+  if (!result.applied) return;
+  const renderKey = result.key;
+
+  let line = state.segmentLines[kind][sourceSide].get(renderKey);
   if (!line) {
     line = document.createElement("article");
     line.className = "transcript-line";
-    line.dataset.generation = generationKey;
-    const placeholder = document.createElement("p");
-    placeholder.className = "source";
-    placeholder.textContent = "Translation";
+    line.dataset.lane = generationRef.lane;
+    line.dataset.generation = String(generationRef.generation);
+    line.dataset.turnId = update.turnId;
+    line.dataset.segmentId = update.segmentId;
+    const text = document.createElement("p");
+    text.className = kind === "source" ? "source" : "translation";
     const label = document.createElement("small");
-    label.textContent = "Phone " + sourceSide + " lane";
-    line.append(placeholder, label);
+    line.append(text, label);
+    state.segmentLines[kind][sourceSide].set(renderKey, line);
     container.append(line);
   }
 
-  let translated = line.querySelector(".translation");
-  if (!translated) {
-    translated = document.createElement("p");
-    translated.className = "translation";
-    line.append(translated);
-  }
-  translated.textContent = text;
-  line.dataset.target = text;
-  if (validated) line.dataset.validated = "true";
-  const isValidated = line.dataset.validated === "true";
+  line.querySelector("p").textContent = update.text;
+  line.dataset.final = String(update.final);
+  line.classList.toggle("is-partial", !update.final);
+  const validated = kind === "target" && data.validated === true;
   line.querySelector("small").textContent =
-    "Phone " + sourceSide + " - AI translation" + (isValidated ? " - validated" : "");
-  state.lastLines[sourceSide] = line;
-  state.targetLines[sourceSide] = final ? null : line;
+    kind === "source"
+      ? "Phone " + sourceSide + (update.final ? " - source" : " - hearing")
+      : "Phone " + sourceSide + " - AI translation" + (validated ? " - validated" : "");
   container.scrollTop = container.scrollHeight;
+}
+
+function clearSupersededSegments(envelope, data, sides) {
+  if (typeof envelope.lane !== "string") return;
+  const generation = Number(envelope.generation ?? data.generation);
+  const previousGeneration = Number(data.previousGeneration);
+  if (
+    !Number.isSafeInteger(generation) ||
+    generation < 0 ||
+    !Number.isSafeInteger(previousGeneration) ||
+    previousGeneration < 0 ||
+    previousGeneration >= generation
+  ) return;
+  const current = state.laneGenerations.get(envelope.lane);
+  if (current !== undefined && generation < current) return;
+  state.laneGenerations.set(envelope.lane, generation);
+
+  for (const kind of ["source", "target"]) {
+    for (const side of ["A", "B"]) {
+      const lines = state.segmentLines[kind][side];
+      for (const [key, line] of lines) {
+        if (
+          line.dataset.lane === envelope.lane &&
+          Number(line.dataset.generation) === previousGeneration &&
+          line.dataset.final !== "true"
+        ) {
+          line.remove();
+          lines.delete(key);
+          state.segmentStates[kind][side].delete(key);
+        }
+      }
+    }
+  }
+
+  if (state.audio && sides.target === route.side) {
+    clearParticipantPlayout(generation, "Audio queue cleared after interruption");
+  }
 }
 
 function updateLatency(data, envelope) {
@@ -443,7 +524,10 @@ function updateRoomState(value) {
     end.disabled = false;
     if (route.role === "participant") {
       updateParticipantConnection(state.audio ? "Live" : "Room live", true);
-      if (previousStatus === "paused" && state.audio && state.vadActive) {
+      if (
+        state.audio &&
+        shouldSendSpeechStartForActiveTransition(previousStatus, normal, state.vadActive)
+      ) {
         sendMediaControl("speech_start");
       }
     } else {
@@ -478,18 +562,24 @@ function updateRecording(data) {
 
 function handleParticipantCaptions(envelope, type, data) {
   if (route.role !== "participant") return;
+  if (type !== "source_segment" && type !== "target_segment") return;
   const sides = eventSides(envelope);
-  const text = textFrom(data);
-  if (!text) return;
+  const update = segmentUpdate(data);
+  const generationRef = acceptedSegmentGeneration(envelope);
+  const sourceSide = sides.source;
+  if (!update || !generationRef || !sourceSide) return;
+  const kind = type === "source_segment" ? "source" : "target";
+  const result = applySegmentRevision(state.segmentStates[kind][sourceSide], {
+    ...update,
+    generation: generationRef.generation,
+  });
+  if (!result.applied) return;
 
-  if ((type === "source_partial" || type === "source_stable") && sides.source === route.side) {
-    $("participant-source-caption").textContent = text;
+  if (type === "source_segment" && sourceSide === route.side) {
+    $("participant-source-caption").textContent = update.text;
   }
-  if (
-    (type === "target_committed" || type === "target_validated") &&
-    sides.target === route.side
-  ) {
-    $("participant-target-caption").textContent = text;
+  if (type === "target_segment" && sides.target === route.side) {
+    $("participant-target-caption").textContent = update.text;
   }
 }
 
@@ -512,12 +602,15 @@ function handleEvent(envelope) {
   const summary = eventSummary(data, envelope);
   const isWarning = type === "error" || type === "terminology_alert";
 
-  if (route.role === "operator" && type !== "source_partial") {
+  if (route.role === "operator" && type !== "source_segment") {
     addFeedItem($("pipeline-feed"), titleCase(type), summary, isWarning);
   }
 
   if (type === "session_state") {
     updateRoomState(data.state ?? data.status ?? data.value);
+    if (route.role === "participant") {
+      updateParticipantLiveStatus("Room " + String(data.state ?? data.status ?? "updated") + ".");
+    }
   } else if (type === "participant_joined") {
     const side = normaliseSide(data.side || envelope.lane);
     if (side) state.participants.add(side);
@@ -526,23 +619,13 @@ function handleEvent(envelope) {
     const side = normaliseSide(data.side || envelope.lane);
     if (side) state.participants.delete(side);
     $("participant-count").textContent = state.participants.size + " / 2 joined";
-  } else if (type === "source_partial") {
+  } else if (type === "source_segment") {
     if (route.role === "operator") {
-      appendSourceTranscript(sides.source, textFrom(data), true, envelope.generation);
+      renderTranscriptSegment("source", sides.source, data, envelope);
     }
-  } else if (type === "source_stable") {
+  } else if (type === "target_segment") {
     if (route.role === "operator") {
-      appendSourceTranscript(sides.source, textFrom(data), false, envelope.generation);
-    }
-  } else if (type === "target_committed" || type === "target_validated") {
-    if (route.role === "operator") {
-      appendTargetTranscript(
-        sides.source,
-        textFrom(data),
-        type === "target_validated",
-        data.final === true,
-        envelope.generation,
-      );
+      renderTranscriptSegment("target", sides.source, data, envelope);
     }
   } else if (type === "terminology_alert") {
     state.alertCount += 1;
@@ -550,15 +633,19 @@ function handleEvent(envelope) {
     $("alert-detail").textContent = summary || "Review required";
     if (route.role === "operator") {
       addFeedItem($("terminology-feed"), data.term || "Terminology alert", summary, true);
+    } else {
+      updateParticipantLiveStatus(summary || "Terminology needs review.", true);
     }
+  } else if (type === "error") {
+    updateParticipantLiveStatus(summary || "The translation service reported an issue.", true);
   } else if (type === "latency") {
     updateLatency(data, envelope);
   } else if (type === "generation_cut") {
     state.cutCount += 1;
     $("cut-count").textContent = String(state.cutCount);
-    const generation = Number(envelope.generation ?? data.generation);
-    if (state.audio && Number.isFinite(generation) && sides.target === route.side) {
-      state.audio.playoutNode.port.postMessage({ type: "clear", generation });
+    clearSupersededSegments(envelope, data, sides);
+    if (route.role === "participant" && sides.target === route.side) {
+      updateParticipantLiveStatus("Previous translation was cleared. Keep speaking normally.");
     }
   } else if (type === "recording_state") {
     updateRecording(data);
@@ -582,6 +669,7 @@ function connectEventStream(sessionId) {
   if (state.eventSessionId !== null && state.eventSessionId !== sessionId) {
     state.lastCursor = 0;
     state.seenCursors.clear();
+    resetSegmentRendering();
   }
   state.eventSessionId = sessionId;
   state.eventsClosed = false;
@@ -642,29 +730,56 @@ function connectEventStream(sessionId) {
 
 function updateCreateAvailability() {
   $("create-session").disabled =
-    !$("recording-consent").checked || !state.capabilitiesReady;
+    !$("recording-consent").checked ||
+    !state.capabilitiesReady ||
+    $("translation-mode").disabled;
+}
+
+function selectedModeCapability() {
+  if (!state.translation) return null;
+  const selectedMode = $("translation-mode").value;
+  return state.translation.supportedModes.find((capability) =>
+    capability.mode === selectedMode,
+  ) ?? null;
+}
+
+function updateModeDetail() {
+  const detail = $("translation-mode-detail");
+  const capability = selectedModeCapability();
+  if (!capability || !state.translation) {
+    detail.textContent = "This server has no selectable translation mode.";
+    return;
+  }
+  const capabilityState = capability.degradation.state === "degraded"
+    ? "Degraded: " + capability.degradation.reason
+    : "Full capability";
+  detail.textContent =
+    (PROVIDER_LABELS[state.translation.provider] ?? titleCase(state.translation.provider)) +
+    " · behavior " + capability.behavior.version + " · " + capabilityState;
+  if (capability.deterministicGlossary) {
+    detail.textContent += " · pinned glossary supported";
+  }
 }
 
 async function loadCapabilities() {
   const capabilities = await getJson("/api/capabilities");
-  const profiles = Array.isArray(capabilities.translationProfiles)
-    ? capabilities.translationProfiles.filter((profile) => PROFILE_LABELS[profile])
-    : [];
-  if (profiles.length === 0) {
-    throw new Error("This server has no browser-selectable translation profile.");
-  }
-
-  const select = $("translation-profile");
+  const translation = normalizeTranslationCapabilities(capabilities.translation);
+  const supportedModes = translation.supportedModes;
+  state.translation = translation;
+  const select = $("translation-mode");
   select.replaceChildren();
-  for (const profile of profiles) {
+  for (const capability of supportedModes) {
     const option = document.createElement("option");
-    option.value = profile;
-    option.textContent = PROFILE_LABELS[profile];
+    option.value = capability.mode;
+    option.textContent = MODE_LABELS[capability.mode] +
+      (capability.degradation.state === "degraded" ? " (degraded)" : "");
     select.append(option);
   }
-  select.value = profiles.includes(capabilities.defaultTranslationProfile)
-    ? capabilities.defaultTranslationProfile
-    : profiles[0];
+  select.value = translation.defaultMode;
+  select.disabled = false;
+  $("translation-provider").textContent =
+    PROVIDER_LABELS[translation.provider] ?? titleCase(translation.provider);
+  updateModeDetail();
   state.capabilitiesReady = true;
   updateCreateAvailability();
 }
@@ -729,8 +844,29 @@ function showOperatorSession(snapshot, updateHistory) {
   if (!snapshot || !snapshot.sessionId) {
     throw new Error("The server did not return a session ID.");
   }
+  if (
+    typeof snapshot.provider !== "string" ||
+    !Object.hasOwn(MODE_LABELS, snapshot.translationMode) ||
+    !Number.isSafeInteger(snapshot.behaviorVersion) ||
+    snapshot.behaviorVersion < 1 ||
+    typeof snapshot.deterministicGlossary !== "boolean" ||
+    !snapshot.degradation ||
+    !["full", "degraded"].includes(snapshot.degradation.state) ||
+    (snapshot.degradation.state === "degraded" &&
+      (typeof snapshot.degradation.reason !== "string" || snapshot.degradation.reason.length === 0))
+  ) {
+    throw new Error("The server did not return the pinned translation behavior.");
+  }
   state.session = snapshot;
   $("session-id").textContent = snapshot.sessionId;
+  const modeLabel = MODE_LABELS[snapshot.translationMode];
+  const providerLabel = PROVIDER_LABELS[snapshot.provider] ?? titleCase(snapshot.provider);
+  const degraded = snapshot.degradation && snapshot.degradation.state === "degraded"
+    ? " · Degraded: " + snapshot.degradation.reason
+    : "";
+  $("session-translation").textContent =
+    "Pinned " + providerLabel + " · " + modeLabel + " · behavior " +
+    String(snapshot.behaviorVersion || "unknown") + degraded;
   renderJoinCards(Array.isArray(snapshot.endpointGrants) ? snapshot.endpointGrants : []);
   $("setup-section").hidden = true;
   $("operator-dashboard").hidden = false;
@@ -764,12 +900,16 @@ async function createSession(event) {
     showError(error, "Choose two different spoken languages.");
     return;
   }
-  const translationProfileId = $("translation-profile").value;
-  if (
-    state.glossaryVersion !== null &&
-    !["glossary_controlled", "local_eval"].includes(translationProfileId)
-  ) {
-    showError(error, "Select Glossary controlled or Local glossary evaluation to use the glossary; Palabra live does not accept a pinned glossary.");
+  const translationMode = selectedModeCapability();
+  if (!translationMode) {
+    showError(error, "Choose one of the modes advertised by this server.");
+    return;
+  }
+  if (state.glossaryVersion !== null && !translationMode.deterministicGlossary) {
+    showError(
+      error,
+      "The selected mode cannot guarantee a pinned glossary. Choose a glossary-capable mode or remove the glossary.",
+    );
     return;
   }
 
@@ -780,7 +920,7 @@ async function createSession(event) {
         A: $("language-a").value,
         B: $("language-b").value,
       },
-      translationProfileId,
+      translationMode: translationMode.mode,
       glossaryVersion: state.glossaryVersion || undefined,
       recordingConsent: true,
     });
@@ -843,6 +983,7 @@ async function initialiseOperator() {
   });
 
   $("recording-consent").addEventListener("change", updateCreateAvailability);
+  $("translation-mode").addEventListener("change", updateModeDetail);
   $("language-a").addEventListener("change", invalidateGlossaryIfDirectionChanged);
   $("language-b").addEventListener("change", invalidateGlossaryIfDirectionChanged);
 
@@ -871,6 +1012,20 @@ async function initialiseOperator() {
   }
 }
 
+function clearParticipantPlayout(generation, label) {
+  if (
+    !state.audio ||
+    !Number.isSafeInteger(generation) ||
+    generation < 0 ||
+    generation <= state.lastClearedGeneration
+  ) {
+    return;
+  }
+  state.lastClearedGeneration = generation;
+  state.audio.playoutNode.port.postMessage({ type: "clear", generation });
+  $("playback-label").textContent = label;
+}
+
 async function handleMediaMessage(message) {
   if (!state.audio) {
     state.pendingMediaMessages.push(message);
@@ -881,10 +1036,7 @@ async function handleMediaMessage(message) {
       const control = JSON.parse(message);
       if (control.type === "clear") {
         const generation = Number(control.generation);
-        if (Number.isFinite(generation)) {
-          state.audio.playoutNode.port.postMessage({ type: "clear", generation });
-          $("playback-label").textContent = "Audio queue cleared";
-        }
+        clearParticipantPlayout(generation, "Audio queue cleared");
       }
     } catch {
       showError($("participant-error"), "Received an invalid media control message.");
@@ -1039,6 +1191,7 @@ async function startParticipantAudio() {
   let participantAudio;
   try {
     state.pendingMediaMessages = [];
+    state.lastClearedGeneration = -1;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }

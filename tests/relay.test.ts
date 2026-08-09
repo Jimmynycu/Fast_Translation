@@ -18,9 +18,23 @@ import type {
   SessionEvent,
   Side,
   TranslationEvent,
+  TranslationCapabilities,
   TranslationPort,
   TranslationRequest,
 } from "../src/core/types.js";
+
+const TEST_CAPABILITIES: TranslationCapabilities = {
+  providerId: "palabra",
+  supportedModes: [
+    { mode: "fast", behaviorVersion: 1, deterministicGlossary: false },
+    { mode: "balanced", behaviorVersion: 1, deterministicGlossary: false },
+    { mode: "accurate", behaviorVersion: 1, deterministicGlossary: true },
+  ],
+  supportsProvisionalRevisions: true,
+  supportsFinality: true,
+  supportsCancellation: true,
+  supportsDeterministicGlossary: true,
+};
 
 class FakeEvidence implements EvidencePort {
   readonly records: EvidenceRecord[] = [];
@@ -81,7 +95,16 @@ class FakeMedia implements MediaPort {
   }
 }
 
+class StalledMedia extends FakeMedia {
+  override async play(request: MediaPlaybackRequest): Promise<void> {
+    await new Promise<void>((resolve) => {
+      request.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+}
+
 class FakeTranslation implements TranslationPort {
+  readonly capabilities = TEST_CAPABILITIES;
   readonly captured: AudioFrame[] = [];
   readonly prepared: LaneContext[] = [];
   readonly closedSessions: string[] = [];
@@ -110,27 +133,40 @@ class FakeTranslation implements TranslationPort {
         await new Promise<void>((resolve) => this.#releaseWaiters.push(resolve));
       }
       yield {
-        type: "source_transcript_delta",
+        kind: "source_transcript",
         sessionId: request.context.sessionId,
         lane: request.context.lane,
         generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "source-0",
+        revision: 1,
+        finality: "provisional",
         emittedAtMs: performance.now(),
-        delta: "source",
+        text: "source",
       };
       yield {
-        type: "target_transcript_delta",
+        kind: "target_transcript",
         sessionId: request.context.sessionId,
         lane: request.context.lane,
         generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "target-0",
+        revision: 1,
+        finality: "provisional",
         emittedAtMs: performance.now(),
-        delta: "target",
+        text: "target",
       };
       yield {
-        type: "audio",
+        kind: "audio",
         sessionId: request.context.sessionId,
         lane: request.context.lane,
         generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "audio-0",
+        revision: 1,
+        finality: "provisional",
         emittedAtMs: performance.now(),
+        playoutSequence: frame.sequence,
         frame: createAudioFrame({
           ...frame,
           generation: request.context.generation,
@@ -149,7 +185,17 @@ class FakeTranslation implements TranslationPort {
 
 }
 
+class CapabilityTranslation extends FakeTranslation {
+  override readonly capabilities: TranslationCapabilities;
+
+  constructor(capabilities: TranslationCapabilities) {
+    super();
+    this.capabilities = capabilities;
+  }
+}
+
 class BatchTranslation implements TranslationPort {
+  readonly capabilities = TEST_CAPABILITIES;
   readonly completedBatches: AudioFrame[][] = [];
   readonly prepared: LaneContext[] = [];
   readonly closedSessions: string[] = [];
@@ -166,22 +212,31 @@ class BatchTranslation implements TranslationPort {
     this.completedBatches.push(batch);
     const last = batch.at(-1);
     if (last !== undefined && !request.signal.aborted) {
-      yield { type: "terminology", sessionId: request.context.sessionId, lane: request.context.lane, generation: request.context.generation, emittedAtMs: performance.now(), status: "bound", glossaryHash: "test-hash", entryIds: ["term-1"], text: "bound", guaranteedTargetExact: [] };
-      yield { type: "terminology", sessionId: request.context.sessionId, lane: request.context.lane, generation: request.context.generation, emittedAtMs: performance.now(), status: "authorized", glossaryHash: "test-hash", entryIds: ["term-1"], text: "target exact", guaranteedTargetExact: ["target exact"] };
+      yield { kind: "terminology", sessionId: request.context.sessionId, lane: request.context.lane, generation: request.context.generation, turnId: request.context.turnId, segmentId: "term-0", revision: 1, finality: "final", emittedAtMs: performance.now(), status: "bound", glossaryHash: "test-hash", entryIds: ["term-1"], text: "bound", guaranteedTargetExact: [] };
+      yield { kind: "terminology", sessionId: request.context.sessionId, lane: request.context.lane, generation: request.context.generation, turnId: request.context.turnId, segmentId: "term-1", revision: 1, finality: "final", emittedAtMs: performance.now(), status: "authorized", glossaryHash: "test-hash", entryIds: ["term-1"], text: "target exact", guaranteedTargetExact: ["target exact"] };
       yield {
-        type: "target_transcript_delta",
+        kind: "target_transcript",
         sessionId: request.context.sessionId,
         lane: request.context.lane,
         generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "target-0",
+        revision: 1,
+        finality: "final",
         emittedAtMs: performance.now(),
-        delta: "translated batch",
+        text: "translated batch",
       };
       yield {
-        type: "audio",
+        kind: "audio",
         sessionId: request.context.sessionId,
         lane: request.context.lane,
         generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "audio-0",
+        revision: 1,
+        finality: "final",
         emittedAtMs: performance.now(),
+        playoutSequence: last.sequence,
         frame: createAudioFrame({ ...last, generation: request.context.generation }),
       };
     }
@@ -193,6 +248,72 @@ class BatchTranslation implements TranslationPort {
   }
 
 }
+
+class RevisionTranslation implements TranslationPort {
+  readonly capabilities = TEST_CAPABILITIES;
+
+  async prepare(_context: LaneContext): Promise<void> {}
+
+  async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
+    for await (const frame of request.frames) {
+      const base = {
+        sessionId: request.context.sessionId,
+        lane: request.context.lane,
+        generation: request.context.generation,
+        turnId: request.context.turnId,
+        emittedAtMs: performance.now(),
+      } as const;
+      yield { ...base, kind: "source_transcript", segmentId: "source-1", revision: 0, finality: "provisional", text: "hel" };
+      yield { ...base, kind: "source_transcript", segmentId: "source-1", revision: 1, finality: "final", text: "hello" };
+      yield { ...base, kind: "source_transcript", segmentId: "source-1", revision: 2, finality: "final", text: "must be ignored" };
+      for (const playoutSequence of [1, 1, 0, 2]) {
+        yield {
+          ...base,
+          kind: "audio",
+          segmentId: "audio-1",
+          revision: playoutSequence,
+          finality: "provisional",
+          playoutSequence,
+          frame: createAudioFrame({ ...frame, generation: request.context.generation }),
+        };
+      }
+      return;
+    }
+  }
+
+  async cancel(_generation: GenerationRef): Promise<void> {}
+  async closeSession(_sessionId: string): Promise<void> {}
+}
+
+class SegmentReuseTranslation implements TranslationPort {
+  readonly capabilities = TEST_CAPABILITIES;
+  #turn = 0;
+
+  async prepare(_context: LaneContext): Promise<void> {}
+
+  async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
+    for await (const _frame of request.frames) {
+      this.#turn += 1;
+      yield {
+        kind: "source_transcript",
+        sessionId: request.context.sessionId,
+        lane: request.context.lane,
+        generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "adapter-reused-segment",
+        revision: 0,
+        finality: "final",
+        emittedAtMs: performance.now(),
+        text: "turn " + this.#turn,
+      };
+      return;
+    }
+  }
+
+  async cancel(_generation: GenerationRef): Promise<void> {}
+  async closeSession(_sessionId: string): Promise<void> {}
+}
+
 class PrepareFailureTranslation extends FakeTranslation {
   override async prepare(context: LaneContext): Promise<void> {
     if (context.lane === "B_TO_A") throw new Error("prepare failed");
@@ -227,15 +348,17 @@ function makeRelay(media: FakeMedia, translation: TranslationPort, evidence: Fak
 async function readySession(
   relay: ModularGuardedDuplexRelay,
   media: FakeMedia,
-  profile: "deterministic_test" | "glossary_controlled" = "deterministic_test",
+  mode: "fast" | "accurate" = "fast",
   glossary?: GlossarySpec,
+  maxQueueFrames: number | null = 10,
 ): Promise<{ events: SessionEvent[]; collector: Promise<void> }> {
   const snapshot = await relay.open({
     sideA: { language: "en-US" },
     sideB: { language: "zh-TW" },
-    profile,
+    provider: "palabra",
+    mode,
     ...(glossary === undefined ? {} : { glossary }),
-    maxQueueFrames: 10,
+    ...(maxQueueFrames === null ? {} : { maxQueueFrames }),
   });
   const events: SessionEvent[] = [];
   const collector = (async () => {
@@ -281,6 +404,55 @@ function audioEvent(side: Side, sequence: number): Extract<MediaIngressEvent, { 
 }
 
 describe("ModularGuardedDuplexRelay", () => {
+  it("rejects provider, mode, and glossary capability mismatches before opening a session", async () => {
+    const media = new FakeMedia();
+    const baseSpec = {
+      sideA: { language: "en-US" },
+      sideB: { language: "zh-TW" },
+      provider: "palabra",
+      mode: "fast",
+    } as const;
+    const mismatchRelay = makeRelay(media, new CapabilityTranslation({
+      ...TEST_CAPABILITIES,
+      providerId: "openai_native",
+    }), new FakeEvidence());
+    await assert.rejects(mismatchRelay.open(baseSpec), /provider does not match/u);
+
+    const unsupportedRelay = makeRelay(media, new CapabilityTranslation({
+      ...TEST_CAPABILITIES,
+      supportedModes: [{ mode: "accurate", behaviorVersion: 1, deterministicGlossary: true }],
+    }), new FakeEvidence());
+    await assert.rejects(unsupportedRelay.open(baseSpec), /mode is not supported/u);
+
+    const palabraAccurateRelay = makeRelay(media, new CapabilityTranslation({
+      ...TEST_CAPABILITIES,
+      supportedModes: [{ mode: "accurate", behaviorVersion: 1, deterministicGlossary: false }],
+      supportsDeterministicGlossary: false,
+    }), new FakeEvidence());
+    const accurateSnapshot = await palabraAccurateRelay.open({ ...baseSpec, mode: "accurate" });
+    await palabraAccurateRelay.command(accurateSnapshot.sessionId, {
+      type: "end",
+      commandId: "end-palabra-accurate",
+    });
+
+    const glossaryRelay = makeRelay(media, new CapabilityTranslation({
+      ...TEST_CAPABILITIES,
+      supportedModes: [{ mode: "accurate", behaviorVersion: 1, deterministicGlossary: false }],
+      supportsDeterministicGlossary: false,
+    }), new FakeEvidence());
+    await assert.rejects(glossaryRelay.open({
+      ...baseSpec,
+      mode: "accurate",
+      glossary: {
+        id: "terms",
+        version: "v1",
+        sourceLanguage: "en-US",
+        targetLanguage: "zh-TW",
+        entries: [{ id: "part", source: "part", aliases: [], targetExact: "component" }],
+      },
+    }), /does not support deterministic glossary/u);
+  });
+
   it("prepares both lanes before activation and closes the provider on end", async () => {
     const media = new FakeMedia();
     const translation = new FakeTranslation();
@@ -355,7 +527,8 @@ describe("ModularGuardedDuplexRelay", () => {
     const snapshot = await relay.open({
       sideA: { language: "en-US" },
       sideB: { language: "zh-TW" },
-      profile: "deterministic_test",
+      provider: "palabra",
+      mode: "fast",
     });
     const events: SessionEvent[] = [];
     const collector = (async () => {
@@ -474,7 +647,7 @@ describe("ModularGuardedDuplexRelay", () => {
 
     media.push(audioEvent("A", 2));
     await waitUntil(() => media.played.B.length === 2, "post-cut audio was not played");
-    assert.equal(media.played.B[1]?.generation, 2);
+    assert.equal(media.played.B[1]?.generation, 1);
 
     await relay.command("session-1", { type: "end", commandId: "end-2" });
     await collector;
@@ -485,7 +658,7 @@ describe("ModularGuardedDuplexRelay", () => {
     const translation = new BatchTranslation();
     const evidence = new FakeEvidence();
     const relay = makeRelay(media, translation, evidence);
-    const { events, collector } = await readySession(relay, media, "glossary_controlled");
+    const { events, collector } = await readySession(relay, media, "accurate");
     await relay.command("session-1", { type: "start", commandId: "start-batch" });
 
     media.push({
@@ -513,6 +686,23 @@ describe("ModularGuardedDuplexRelay", () => {
     await collector;
   });
 
+  it("uses the accurate behavior buffer budget when no queue limit is explicitly configured", async () => {
+    const media = new FakeMedia();
+    const translation = new BatchTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { collector } = await readySession(relay, media, "accurate", undefined, null);
+    await relay.command("session-1", { type: "start", commandId: "start-accurate-buffer" });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    for (let sequence = 1; sequence <= 26; sequence += 1) media.push(audioEvent("A", sequence));
+    media.push({ type: "speech_ended", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    await waitUntil(() => translation.completedBatches.length === 1, "accurate utterance was not committed");
+    assert.equal(translation.completedBatches[0]?.length, 26);
+
+    await relay.command("session-1", { type: "end", commandId: "end-accurate-buffer" });
+    await collector;
+  });
+
   it("pins the approved glossary pair in both translation directions", async () => {
     const media = new FakeMedia();
     const translation = new BatchTranslation();
@@ -533,7 +723,7 @@ describe("ModularGuardedDuplexRelay", () => {
     const { collector } = await readySession(
       relay,
       media,
-      "glossary_controlled",
+      "accurate",
       glossary,
     );
     await relay.command("session-1", { type: "start", commandId: "start-directions" });
@@ -603,10 +793,213 @@ describe("ModularGuardedDuplexRelay", () => {
 
     media.push(audioEvent("A", 2));
     await waitUntil(() => media.played.B.length === 1, "new generation did not resume");
-    assert.equal(media.played.B[0]?.generation, 2);
+    assert.equal(media.played.B[0]?.generation, 1);
 
     await relay.command("session-1", { type: "end", commandId: "end-3" });
     await collector;
+  });
+
+  it("starts a fresh same-generation turn after speech end while the prior adapter is still draining", async () => {
+    const media = new FakeMedia();
+    const translation = new FakeTranslation(true);
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-back-to-back" });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    media.push(audioEvent("A", 1));
+    await waitUntil(() => translation.captured.length === 1, "first utterance did not reach the adapter");
+    media.push({ type: "speech_ended", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    media.push(audioEvent("A", 2));
+    await waitUntil(() => translation.captured.length === 2, "second utterance was lost behind the closed input");
+    translation.release();
+    await waitUntil(() => media.played.B.length === 1, "second utterance did not produce playout");
+    assert.equal(media.played.B[0]?.sequence, 2);
+
+    await relay.command("session-1", { type: "end", commandId: "end-back-to-back" });
+    await collector;
+  });
+
+  it("keeps reused adapter segment IDs independent across same-generation turns", async () => {
+    const media = new FakeMedia();
+    const relay = makeRelay(media, new SegmentReuseTranslation(), new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-segment-reuse" });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    media.push(audioEvent("A", 1));
+    await waitUntil(
+      () => events.some((event) => event.type === "source_transcript" && event.text === "turn 1"),
+      "first reused segment was not emitted",
+    );
+    media.push({ type: "speech_ended", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    media.push(audioEvent("A", 2));
+    await waitUntil(
+      () => events.some((event) => event.type === "source_transcript" && event.text === "turn 2"),
+      "second reused segment was suppressed by the first turn finality",
+    );
+    const source = events.filter(
+      (event): event is SessionEvent & { type: "source_transcript"; text: string; turnId: string } =>
+        event.type === "source_transcript",
+    );
+    assert.deepEqual(source.map((event) => event.text), ["turn 1", "turn 2"]);
+    assert.notEqual(source[0]?.turnId, source[1]?.turnId);
+
+    await relay.command("session-1", { type: "end", commandId: "end-segment-reuse" });
+    await collector;
+  });
+
+  it("replaces transcript segments, makes final revisions terminal, and drops stale audio sequences", async () => {
+    const media = new FakeMedia();
+    const relay = makeRelay(media, new RevisionTranslation(), new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-revisions" });
+    media.push(audioEvent("A", 1));
+
+    await waitUntil(() => media.played.B.length === 2, "ordered audio was not played");
+    const source = events.filter(
+      (event): event is SessionEvent & { type: "source_transcript"; text: string; revision: number } =>
+        event.type === "source_transcript",
+    );
+    assert.deepEqual(source.map((event) => event.text), ["hel", "hello"]);
+    assert.deepEqual(source.map((event) => event.revision), [0, 1]);
+    assert.deepEqual(media.played.B.map((frame) => frame.sequence), [1, 2]);
+
+    await relay.command("session-1", { type: "end", commandId: "end-revisions" });
+    await collector;
+  });
+
+  it("barge-in clears only the interrupted destination while both lanes remain capturable", async () => {
+    const media = new FakeMedia();
+    const evidence = new FakeEvidence();
+    const relay = makeRelay(media, new FakeTranslation(), evidence);
+    const { collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-barge-lanes" });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    media.push(audioEvent("A", 1));
+    await waitUntil(() => media.played.B.length === 1, "A-to-B audio was not played");
+    const beforeBargeIn = media.clears.length;
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "B", timestampMonoMs: performance.now() });
+    await waitUntil(() => media.clears.length === beforeBargeIn + 1, "barge-in clear was not issued");
+    assert.equal(media.clears.at(-1)?.lane, "A_TO_B");
+    assert.equal(media.clears.at(-1)?.side, "B");
+
+    media.push(audioEvent("A", 2));
+    media.push(audioEvent("B", 1));
+    await waitUntil(
+      () => evidence.records.some((record) => record.type === "audio" && record.track === "source_b"),
+      "B ingress was not captured after barge-in",
+    );
+    assert.equal(evidence.records.some((record) => record.type === "audio" && record.track === "source_a"), true);
+
+    await relay.command("session-1", { type: "end", commandId: "end-barge-lanes" });
+    await collector;
+  });
+
+  it("resets only the disconnected side's source evidence cursor on reconnect", async () => {
+    const media = new FakeMedia();
+    const evidence = new FakeEvidence();
+    const relay = makeRelay(media, new FakeTranslation(), evidence);
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-reconnect-evidence" });
+
+    media.push(audioEvent("A", 0));
+    media.push(audioEvent("B", 0));
+    await waitUntil(
+      () => evidence.records.filter(
+        (record) => record.type === "audio" && (record.track === "source_a" || record.track === "source_b"),
+      ).length === 2,
+      "initial source evidence was not captured",
+    );
+
+    media.push({ type: "participant_state", sessionId: "session-1", side: "A", timestampMonoMs: performance.now(), connected: false });
+    media.push({ type: "participant_state", sessionId: "session-1", side: "A", timestampMonoMs: performance.now(), connected: true });
+    media.push(audioEvent("A", 0));
+    await waitUntil(
+      () => evidence.records.filter((record) => record.type === "audio" && record.track === "source_a").length === 2,
+      "reconnected source frame was not captured as evidence",
+    );
+    assert.equal(
+      events.some(
+        (event) => event.type === "alert" &&
+          event.lane === "A_TO_B" &&
+          event.alert.code === "invalid_source_sequence",
+      ),
+      false,
+    );
+
+    media.push(audioEvent("B", 0));
+    await waitUntil(
+      () => events.some(
+        (event) => event.type === "alert" &&
+          event.lane === "B_TO_A" &&
+          event.alert.code === "invalid_source_sequence",
+      ),
+      "other participant source evidence cursor was reset",
+    );
+    assert.equal(
+      evidence.records.filter((record) => record.type === "audio" && record.track === "source_b").length,
+      1,
+    );
+
+    await relay.command("session-1", { type: "end", commandId: "end-reconnect-evidence" });
+    await collector;
+  });
+
+  it("bounds and purges playout metadata when playback stalls, cuts, or disconnects", async () => {
+    const media = new StalledMedia();
+    const translation = new FakeTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-stalled-playout" });
+
+    for (let sequence = 1; sequence <= 100; sequence += 1) {
+      media.push(audioEvent("A", sequence));
+      await waitUntil(() => translation.captured.length >= sequence, "stalled playout did not receive source frames");
+    }
+    assert.ok(relay.playoutMetadataCount("session-1", "A_TO_B") <= 10);
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "B", timestampMonoMs: performance.now() });
+    await waitUntil(() => media.clears.some((clear) => clear.lane === "A_TO_B"), "cut did not clear stalled destination");
+    assert.equal(relay.playoutMetadataCount("session-1", "A_TO_B"), 0);
+
+    for (let sequence = 101; sequence <= 200; sequence += 1) {
+      media.push(audioEvent("A", sequence));
+      await waitUntil(() => translation.captured.length >= sequence, "post-cut frames were not translated");
+    }
+    assert.ok(relay.playoutMetadataCount("session-1", "A_TO_B") <= 10);
+    media.push({ type: "participant_state", sessionId: "session-1", side: "B", timestampMonoMs: performance.now(), connected: false });
+    await waitUntil(() => relay.playoutMetadataCount("session-1", "A_TO_B") === 0, "disconnect did not purge destination metadata");
+
+    await relay.command("session-1", { type: "end", commandId: "end-stalled-playout" });
+    await collector;
+  });
+
+  it("releases settled lane tasks instead of retaining one promise per completed turn", async () => {
+    const media = new FakeMedia();
+    const relay = makeRelay(media, new FakeTranslation(), new FakeEvidence());
+    const { collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-task-retention" });
+
+    for (let sequence = 1; sequence <= 25; sequence += 1) {
+      media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+      media.push(audioEvent("A", sequence));
+      media.push({ type: "speech_ended", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+      await waitUntil(
+        () => relay.backgroundTaskCount("session-1") === 3,
+        "completed turn task was retained in the relay background set",
+      );
+    }
+
+    await relay.command("session-1", { type: "end", commandId: "end-task-retention" });
+    await collector;
+    assert.equal(relay.backgroundTaskCount("session-1"), 0);
   });
 
   it("bounds retained closed sessions while keeping the newest event history", async () => {
@@ -628,7 +1021,8 @@ describe("ModularGuardedDuplexRelay", () => {
     const spec = {
       sideA: { language: "en-US" },
       sideB: { language: "zh-TW" },
-      profile: "deterministic_test",
+      provider: "palabra",
+      mode: "fast",
     } as const;
 
     const first = await relay.open(spec);

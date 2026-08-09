@@ -75,14 +75,11 @@
             </div>
 
             <label class="field">
-              <span>Translation profile</span>
-              <select id="translation-profile" name="translationProfile">
-                <option value="glossary_controlled">Glossary controlled</option>
-                <option value="native_live_baseline">Native live baseline</option>
-                <option value="palabra_live">Palabra live</option>
-                <option value="deterministic_test">Deterministic test</option>
+              <span>Translation mode <span id="translation-provider" class="quiet-badge">Loading provider&hellip;</span></span>
+              <select id="translation-mode" name="translationMode" disabled>
+                <option>Checking available modes&hellip;</option>
               </select>
-              <small>Controls the translation and voice pipeline used by both lanes.</small>
+              <small id="translation-mode-detail" aria-live="polite">The server will show the behavior and any known trade-offs for this mode.</small>
             </label>
 
             <label class="consent-check">
@@ -127,6 +124,7 @@
               <p class="eyebrow">Live room</p>
               <h2 id="dashboard-title">Conversation console</h2>
               <p class="session-reference">Session <code id="session-id">&mdash;</code></p>
+              <p id="session-translation" class="session-reference">Translation behavior will be pinned before the room starts.</p>
             </div>
             <div class="dashboard-actions">
               <span id="recording-badge" class="recording-badge is-off"><span></span><span id="recording-label">Recording off</span></span>
@@ -230,6 +228,8 @@
                 <article class="caption-card"><span>Your speech</span><p id="participant-source-caption" aria-live="polite">Listening&hellip;</p></article>
                 <article class="caption-card translated-caption"><span>Translated conversation &middot; AI voice</span><p id="participant-target-caption" aria-live="polite">Waiting for the other speaker&hellip;</p></article>
               </div>
+
+              <p id="participant-live-status" class="call-status" role="status" aria-live="polite">Translation audio remains live while room updates arrive.</p>
 
               <div class="call-footer">
                 <div class="playback-state"><span></span><span id="playback-label">Translated audio ready</span></div>

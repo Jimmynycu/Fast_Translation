@@ -8,6 +8,7 @@ import type { CompiledGlossary, GlossaryAlert } from "../../core/glossary.js";
 import type {
   GenerationRef,
   LaneContext,
+  TranslationCapabilities,
   TranslationErrorEvent,
   TranslationEvent,
   TranslationPort,
@@ -98,6 +99,19 @@ export interface ControlledTranslationAdapterOptions {
   readonly now?: () => number;
 }
 
+export const CONTROLLED_TRANSLATION_CAPABILITIES: TranslationCapabilities = Object.freeze({
+  providerId: "openai_controlled",
+  supportedModes: Object.freeze([Object.freeze({
+    mode: "accurate",
+    behaviorVersion: 1,
+    deterministicGlossary: true,
+  })]),
+  supportsProvisionalRevisions: true,
+  supportsFinality: true,
+  supportsCancellation: true,
+  supportsDeterministicGlossary: true,
+});
+
 function isCanonicalTtsFormat(value: unknown): value is CanonicalAudioFormat {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
@@ -106,7 +120,29 @@ function isCanonicalTtsFormat(value: unknown): value is CanonicalAudioFormat {
   );
 }
 
+function assertControlledContext(context: LaneContext): void {
+  const mode = CONTROLLED_TRANSLATION_CAPABILITIES.supportedModes.find(
+    (candidate) =>
+      candidate.mode === context.behavior.mode &&
+      candidate.behaviorVersion === context.behavior.version,
+  );
+  if (mode === undefined) {
+    throw new TypeError("Controlled glossary translation requires accurate behavior");
+  }
+  if (context.glossary !== undefined && !mode.deterministicGlossary) {
+    throw new TypeError(
+      "Controlled glossary translation cannot authorize this behavior's glossary",
+    );
+  }
+}
+
+/**
+ * A deep final-turn glossary module: raw provider streaming stays behind the
+ * transcriber/translator/TTS adapters, while callers receive only normalized
+ * revisions and a target transcript that has passed the target_exact barrier.
+ */
 export class ControlledTranslationAdapter implements TranslationPort {
+  readonly capabilities = CONTROLLED_TRANSLATION_CAPABILITIES;
   readonly #transcriber: ControlledTranscriptionPort;
   readonly #translator: ControlledTextTranslationPort;
   readonly #tts: ControlledTtsPort;
@@ -135,15 +171,20 @@ export class ControlledTranslationAdapter implements TranslationPort {
     this.#now = options.now ?? (() => performance.now());
   }
 
-  async prepare(_context: LaneContext): Promise<void> {}
+  async prepare(context: LaneContext): Promise<void> {
+    assertControlledContext(context);
+  }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
+    assertControlledContext(request.context);
     const key = generationKey(request.context);
     this.#active.get(key)?.abort();
     const controller = new AbortController();
     this.#active.set(key, controller);
     const signal = AbortSignal.any([request.signal, controller.signal]);
-    let emittedSourceDelta = false;
+    let sourceSegmentId: string | undefined;
+    let sourceText = "";
+    let sourceRevision = 0;
 
     try {
       const keywords = glossaryKeywords(request.context);
@@ -163,28 +204,42 @@ export class ControlledTranslationAdapter implements TranslationPort {
             event.error.message,
             event.error.retryable,
             this.#now(),
+            "transcription-error",
           );
           continue;
         }
+
+        const nextSegmentId = "source:" + event.itemId;
+        if (sourceSegmentId !== nextSegmentId) {
+          sourceSegmentId = nextSegmentId;
+          sourceText = "";
+          sourceRevision = 0;
+        }
         if (event.type === "transcript_delta") {
-          emittedSourceDelta = true;
-          yield {
-            type: "source_transcript_delta",
-            ...generationFields(request.context),
-            emittedAtMs: event.emittedAtMs,
-            delta: event.delta,
-          };
+          sourceText += event.delta;
+          yield transcriptEvent(
+            request.context,
+            "source_transcript",
+            sourceSegmentId,
+            sourceRevision,
+            "provisional",
+            sourceText,
+            event.emittedAtMs,
+          );
+          sourceRevision += 1;
           continue;
         }
 
-        if (!emittedSourceDelta) {
-          yield {
-            type: "source_transcript_delta",
-            ...generationFields(request.context),
-            emittedAtMs: event.emittedAtMs,
-            delta: event.transcript,
-          };
-        }
+        sourceText = event.transcript;
+        yield transcriptEvent(
+          request.context,
+          "source_transcript",
+          sourceSegmentId,
+          sourceRevision,
+          "final",
+          sourceText,
+          event.emittedAtMs,
+        );
         yield* this.#translateTranscript(request, event, signal);
       }
     } catch {
@@ -195,17 +250,14 @@ export class ControlledTranslationAdapter implements TranslationPort {
           "Speech transcription failed; the turn could not be translated.",
           true,
           this.#now(),
+          "transcription-failed",
         );
       }
     } finally {
       if (this.#active.get(key) === controller) this.#active.delete(key);
     }
 
-    yield {
-      type: "completed",
-      ...generationFields(request.context),
-      emittedAtMs: this.#now(),
-    };
+    yield completedEvent(request.context, this.#now());
   }
 
   async cancel(generation: GenerationRef): Promise<void> {
@@ -217,14 +269,15 @@ export class ControlledTranslationAdapter implements TranslationPort {
       // The local abort fence is authoritative; provider cancellation is best effort.
     }
   }
-  async closeSession(_sessionId: string): Promise<void> {}
 
+  async closeSession(_sessionId: string): Promise<void> {}
 
   async *#translateTranscript(
     request: TranslationRequest,
     event: ControlledTranscriptCompletedEvent,
     signal: AbortSignal,
   ): AsyncIterable<TranslationEvent> {
+    const terminologySegmentId = "terminology:" + event.itemId;
     if (
       event.confidence !== undefined &&
       event.confidence < this.#minimumConfidence
@@ -235,6 +288,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
         "Speech transcription confidence was below the configured threshold.",
         false,
         this.#now(),
+        terminologySegmentId + ":confidence",
       );
     }
 
@@ -252,6 +306,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
         "The pinned glossary does not match this translation direction.",
         false,
         this.#now(),
+        terminologySegmentId + ":direction",
       );
     }
 
@@ -262,25 +317,30 @@ export class ControlledTranslationAdapter implements TranslationPort {
     if (nearMisses.length > 0) {
       yield errorEvent(
         request.context,
-        "TRANSCRIPTION_LOW_CONFIDENCE",
-        "Possible terminology near miss: " + nearMisses.join(", "),
+        "GLOSSARY_UNKNOWN_OR_AMBIGUOUS_TERM",
+        "Possible unknown or ambiguous terminology near approved terms: " + nearMisses.join(", "),
         false,
+        this.#now(),
+        terminologySegmentId + ":uncertain",
+      );
+    }
+
+    const bound = activeGlossary?.bind(event.transcript);
+    if (bound !== undefined && bound.bindings.length > 0) {
+      yield terminologyEvent(
+        request.context,
+        terminologySegmentId,
+        0,
+        "provisional",
+        "bound",
+        bound.glossaryHash,
+        bound.bindings.map((binding) => binding.entryId),
+        bound.text,
+        [],
         this.#now(),
       );
     }
-    const bound = activeGlossary?.bind(event.transcript);
-    if (bound !== undefined && bound.bindings.length > 0) {
-      yield {
-        type: "terminology",
-        ...generationFields(request.context),
-        emittedAtMs: this.#now(),
-        status: "bound",
-        glossaryHash: bound.glossaryHash,
-        entryIds: bound.bindings.map((binding) => binding.entryId),
-        text: bound.text,
-        guaranteedTargetExact: [],
-      };
-    }
+
     let targetText: string;
     try {
       const translated = await this.#translator.translate({
@@ -298,44 +358,75 @@ export class ControlledTranslationAdapter implements TranslationPort {
       } else {
         const authorized = activeGlossary.authorize(translated, bound);
         if (bound.bindings.length > 0) {
-          yield {
-            type: "terminology",
-            ...generationFields(request.context),
-            emittedAtMs: this.#now(),
-            status: authorized.status,
-            glossaryHash: bound.glossaryHash,
-            entryIds: bound.bindings.map((binding) => binding.entryId),
-            text: authorized.text,
-            guaranteedTargetExact: authorized.guaranteedTargetExact,
-          };
+          yield terminologyEvent(
+            request.context,
+            terminologySegmentId,
+            1,
+            "final",
+            authorized.status,
+            bound.glossaryHash,
+            bound.bindings.map((binding) => binding.entryId),
+            authorized.text,
+            authorized.guaranteedTargetExact,
+            this.#now(),
+          );
         }
         targetText = authorized.text;
         for (const alert of authorized.alerts) {
-          yield glossaryError(request.context, alert, this.#now());
+          yield glossaryError(
+            request.context,
+            alert,
+            this.#now(),
+            terminologySegmentId + ":" + alert.code,
+          );
         }
       }
     } catch {
       if (signal.aborted) return;
       targetText = event.transcript;
+      if (bound !== undefined && bound.bindings.length > 0) {
+        yield terminologyEvent(
+          request.context,
+          terminologySegmentId,
+          1,
+          "final",
+          "bypassed",
+          bound.glossaryHash,
+          bound.bindings.map((binding) => binding.entryId),
+          targetText,
+          [],
+          this.#now(),
+        );
+      }
       yield errorEvent(
         request.context,
-        "TEXT_TRANSLATION_FAILED",
-        "Text translation failed; source speech is used as the uninterrupted fallback.",
+        bound !== undefined && bound.bindings.length > 0
+          ? "GLOSSARY_BYPASSED_TRANSLATION_FALLBACK"
+          : "TEXT_TRANSLATION_FALLBACK",
+        bound !== undefined && bound.bindings.length > 0
+          ? "Text translation failed; glossary target_exact authorization was bypassed and source speech will play uninterrupted."
+          : "Text translation failed; source speech will play as an uninterrupted fallback.",
         true,
         this.#now(),
+        "translation-fallback:" + event.itemId,
       );
     }
     if (signal.aborted) return;
 
-    yield {
-      type: "target_transcript_delta",
-      ...generationFields(request.context),
-      emittedAtMs: this.#now(),
-      delta: targetText,
-    };
+    // This final target event is the commit barrier: terminology-bound output
+    // is never released to target playout before authorization/reinsertion.
+    yield transcriptEvent(
+      request.context,
+      "target_transcript",
+      "target:" + event.itemId,
+      0,
+      "final",
+      targetText,
+      this.#now(),
+    );
 
     try {
-      yield* this.#synthesize(targetText, request.context, signal);
+      yield* this.#synthesize(targetText, request.context, event.itemId, signal);
     } catch {
       if (!signal.aborted) {
         yield errorEvent(
@@ -344,6 +435,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
           "Speech synthesis failed after target text was produced.",
           true,
           this.#now(),
+          "tts-failed:" + event.itemId,
         );
       }
     }
@@ -351,7 +443,8 @@ export class ControlledTranslationAdapter implements TranslationPort {
 
   async *#synthesize(
     text: string,
-    generation: GenerationRef,
+    generation: LaneContext,
+    itemId: string,
     signal: AbortSignal,
   ): AsyncIterable<TranslationEvent> {
     let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -365,34 +458,14 @@ export class ControlledTranslationAdapter implements TranslationPort {
       while (pending.byteLength >= CANONICAL_AUDIO.bytesPerFrame) {
         const pcm16le = pending.slice(0, CANONICAL_AUDIO.bytesPerFrame);
         pending = pending.slice(CANONICAL_AUDIO.bytesPerFrame);
-        yield {
-          type: "audio",
-          ...generationFields(generation),
-          emittedAtMs: this.#now(),
-          frame: createAudioFrame({
-            ...generationFields(generation),
-            sequence,
-            capturedAtMs: this.#now(),
-            pcm16le,
-          }),
-        };
+        yield audioEvent(generation, itemId, sequence, pcm16le, this.#now());
         sequence += 1;
       }
     }
     if (pending.byteLength > 0 && !signal.aborted) {
       const pcm16le = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame);
       pcm16le.set(pending);
-      yield {
-        type: "audio",
-        ...generationFields(generation),
-        emittedAtMs: this.#now(),
-        frame: createAudioFrame({
-          ...generationFields(generation),
-          sequence,
-          capturedAtMs: this.#now(),
-          pcm16le,
-        }),
-      };
+      yield audioEvent(generation, itemId, sequence, pcm16le, this.#now());
     }
   }
 }
@@ -409,15 +482,82 @@ async function* transcriptionInput(
     yield {
       type: "speech_end",
       ...generationFields(request.context),
-      turnId: "turn-" + request.context.generation,
+      turnId: request.context.turnId,
     };
   }
 }
 
+function transcriptEvent(
+  generation: LaneContext,
+  kind: "source_transcript" | "target_transcript",
+  segmentId: string,
+  revision: number,
+  finality: "provisional" | "final",
+  text: string,
+  emittedAtMs: number,
+): TranslationEvent {
+  return {
+    kind,
+    ...eventFields(generation, segmentId, revision, finality, emittedAtMs),
+    text,
+  };
+}
+
+function terminologyEvent(
+  generation: LaneContext,
+  segmentId: string,
+  revision: number,
+  finality: "provisional" | "final",
+  status: "bound" | "authorized" | "bypassed",
+  glossaryHash: string,
+  entryIds: readonly string[],
+  text: string,
+  guaranteedTargetExact: readonly string[],
+  emittedAtMs: number,
+): TranslationEvent {
+  return {
+    kind: "terminology",
+    ...eventFields(generation, segmentId, revision, finality, emittedAtMs),
+    status,
+    glossaryHash,
+    entryIds: Object.freeze([...entryIds]),
+    text,
+    guaranteedTargetExact: Object.freeze([...guaranteedTargetExact]),
+  };
+}
+
+function audioEvent(
+  generation: LaneContext,
+  itemId: string,
+  sequence: number,
+  pcm16le: Uint8Array,
+  emittedAtMs: number,
+): TranslationEvent {
+  return {
+    kind: "audio",
+    ...eventFields(generation, "audio:" + itemId + ":" + sequence, 0, "final", emittedAtMs),
+    playoutSequence: sequence,
+    frame: createAudioFrame({
+      ...generationFields(generation),
+      sequence,
+      capturedAtMs: emittedAtMs,
+      pcm16le,
+    }),
+  };
+}
+
+function completedEvent(generation: LaneContext, emittedAtMs: number): TranslationEvent {
+  return {
+    kind: "completed",
+    ...eventFields(generation, "completed:" + generation.turnId, 0, "final", emittedAtMs),
+  };
+}
+
 function glossaryError(
-  generation: GenerationRef,
+  generation: LaneContext,
   alert: GlossaryAlert,
   emittedAtMs: number,
+  segmentId: string,
 ): TranslationErrorEvent {
   return errorEvent(
     generation,
@@ -425,21 +565,45 @@ function glossaryError(
     alert.message,
     false,
     emittedAtMs,
+    segmentId,
   );
 }
 
 function errorEvent(
-  generation: GenerationRef,
+  generation: LaneContext,
   code: string,
   message: string,
   retryable: boolean,
   emittedAtMs: number,
+  segmentId: string,
 ): TranslationErrorEvent {
   return {
-    type: "error",
-    ...generationFields(generation),
-    emittedAtMs,
+    kind: "error",
+    ...eventFields(generation, "error:" + segmentId, 0, "final", emittedAtMs),
     error: { code, message, retryable },
+  };
+}
+
+function eventFields(
+  generation: LaneContext,
+  segmentId: string,
+  revision: number,
+  finality: "provisional" | "final",
+  emittedAtMs: number,
+): Readonly<GenerationRef & {
+  readonly turnId: string;
+  readonly segmentId: string;
+  readonly revision: number;
+  readonly finality: "provisional" | "final";
+  readonly emittedAtMs: number;
+}> {
+  return {
+    ...generationFields(generation),
+    turnId: generation.turnId,
+    segmentId,
+    revision,
+    finality,
+    emittedAtMs,
   };
 }
 
@@ -459,7 +623,6 @@ function generationKey(generation: GenerationRef): string {
 function normalizeLanguage(language: string): string {
   return language.trim().toLocaleLowerCase("en-US");
 }
-
 
 function glossaryKeywords(context: LaneContext): readonly string[] {
   if (context.glossary === undefined) return Object.freeze([]);
@@ -487,8 +650,13 @@ function glossaryNearMisses(
   const transcriptTokens = terminologyTokens(transcript);
   const misses = new Set<string>();
   for (const entry of glossary.entries) {
-    for (const candidateText of [entry.source, ...entry.aliases]) {
-      const candidateTokens = terminologyTokens(candidateText);
+    const candidateTokensByTerm = [entry.source, ...entry.aliases].map(terminologyTokens);
+    if (candidateTokensByTerm.some((candidateTokens) =>
+      containsExactTerminologyCandidate(transcriptTokens, candidateTokens)
+    )) {
+      continue;
+    }
+    for (const candidateTokens of candidateTokensByTerm) {
       if (candidateTokens.length === 0 || transcriptTokens.length < candidateTokens.length) {
         continue;
       }
@@ -514,6 +682,25 @@ function glossaryNearMisses(
     if (misses.size >= 3) break;
   }
   return Object.freeze([...misses]);
+}
+
+function containsExactTerminologyCandidate(
+  transcriptTokens: readonly string[],
+  candidateTokens: readonly string[],
+): boolean {
+  if (candidateTokens.length === 0 || transcriptTokens.length < candidateTokens.length) {
+    return false;
+  }
+  for (
+    let index = 0;
+    index <= transcriptTokens.length - candidateTokens.length;
+    index += 1
+  ) {
+    if (candidateTokens.every((token, offset) => transcriptTokens[index + offset] === token)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function terminologyTokens(value: string): readonly string[] {

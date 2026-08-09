@@ -1,6 +1,12 @@
 import { CANONICAL_AUDIO, createAudioFrame, destinationForLane, laneFromSource } from "../core/audio.js";
 import { AsyncQueue } from "../core/async-queue.js";
 import { ModularGuardedDuplexRelay } from "../core/relay.js";
+import {
+  resolveTranslationBehavior,
+  type TranslationBehavior,
+  type TranslationMode,
+  type TranslationProviderId,
+} from "../core/translation-behavior.js";
 import type {
   AudioFrame,
   EvidenceAudioTrack,
@@ -20,6 +26,7 @@ import type {
   TranscriptEvent,
   Side,
   TranslationEvent,
+  TranslationCapabilities,
   TranslationPort,
   TranslationRequest,
 } from "../core/types.js";
@@ -32,16 +39,26 @@ export type LocalHarnessMediaMode = "acknowledge" | "drop_playout_ack";
 
 export interface LocalHarnessExecutionInput {
   readonly run: ExecutableRun;
+  readonly provider: TranslationProviderId;
+  readonly mode: TranslationMode;
+  readonly behavior: TranslationBehavior;
   readonly fixture?: ExecutableFixture;
   readonly schedule?: ExecutableSchedule;
-  readonly profile: HealingProfile;
-  readonly profileHash: string;
+  /** Owner-approved healing material, carried only as an immutable benchmark input. */
+  readonly approvedProfile: HealingProfile;
+  readonly approvedProfileHash: string;
   readonly mediaMode?: LocalHarnessMediaMode;
 }
 
 export type LocalHarnessExecutor = (
   input: LocalHarnessExecutionInput,
 ) => Promise<BenchmarkObservation>;
+
+/**
+ * Sparse positions per direction across the virtual ten-minute timeline.
+ * These are the only PCM frames sent to the local relay for this fixture.
+ */
+const VIRTUAL_SOAK_SAMPLES_PER_LANE = 30;
 
 class MonotonicHarnessClock {
   #value = 1_000;
@@ -224,17 +241,34 @@ class HarnessEvidence implements EvidencePort {
 }
 
 class StreamingEchoTranslation implements TranslationPort {
+  readonly capabilities: TranslationCapabilities = Object.freeze({
+    providerId: "openai_controlled",
+    supportedModes: Object.freeze([
+      Object.freeze({ mode: "fast", behaviorVersion: 1, deterministicGlossary: true }),
+      Object.freeze({ mode: "accurate", behaviorVersion: 1, deterministicGlossary: true }),
+    ]),
+    supportsProvisionalRevisions: true,
+    supportsFinality: true,
+    supportsCancellation: true,
+    supportsDeterministicGlossary: true,
+  });
+
   async prepare(_context: import("../core/types.js").LaneContext): Promise<void> {}
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     for await (const frame of request.frames) {
       if (request.signal.aborted) return;
       yield {
-        type: "audio",
+        kind: "audio",
         sessionId: request.context.sessionId,
         lane: request.context.lane,
         generation: request.context.generation,
+        turnId: request.context.turnId,
+        segmentId: "echo-audio-" + frame.sequence,
+        revision: 0,
+        finality: "final",
         emittedAtMs: frame.capturedAtMs,
+        playoutSequence: frame.sequence,
         frame: createAudioFrame({
           ...frame,
           sessionId: request.context.sessionId,
@@ -260,7 +294,7 @@ interface RunningHarness {
   readonly sessionId: string;
 }
 
-function profileGlossary(profile: HealingProfile, profileHash: string): GlossarySpec {
+function approvedGlossary(profile: HealingProfile, profileHash: string): GlossarySpec {
   if (profile.glossary.length === 0) {
     throw new Error("approved profile under test has no glossary entries");
   }
@@ -292,13 +326,20 @@ async function waitUntil(
 
 async function startHarness(input: Readonly<{
   translation: TranslationPort;
-  profile: HealingProfile;
-  profileHash: string;
+  provider: TranslationProviderId;
+  mode: TranslationMode;
+  behavior: TranslationBehavior;
+  approvedProfile: HealingProfile;
+  approvedProfileHash: string;
   mediaMode?: LocalHarnessMediaMode;
   captureAudio?: boolean;
   holdFirst?: boolean;
   maxQueueFrames?: number;
 }>): Promise<RunningHarness> {
+  const resolvedBehavior = resolveTranslationBehavior(input.mode);
+  if (JSON.stringify(input.behavior) !== JSON.stringify(resolvedBehavior)) {
+    throw new Error("local Harness behavior does not match its explicit mode");
+  }
   const clock = new MonotonicHarnessClock();
   const media = new HarnessMedia({
     clock,
@@ -325,8 +366,9 @@ async function startHarness(input: Readonly<{
   const snapshot = await relay.open({
     sideA: { language: "en-US" },
     sideB: { language: "zh-TW" },
-    profile: "local_eval",
-    glossary: profileGlossary(input.profile, input.profileHash),
+    provider: input.provider,
+    mode: input.mode,
+    glossary: approvedGlossary(input.approvedProfile, input.approvedProfileHash),
     maxQueueFrames: input.maxQueueFrames ?? 64,
   });
   for (const side of ["A", "B"] as const) {
@@ -462,6 +504,27 @@ function uninterruptedPlayout(
   );
 }
 
+function consecutivePlayoutSequence(
+  records: readonly Extract<EvidenceRecord, { type: "audio" }>[],
+): boolean {
+  return records.length > 0 && records.every((record, index) =>
+    index === 0 ||
+    record.frame.sequence === (records[index - 1]?.frame.sequence ?? -1) + 1
+  );
+}
+
+function isFinalTranscript(
+  event: TranscriptEvent | undefined,
+  lane: Lane,
+  type: TranscriptEvent["type"],
+): event is TranscriptEvent {
+  return event !== undefined &&
+    event.type === type &&
+    event.lane === lane &&
+    event.final &&
+    event.text.trim().length > 0;
+}
+
 async function runFixtureObservation(
   input: LocalHarnessExecutionInput,
   fixture: ExecutableFixture,
@@ -482,8 +545,11 @@ async function runFixtureObservation(
   const startedAt = performance.now();
   const harness = await startHarness({
     translation,
-    profile: input.profile,
-    profileHash: input.profileHash,
+    provider: input.provider,
+    mode: input.mode,
+    behavior: input.behavior,
+    approvedProfile: input.approvedProfile,
+    approvedProfileHash: input.approvedProfileHash,
     ...(input.mediaMode === undefined ? {} : { mediaMode: input.mediaMode }),
   });
   try {
@@ -491,11 +557,11 @@ async function runFixtureObservation(
     pushFrame(harness, sourceSide, 0);
     pushSpeech(harness, sourceSide, "speech_ended");
     await waitUntil(
-      () => eventForLane(
-        harness.evidence.events(),
+      () => isFinalTranscript(
+        eventForLane(harness.evidence.events(), lane, "target_transcript"),
         lane,
         "target_transcript",
-      )?.final === true,
+      ),
       input.run.runId + " did not produce a final target transcript",
     );
     await waitUntil(
@@ -509,13 +575,15 @@ async function runFixtureObservation(
     const bound = eventForLane(events, lane, "glossary_bound");
     const authorized = eventForLane(events, lane, "glossary_authorized");
     const playout = harness.evidence.audio(playoutTrack(lane));
+    const playoutSequenceContiguous = consecutivePlayoutSequence(playout);
+    const alerts = Object.freeze([...harness.evidence.alertCodes]);
     const actualTargetText = target?.text.normalize("NFKC") ?? "";
     const targetExactSatisfied = actualTargetText.includes(
       fixture.expectedTargetExact.normalize("NFKC"),
     );
     const entryIds = bound?.entryIds ?? [];
     const matchedSourceTexts = sourceTextsForEntries(
-      input.profile,
+      input.approvedProfile,
       entryIds,
       lane,
     );
@@ -524,7 +592,10 @@ async function runFixtureObservation(
       : bound !== undefined
         ? "bypassed" as const
         : "not_applicable" as const;
-    const uninterrupted = uninterruptedPlayout(playout) &&
+    const uninterrupted = isFinalTranscript(source, lane, "source_transcript") &&
+      isFinalTranscript(target, lane, "target_transcript") &&
+      uninterruptedPlayout(playout) &&
+      playoutSequenceContiguous &&
       !harness.evidence.alertCodes.some((code) =>
         code === "source_queue_trimmed" ||
         code === "playout_queue_trimmed" ||
@@ -550,6 +621,13 @@ async function runFixtureObservation(
         glossaryHash,
         playedFrameCount: playout.length,
         uninterrupted,
+        normalizedEventEvidence: Object.freeze({
+          sourceRevision: source?.revision ?? 0,
+          targetRevision: target?.revision ?? 0,
+          targetFinal: target?.final === true,
+          playoutSequenceContiguous,
+        }),
+        alerts,
         elapsedMs: Math.max(0, performance.now() - startedAt),
       });
     }
@@ -575,6 +653,13 @@ async function runFixtureObservation(
       glossaryHash,
       playedFrameCount: playout.length,
       uninterrupted,
+      normalizedEventEvidence: Object.freeze({
+        sourceRevision: source.revision,
+        targetRevision: target?.revision ?? 0,
+        targetFinal: target?.final === true,
+        playoutSequenceContiguous,
+      }),
+      alerts,
       metricsMs: Object.freeze({
         speechToAligned: Math.max(0, firstPlayoutAt - speechOnset),
         stableSourceToPlayable: Math.max(0, firstPlayoutAt - source.timestampMonoMs),
@@ -606,14 +691,18 @@ async function runInterruptionObservation(
   }
   const harness = await startHarness({
     translation: new StreamingEchoTranslation(),
-    profile: input.profile,
-    profileHash: input.profileHash,
+    provider: input.provider,
+    mode: input.mode,
+    behavior: input.behavior,
+    approvedProfile: input.approvedProfile,
+    approvedProfileHash: input.approvedProfileHash,
     holdFirst: true,
     ...(input.mediaMode === undefined ? {} : { mediaMode: input.mediaMode }),
   });
   try {
     pushSpeech(harness, firstSide, "speech_started");
     pushFrame(harness, firstSide, 0);
+    pushSpeech(harness, firstSide, "speech_ended");
     await waitUntil(
       () => harness.media.hasHeld(),
       input.run.runId + " did not reach held playout",
@@ -635,6 +724,7 @@ async function runInterruptionObservation(
     );
     harness.media.releaseHeld();
     pushFrame(harness, interruptingSide, 0);
+    pushSpeech(harness, interruptingSide, "speech_ended");
     const resumedLane = laneFromSource(interruptingSide);
     const resumedTrack = playoutTrack(resumedLane);
     await waitUntil(
@@ -642,8 +732,6 @@ async function runInterruptionObservation(
         input.mediaMode === "drop_playout_ack",
       input.run.runId + " did not resume valid output",
     );
-    pushSpeech(harness, firstSide, "speech_ended");
-    pushSpeech(harness, interruptingSide, "speech_ended");
 
     const events = harness.evidence.events();
     const clear = harness.media.clears.find((candidate) =>
@@ -677,6 +765,7 @@ async function runInterruptionObservation(
       clearLatencyMs: clear === undefined
         ? Number.POSITIVE_INFINITY
         : Math.max(0, clear.clearedAtMonoMs - interruptionAt),
+      alerts: Object.freeze([...harness.evidence.alertCodes]),
     });
   } finally {
     await endHarness(harness);
@@ -693,36 +782,32 @@ async function runSoakObservation(
   const framesPerLane = Math.floor(
     schedule.durationMs / CANONICAL_AUDIO.frameDurationMs,
   );
-  const expectedFrames = framesPerLane * 2;
+  const virtualFramesRepresented = framesPerLane * 2;
+  const samplesPerLane = Math.min(VIRTUAL_SOAK_SAMPLES_PER_LANE, framesPerLane);
+  const expectedFrames = samplesPerLane * 2;
   const harness = await startHarness({
     translation: new StreamingEchoTranslation(),
-    profile: input.profile,
-    profileHash: input.profileHash,
+    provider: input.provider,
+    mode: input.mode,
+    behavior: input.behavior,
+    approvedProfile: input.approvedProfile,
+    approvedProfileHash: input.approvedProfileHash,
     captureAudio: false,
     maxQueueFrames: 64,
     ...(input.mediaMode === undefined ? {} : { mediaMode: input.mediaMode }),
   });
   try {
-    pushSpeech(harness, "A", "speech_started");
-    pushSpeech(harness, "B", "speech_started");
-    const batchSize = 32;
-    for (let sequence = 0; sequence < framesPerLane; sequence += 1) {
+    // Fast mode accepts frames continuously. Speech lifecycle events would invoke
+    // the barge-in fence and turn this sampled duplex fixture into an interruption
+    // run; the dedicated interruption schedules cover that behavior separately.
+    for (let sample = 0; sample < samplesPerLane; sample += 1) {
+      const sequence = samplesPerLane === 1
+        ? 0
+        : Math.round(sample * (framesPerLane - 1) / (samplesPerLane - 1));
       const capturedAtMs = 10_000 + sequence * CANONICAL_AUDIO.frameDurationMs;
       pushFrame(harness, "A", sequence, capturedAtMs);
       pushFrame(harness, "B", sequence, capturedAtMs);
-      const submitted = (sequence + 1) * 2;
-      if ((sequence + 1) % batchSize === 0 || sequence + 1 === framesPerLane) {
-        await waitUntil(
-          () => harness.evidence.audioCounts.source_a +
-            harness.evidence.audioCounts.source_b >= submitted &&
-            harness.media.playedCounts.A + harness.media.playedCounts.B >= submitted,
-          input.run.runId + " did not drain an accelerated duplex batch",
-          20_000,
-        );
-      }
     }
-    pushSpeech(harness, "A", "speech_ended");
-    pushSpeech(harness, "B", "speech_ended");
     if (input.mediaMode !== "drop_playout_ack") {
       await waitUntil(
         () => harness.evidence.audioCounts.playout_to_a +
@@ -733,22 +818,26 @@ async function runSoakObservation(
     }
     const acceptedPlayout = harness.evidence.audioCounts.playout_to_a +
       harness.evidence.audioCounts.playout_to_b;
-    const queueFinalDepth = Math.max(0, expectedFrames - acceptedPlayout);
+    const unacknowledgedSampleFrames = Math.max(0, expectedFrames - acceptedPlayout);
     const trimmed = harness.evidence.alertCodes.some((code) =>
       code === "source_queue_trimmed" || code === "playout_queue_trimmed"
     );
     return Object.freeze({
       kind: "continuous_duplex",
       scheduleId: schedule.scheduleId,
-      executionMode: "accelerated_virtual_time",
+      executionMode: "sampled_virtual_mechanism",
+      coverageScope: "virtual_mechanism_only",
       virtualDurationMs: schedule.durationMs,
-      processedFrames: harness.evidence.audioCounts.source_a +
+      virtualFramesRepresented,
+      sampleFramesPerLane: samplesPerLane,
+      processedSampleFrames: harness.evidence.audioCounts.source_a +
         harness.evidence.audioCounts.source_b,
-      queueMaximumDepth: harness.media.maxConcurrentPlayback,
-      queueFinalDepth,
-      queueGrowthDetected: trimmed || queueFinalDepth !== 0 ||
+      playbackMaximumConcurrency: harness.media.maxConcurrentPlayback,
+      unacknowledgedSampleFrames,
+      queuePressureDetected: trimmed || unacknowledgedSampleFrames !== 0 ||
         harness.evidence.timelineOrderViolation,
       checksum: harness.media.playbackChecksum,
+      alerts: Object.freeze([...harness.evidence.alertCodes]),
     });
   } finally {
     await endHarness(harness);

@@ -12,10 +12,12 @@ import type {
   SessionSpec,
   Side,
 } from "../src/core/types.js";
+import { resolveTranslationBehavior } from "../src/core/translation-behavior.js";
 import {
   createServerApp,
   mapSessionEvent,
   type BrowserMediaGateway,
+  type ConfiguredTranslation,
   type GlossaryImportResult,
   type GlossaryRegistry,
 } from "../src/server/app.js";
@@ -38,6 +40,33 @@ const glossary: GlossarySpec = {
 const OPERATOR_TOKEN = "operator-test-token-0123456789abcdef";
 const OPERATOR_HEADERS = { authorization: "Bearer " + OPERATOR_TOKEN } as const;
 const PARTICIPANT_SIGNING_KEY = Buffer.alloc(32, 19);
+
+const translation: ConfiguredTranslation = {
+  providerId: "openai_controlled",
+  supportedModes: [
+    {
+      mode: "fast",
+      behaviorVersion: 1,
+      deterministicGlossary: false,
+      degradation: "Provider-local revision behavior is not yet parity-verified.",
+    },
+    {
+      mode: "balanced",
+      behaviorVersion: 1,
+      deterministicGlossary: false,
+    },
+    {
+      mode: "accurate",
+      behaviorVersion: 1,
+      deterministicGlossary: true,
+    },
+  ],
+  supportsProvisionalRevisions: true,
+  supportsFinality: true,
+  supportsCancellation: true,
+  supportsDeterministicGlossary: true,
+  defaultMode: "balanced",
+};
 
 function testAccess(): ServerAccessControl {
   return createServerAccessControl({
@@ -67,6 +96,7 @@ function snapshot(sessionId: string, spec: SessionSpec): SessionSnapshot {
       },
     },
     generations: { A_TO_B: 0, B_TO_A: 0 },
+    behavior: resolveTranslationBehavior(spec.mode),
     ...(spec.glossary === undefined
       ? {}
       : { glossary: { id: spec.glossary.id, version: spec.glossary.version, hash: "hash-v1" } }),
@@ -139,7 +169,8 @@ async function openFakeSession(relay: FakeRelay): Promise<void> {
   await relay.open({
     sideA: { language: "en-US" },
     sideB: { language: "zh-TW" },
-    profile: "deterministic_test",
+    provider: "openai_controlled",
+    mode: "balanced",
   });
 }
 
@@ -189,6 +220,7 @@ async function fixture(
     glossaries,
     browserMedia: media,
     access,
+    translation,
     evidenceHealth: () => evidenceHealth,
   });
   await app.ready();
@@ -310,7 +342,7 @@ describe("server application", () => {
         headers: OPERATOR_HEADERS,
         payload: {
           languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "glossary_controlled",
+          translationMode: "accurate",
           recordingConsent: false,
         },
       });
@@ -322,13 +354,18 @@ describe("server application", () => {
         headers: OPERATOR_HEADERS,
         payload: {
           languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "glossary_controlled",
+          translationMode: "accurate",
           glossaryVersion: "factory-v1",
           recordingConsent: true,
         },
       });
       assert.equal(response.statusCode, 201);
       assert.deepEqual(response.json(), {
+        provider: "openai_controlled",
+        translationMode: "accurate",
+        behaviorVersion: 1,
+        deterministicGlossary: true,
+        degradation: { state: "full" },
         sessionId: "session-1",
         state: "waiting",
         endpointGrants: [
@@ -351,6 +388,8 @@ describe("server application", () => {
       assert.equal(relay.opened[0]?.glossary, glossary);
       assert.equal(relay.opened[0]?.sideA.language, "en-US");
       assert.equal(relay.opened[0]?.sideB.language, "zh-TW");
+      assert.equal(relay.opened[0]?.provider, "openai_controlled");
+      assert.equal(relay.opened[0]?.mode, "accurate");
       const recovered = await app.inject({
         method: "GET",
         url: "/api/sessions/session-1",
@@ -363,7 +402,7 @@ describe("server application", () => {
     }
   });
 
-  it("allows the keyless local evaluation profile to pin a glossary", async () => {
+  it("rejects a pinned glossary when the selected mode cannot guarantee it", async () => {
     const { app, relay } = await fixture();
     try {
       const response = await app.inject({
@@ -372,41 +411,19 @@ describe("server application", () => {
         headers: OPERATOR_HEADERS,
         payload: {
           languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "local_eval",
-          glossaryVersion: "factory-v1",
-          recordingConsent: true,
-        },
-      });
-
-      assert.equal(response.statusCode, 201);
-      assert.equal(relay.opened[0]?.profile, "local_eval");
-      assert.equal(relay.opened[0]?.glossary, glossary);
-    } finally {
-      await app.close();
-    }
-  });
-  it("rejects a pinned glossary for Palabra live", async () => {
-    const { app, relay } = await fixture();
-    try {
-      const response = await app.inject({
-        method: "POST",
-        url: "/api/sessions",
-        headers: OPERATOR_HEADERS,
-        payload: {
-          languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "palabra_live",
+          translationMode: "balanced",
           glossaryVersion: "factory-v1",
           recordingConsent: true,
         },
       });
       assert.equal(response.statusCode, 422);
-      assert.equal(response.json().error.code, "glossary_profile_mismatch");
+      assert.equal(response.json().error.code, "glossary_unsupported");
+      assert.deepEqual(response.json().error.supportedModes, ["accurate"]);
       assert.equal(relay.opened.length, 0);
     } finally {
       await app.close();
     }
   });
-
 
   it("rejects an unknown glossary without opening a relay session", async () => {
     const { app, relay } = await fixture();
@@ -417,7 +434,7 @@ describe("server application", () => {
         headers: OPERATOR_HEADERS,
         payload: {
           languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "glossary_controlled",
+          translationMode: "accurate",
           glossaryVersion: "missing",
           recordingConsent: true,
         },
@@ -430,28 +447,6 @@ describe("server application", () => {
     }
   });
 
-
-  it("rejects a glossary on profiles that do not enforce it", async () => {
-    const { app, relay } = await fixture();
-    try {
-      const response = await app.inject({
-        method: "POST",
-        url: "/api/sessions",
-        headers: OPERATOR_HEADERS,
-        payload: {
-          languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "deterministic_test",
-          glossaryVersion: "factory-v1",
-          recordingConsent: true,
-        },
-      });
-      assert.equal(response.statusCode, 422);
-      assert.equal(response.json().error.code, "glossary_profile_mismatch");
-      assert.equal(relay.opened.length, 0);
-    } finally {
-      await app.close();
-    }
-  });
 
   it("maps HTTP command kinds to relay command types", async () => {
     const { app, relay } = await fixture();
@@ -485,13 +480,33 @@ describe("server application", () => {
         url: "/api/capabilities",
         headers: OPERATOR_HEADERS,
       });
-      assert.deepEqual(capabilities.json().translationProfiles, [
-        "native_live_baseline",
-        "glossary_controlled",
-        "palabra_live",
-        "local_eval",
-        "deterministic_test",
-      ]);
+      assert.deepEqual(capabilities.json().translation, {
+        provider: "openai_controlled",
+        supportedModes: [
+          {
+            mode: "fast",
+            behavior: { version: 1 },
+            deterministicGlossary: false,
+            degradation: {
+              state: "degraded",
+              reason: "Provider-local revision behavior is not yet parity-verified.",
+            },
+          },
+          {
+            mode: "balanced",
+            behavior: { version: 1 },
+            deterministicGlossary: false,
+            degradation: { state: "full" },
+          },
+          {
+            mode: "accurate",
+            behavior: { version: 1 },
+            deterministicGlossary: true,
+            degradation: { state: "full" },
+          },
+        ],
+        defaultMode: "balanced",
+      });
       assert.deepEqual(capabilities.json().glossaryImportFormats, ["csv", "xlsx"]);
       assert.deepEqual(capabilities.json().audio, {
         encoding: "pcm_s16le",
@@ -510,6 +525,7 @@ describe("server application", () => {
       glossaries: new FakeGlossaryRegistry(),
       mediaProfile: "fake_telephony",
       access: testAccess(),
+      translation,
     });
     await app.ready();
     try {
@@ -537,6 +553,7 @@ describe("server application", () => {
         mediaProfile: "fake_telephony",
         browserMedia: new FakeBrowserMedia(),
         access: testAccess(),
+        translation,
       }),
       /must not expose the browser media gateway/u,
     );
@@ -555,16 +572,21 @@ describe("server application", () => {
     }
   });
 
-  it("advertises and accepts only configured translation profiles", async () => {
+  it("advertises and accepts only configured translation modes", async () => {
     const relay = new FakeRelay();
     const glossaries = new FakeGlossaryRegistry();
     const media = new FakeBrowserMedia();
+    const onlyBalanced: ConfiguredTranslation = {
+      ...translation,
+      supportedModes: [translation.supportedModes[1]!],
+      defaultMode: "balanced",
+    };
     const app = await createServerApp({
       relay,
       glossaries,
       browserMedia: media,
       access: testAccess(),
-      translationProfiles: ["deterministic_test"],
+      translation: onlyBalanced,
     });
     await app.ready();
     try {
@@ -573,7 +595,16 @@ describe("server application", () => {
         url: "/api/capabilities",
         headers: OPERATOR_HEADERS,
       });
-      assert.deepEqual(capabilities.json().translationProfiles, ["deterministic_test"]);
+      assert.deepEqual(capabilities.json().translation, {
+        provider: "openai_controlled",
+        supportedModes: [{
+          mode: "balanced",
+          behavior: { version: 1 },
+          deterministicGlossary: false,
+          degradation: { state: "full" },
+        }],
+        defaultMode: "balanced",
+      });
 
       const rejected = await app.inject({
         method: "POST",
@@ -581,12 +612,13 @@ describe("server application", () => {
         headers: OPERATOR_HEADERS,
         payload: {
           languages: { A: "en-US", B: "zh-TW" },
-          translationProfileId: "glossary_controlled",
+          translationMode: "accurate",
           recordingConsent: true,
         },
       });
-      assert.equal(rejected.statusCode, 409);
-      assert.equal(rejected.json().error.code, "translation_profile_unavailable");
+      assert.equal(rejected.statusCode, 422);
+      assert.equal(rejected.json().error.code, "translation_mode_unsupported");
+      assert.deepEqual(rejected.json().error.supportedModes, ["balanced"]);
       assert.equal(relay.opened.length, 0);
     } finally {
       await app.close();
@@ -601,6 +633,9 @@ describe("server application", () => {
       lane: "A_TO_B",
       generation: 2,
       type: "source_transcript",
+      turnId: "turn-a-2",
+      segmentId: "source-a-2",
+      revision: 3,
       text: "spindle",
       final: true,
     });
@@ -610,8 +645,16 @@ describe("server application", () => {
       timestampMonoMs: 120,
       lane: "A_TO_B",
       generation: 2,
-      type: "source_stable",
-      data: { text: "spindle", final: true, sourceSide: "A", targetSide: "B" },
+      type: "source_segment",
+      data: {
+        text: "spindle",
+        turnId: "turn-a-2",
+        segmentId: "source-a-2",
+        revision: 3,
+        final: true,
+        sourceSide: "A",
+        targetSide: "B",
+      },
     });
 
     const alert = mapSessionEvent({
@@ -692,6 +735,9 @@ describe("server application", () => {
         lane: "A_TO_B",
         generation: 1,
         type: "source_transcript",
+        turnId: "turn-a",
+        segmentId: "source-a",
+        revision: 0,
         text: "from A",
         final: true,
       },
@@ -702,6 +748,9 @@ describe("server application", () => {
         lane: "B_TO_A",
         generation: 1,
         type: "source_transcript",
+        turnId: "turn-b",
+        segmentId: "source-b",
+        revision: 0,
         text: "from B",
         final: true,
       },
@@ -712,6 +761,9 @@ describe("server application", () => {
         lane: "A_TO_B",
         generation: 1,
         type: "target_transcript",
+        turnId: "turn-a",
+        segmentId: "target-a",
+        revision: 0,
         text: "to B",
         final: true,
       },
@@ -722,6 +774,9 @@ describe("server application", () => {
         lane: "B_TO_A",
         generation: 1,
         type: "target_transcript",
+        turnId: "turn-b",
+        segmentId: "target-b",
+        revision: 0,
         text: "to A",
         final: true,
       },
@@ -821,6 +876,9 @@ describe("server application", () => {
         lane: "A_TO_B",
         generation: 1,
         type: "audio_playout",
+        turnId: "turn-a",
+        segmentId: "target-a",
+        playoutSequence: 0,
         frame: createAudioFrame({
           sessionId: "session-1",
           lane: "A_TO_B",
@@ -908,7 +966,8 @@ describe("server application", () => {
     const spec: SessionSpec = {
       sideA: { language: "en-US" },
       sideB: { language: "zh-TW" },
-      profile: "deterministic_test",
+      provider: "openai_controlled",
+      mode: "balanced",
     };
     relay.eventsForSession = [
       {
@@ -955,7 +1014,7 @@ describe("server application", () => {
     const glossaries = new FakeGlossaryRegistry();
     const media = new FakeBrowserMedia();
     const access = testAccess();
-    const app = await createServerApp({ relay, glossaries, mediaProfile: "browser_pair", browserMedia: media, access });
+    const app = await createServerApp({ relay, glossaries, mediaProfile: "browser_pair", browserMedia: media, access, translation });
     await app.ready();
     await openFakeSession(relay);
     try {

@@ -22,6 +22,7 @@ const DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime";
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_COMMIT_TIMEOUT_MS = 10_000;
 const DEFAULT_COMPLETION_TIMEOUT_MS = 30_000;
+const DEFAULT_INPUT_APPEND_MS = 200;
 
 export type TranscriptionDelay =
   | "minimal"
@@ -42,6 +43,8 @@ export interface OpenAILiveTranscribeAdapterOptions {
   readonly connectTimeoutMs?: number;
   readonly commitTimeoutMs?: number;
   readonly completionTimeoutMs?: number;
+  /** Coalesce canonical 20 ms frames before each Realtime append. */
+  readonly inputAppendMs?: number;
   readonly now?: () => number;
 }
 
@@ -126,6 +129,7 @@ export class OpenAILiveTranscribeAdapter {
   readonly #connectTimeoutMs: number;
   readonly #commitTimeoutMs: number;
   readonly #completionTimeoutMs: number;
+  readonly #inputAppendBytes: number;
 
   constructor(options: OpenAILiveTranscribeAdapterOptions) {
     this.#apiKey = requireApiKey(options.apiKey);
@@ -153,6 +157,20 @@ export class OpenAILiveTranscribeAdapter {
       DEFAULT_COMPLETION_TIMEOUT_MS,
       "OpenAI transcription completionTimeoutMs",
     );
+    const inputAppendMs = resolveTimeoutMs(
+      options.inputAppendMs,
+      DEFAULT_INPUT_APPEND_MS,
+      "OpenAI transcription inputAppendMs",
+    );
+    if (inputAppendMs % CANONICAL_AUDIO.frameDurationMs !== 0) {
+      throw new OpenAIAdapterError(
+        "configuration_error",
+        "OpenAI transcription inputAppendMs must be a multiple of the canonical frame duration.",
+      );
+    }
+    this.#inputAppendBytes =
+      (inputAppendMs / CANONICAL_AUDIO.frameDurationMs) *
+      CANONICAL_AUDIO.bytesPerFrame;
 
     for (const keyword of this.#keywords) {
       if (
@@ -204,6 +222,7 @@ export class OpenAILiveTranscribeAdapter {
 
     const events = new AsyncQueue<LiveTranscriptionEvent>();
     let lifecycle: "active" | "intentional" | "failed" = "active";
+    let outputSuppressed = false;
     const waitingTurns: PendingCommit[] = [];
     const turnByItem = new Map<string, string>();
     const incompleteItems = new Set<string>();
@@ -259,12 +278,13 @@ export class OpenAILiveTranscribeAdapter {
       completionTimers.clear();
     };
 
-    const stop = (): void => {
+    const stop = (discardBuffered = true): void => {
       if (lifecycle !== "active") return;
       stopInput();
       clearTurnDeadlines();
       lifecycle = "intentional";
-      events.end();
+      if (discardBuffered) outputSuppressed = true;
+      events.end({ discardBuffered });
       closeSocket(socket);
     };
 
@@ -307,7 +327,7 @@ export class OpenAILiveTranscribeAdapter {
         waitingTurns.length === 0 &&
         incompleteItems.size === 0
       ) {
-        stop();
+        stop(false);
       }
     };
 
@@ -504,7 +524,10 @@ export class OpenAILiveTranscribeAdapter {
           );
         });
 
-      for await (const event of events) yield event;
+      for await (const event of events) {
+        if (outputSuppressed || request.signal.aborted) break;
+        yield event;
+      }
     } catch (error) {
       if (!request.signal.aborted) {
         const timedOut =
@@ -518,7 +541,10 @@ export class OpenAILiveTranscribeAdapter {
             : "The transcription service connection failed.",
           true,
         );
-        for await (const event of events) yield event;
+        for await (const event of events) {
+          if (outputSuppressed || request.signal.aborted) break;
+          yield event;
+        }
       }
     } finally {
       request.signal.removeEventListener("abort", onAbort);
@@ -547,6 +573,24 @@ export class OpenAILiveTranscribeAdapter {
     returnIterator: (iterator: AsyncIterator<LiveTranscriptionInput>) => void,
   ): Promise<void> {
     let commitSequence = 0;
+    const pendingFrames: Uint8Array[] = [];
+    let pendingBytes = 0;
+    let audioSinceLastCommit = false;
+    const flushPendingAudio = (): void => {
+      if (pendingBytes === 0) return;
+      const audio = new Uint8Array(pendingBytes);
+      let offset = 0;
+      for (const pending of pendingFrames) {
+        audio.set(pending, offset);
+        offset += pending.byteLength;
+      }
+      pendingFrames.splice(0);
+      pendingBytes = 0;
+      sendJson(socket, {
+        type: "input_audio_buffer.append",
+        audio: encodePcm16(audio),
+      });
+    };
     if (request.signal.aborted || isStopped()) return;
 
     const iterator = request.events[Symbol.asyncIterator]();
@@ -611,10 +655,10 @@ export class OpenAILiveTranscribeAdapter {
             );
           }
           if (request.signal.aborted || isStopped()) return;
-          sendJson(socket, {
-            type: "input_audio_buffer.append",
-            audio: encodePcm16(frame.pcm16le),
-          });
+          pendingFrames.push(frame.pcm16le);
+          pendingBytes += frame.pcm16le.byteLength;
+          audioSinceLastCommit = true;
+          if (pendingBytes >= this.#inputAppendBytes) flushPendingAudio();
           continue;
         }
 
@@ -640,12 +684,25 @@ export class OpenAILiveTranscribeAdapter {
         }
 
         if (request.signal.aborted || isStopped()) return;
+        flushPendingAudio();
+        if (!audioSinceLastCommit) {
+          events.push(
+            this.#errorEvent(
+              request.context,
+              "OPENAI_TRANSCRIBE_EMPTY_TURN",
+              "A speech boundary was received without audio.",
+              false,
+            ),
+          );
+          continue;
+        }
         enqueueCommit(input.turnId);
         sendJson(socket, {
           type: "input_audio_buffer.commit",
           event_id: "commit_" + commitSequence.toString(10),
         });
         commitSequence += 1;
+        audioSinceLastCommit = false;
       }
     } finally {
       if (naturallyDone) releaseIterator(iterator);

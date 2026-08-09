@@ -2,6 +2,12 @@ import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { MEDIA_PROFILES, type MediaProfile } from "./core/types.js";
+import {
+  resolveTranslationBehavior,
+  type TranslationBehavior,
+  type TranslationMode,
+  type TranslationProviderId,
+} from "./core/translation-behavior.js";
 
 const optionalSecret = z.preprocess(
   (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
@@ -28,16 +34,11 @@ const environmentSchema = z
     OPENAI_TEXT_MODEL: z.string().min(1).default("gpt-5.4-mini"),
     OPENAI_TTS_MODEL: z.string().min(1).default("gpt-4o-mini-tts"),
     OPENAI_TTS_VOICE: z.string().min(1).default("marin"),
-    LOCAL_EVAL_TRANSCRIPT_A_TO_B: z.string().trim().min(1).max(4_096)
-      .default("Verify the mistake proofing fixture."),
-    LOCAL_EVAL_TRANSCRIPT_B_TO_A: z.string().trim().min(1).max(4_096)
-      .default("請確認防呆治具。"),
-    LOCAL_EVAL_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.99),
-    LOCAL_EVAL_TRANSLATION_MODE: z.enum(["preserve", "drop_placeholders"]).default("preserve"),
     MEDIA_PROFILE: z.enum(MEDIA_PROFILES).default("browser_pair"),
-    TRANSLATION_PROFILE: z
-      .enum(["native_live_baseline", "glossary_controlled", "palabra_live", "local_eval", "deterministic_test"])
-      .default("glossary_controlled"),
+    TRANSLATION_PROVIDER: z
+      .enum(["palabra", "openai_native", "openai_controlled"])
+      .default("openai_controlled"),
+    TRANSLATION_MODE: z.enum(["fast", "balanced", "accurate"]).default("balanced"),
     PALABRA_INPUT_CHUNK_MS: z.coerce.number().int().min(20).max(320)
       .refine((value) => value % 20 === 0, "PALABRA_INPUT_CHUNK_MS must be a multiple of 20")
       .default(320),
@@ -57,26 +58,25 @@ const environmentSchema = z
     }
 
     if (
-      (value.TRANSLATION_PROFILE === "native_live_baseline" ||
-        value.TRANSLATION_PROFILE === "glossary_controlled") &&
+      (value.TRANSLATION_PROVIDER === "openai_native" ||
+        value.TRANSLATION_PROVIDER === "openai_controlled") &&
       value.OPENAI_API_KEY === undefined
     ) {
       context.addIssue({
         code: "custom",
         path: ["OPENAI_API_KEY"],
-        message: `OPENAI_API_KEY is required for ${value.TRANSLATION_PROFILE}`,
+        message: `OPENAI_API_KEY is required for TRANSLATION_PROVIDER=${value.TRANSLATION_PROVIDER}`,
       });
     }
 
-
     if (
-      value.TRANSLATION_PROFILE === "palabra_live" &&
+      value.TRANSLATION_PROVIDER === "palabra" &&
       value.PALABRA_API_KEY === undefined
     ) {
       context.addIssue({
         code: "custom",
         path: ["PALABRA_API_KEY"],
-        message: "PALABRA_API_KEY is required for palabra_live",
+        message: "PALABRA_API_KEY is required for TRANSLATION_PROVIDER=palabra",
       });
     }
 
@@ -119,12 +119,10 @@ export type AppConfig = Readonly<{
   openaiTextModel: string;
   openaiTtsModel: string;
   openaiTtsVoice: string;
-  localEvalTranscriptAToB: string;
-  localEvalTranscriptBToA: string;
-  localEvalConfidence: number;
-  localEvalTranslationMode: "preserve" | "drop_placeholders";
   mediaProfile: MediaProfile;
-  translationProfile: "native_live_baseline" | "glossary_controlled" | "palabra_live" | "local_eval" | "deterministic_test";
+  translationProvider: TranslationProviderId;
+  translationMode: TranslationMode;
+  translationBehavior: TranslationBehavior;
   palabraInputChunkMs: number;
   evidenceProfile: "encrypted_local" | "in_memory";
   evidenceDirectory: string;
@@ -152,12 +150,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv, cwd = process.cwd()):
     openaiTextModel: parsed.OPENAI_TEXT_MODEL,
     openaiTtsModel: parsed.OPENAI_TTS_MODEL,
     openaiTtsVoice: parsed.OPENAI_TTS_VOICE,
-    localEvalTranscriptAToB: parsed.LOCAL_EVAL_TRANSCRIPT_A_TO_B,
-    localEvalTranscriptBToA: parsed.LOCAL_EVAL_TRANSCRIPT_B_TO_A,
-    localEvalConfidence: parsed.LOCAL_EVAL_CONFIDENCE,
-    localEvalTranslationMode: parsed.LOCAL_EVAL_TRANSLATION_MODE,
     mediaProfile: parsed.MEDIA_PROFILE,
-    translationProfile: parsed.TRANSLATION_PROFILE,
+    translationProvider: parsed.TRANSLATION_PROVIDER,
+    translationMode: parsed.TRANSLATION_MODE,
+    translationBehavior: resolveTranslationBehavior(parsed.TRANSLATION_MODE),
     palabraInputChunkMs: parsed.PALABRA_INPUT_CHUNK_MS,
     evidenceProfile: parsed.EVIDENCE_PROFILE,
     evidenceDirectory: resolve(cwd, parsed.EVIDENCE_DIRECTORY),

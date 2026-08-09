@@ -60,6 +60,13 @@ describe("keyless executable benchmark runner", () => {
     assert.equal(execution.score.armVerdicts.PALABRA_REFERENCE.verdict, "NOT_RUN");
     assert.equal(execution.score.armVerdicts.OPENAI_NATIVE_TRANSLATE.verdict, "NOT_RUN");
     assert.equal(execution.score.localMechanismVerdict, "PASS");
+    assert.deepEqual(execution.score.localReleaseEvidence, {
+      targetExact: true,
+      zeroRegression: true,
+      alertsClear: true,
+      latency: true,
+      evidenceComplete: true,
+    });
     assert.equal(execution.score.productAcceptanceVerdict, "NOT_RUN");
     assert.equal(execution.score.providerAcceptanceVerdict, "NOT_RUN");
 
@@ -105,7 +112,7 @@ describe("keyless executable benchmark runner", () => {
     assert.equal(persistedMarker.resultSha256, firstLocal.resultSha256);
   });
 
-  it("executes actual local formal, latency, interruption, and accelerated soak observations", async () => {
+  it("executes local formal, latency, interruption, and sampled virtual duplex observations", async () => {
     const execution = await executeKeylessBenchmark({
       outputDirectory: await isolatedDirectory("observations"),
       profileUnderTest,
@@ -123,7 +130,12 @@ describe("keyless executable benchmark runner", () => {
     const formal = localResults.filter((result) => result.stage === "formal_terminology");
     assert.equal(formal.every((result) =>
       result.observation?.kind === "formal_terminology" &&
-      result.observation.uninterrupted &&
+        result.observation.uninterrupted &&
+        result.observation.alerts.length === 0 &&
+        result.observation.normalizedEventEvidence.sourceRevision >= 0 &&
+        result.observation.normalizedEventEvidence.targetRevision >= 0 &&
+        result.observation.normalizedEventEvidence.targetFinal &&
+        result.observation.normalizedEventEvidence.playoutSequenceContiguous &&
       result.observation.playedFrameCount === 3 &&
       (result.observation.scenario === "protected"
         ? result.observation.targetExactSatisfied &&
@@ -142,7 +154,12 @@ describe("keyless executable benchmark runner", () => {
     assert.equal(latency.every((result) =>
       result.observation?.kind === "latency" &&
       result.observation.measurementScope === "local_processing_not_acoustic" &&
-      result.observation.uninterrupted &&
+        result.observation.uninterrupted &&
+        result.observation.alerts.length === 0 &&
+        result.observation.normalizedEventEvidence.sourceRevision >= 0 &&
+        result.observation.normalizedEventEvidence.targetRevision >= 0 &&
+        result.observation.normalizedEventEvidence.targetFinal &&
+        result.observation.normalizedEventEvidence.playoutSequenceContiguous &&
       result.observation.playedFrameCount === 3 &&
       (result.observation.scenario === "protected"
         ? result.observation.targetExactSatisfied &&
@@ -164,17 +181,98 @@ describe("keyless executable benchmark runner", () => {
       result.observation.generationCut &&
       result.observation.playoutCleared &&
       result.observation.staleOutputRejected &&
-      result.observation.validOutputResumed
+      result.observation.validOutputResumed &&
+      result.observation.alerts.length === 0
     ), true);
 
     const soak = localResults.find((result) => result.stage === "continuous_duplex");
     assert.ok(soak);
     assert.equal(soak.observation?.kind, "continuous_duplex");
     if (soak.observation?.kind !== "continuous_duplex") return;
-    assert.equal(soak.observation.executionMode, "accelerated_virtual_time");
+    assert.equal(soak.observation.executionMode, "sampled_virtual_mechanism");
+    assert.equal(soak.observation.coverageScope, "virtual_mechanism_only");
     assert.equal(soak.observation.virtualDurationMs, 600_000);
-    assert.equal(soak.observation.processedFrames, 60_000);
-    assert.equal(soak.observation.queueGrowthDetected, false);
+    assert.equal(soak.observation.virtualFramesRepresented, 60_000);
+    assert.equal(soak.observation.sampleFramesPerLane, 30);
+    assert.equal(soak.observation.processedSampleFrames, 60);
+    assert.ok(
+      soak.observation.processedSampleFrames < soak.observation.virtualFramesRepresented,
+    );
+    assert.equal(soak.observation.unacknowledgedSampleFrames, 0);
+    assert.equal(soak.observation.queuePressureDetected, false);
+    assert.equal(soak.observation.alerts.length, 0);
+  });
+
+  it("completes an accurate interruption after each input reaches speech end", { timeout: 1_000 }, async () => {
+    const run = EXECUTABLE_BENCHMARK_MANIFEST.runs.find((candidate) =>
+      candidate.stage === "interruption" && candidate.arm === "GLOSSARY_CONTROLLED"
+    );
+    if (
+      run === undefined ||
+      run.scheduleId === undefined ||
+      run.provider === undefined ||
+      run.mode === undefined ||
+      run.behavior === undefined
+    ) {
+      throw new Error("canonical controlled interruption input is missing");
+    }
+    const schedule = EXECUTABLE_BENCHMARK_MANIFEST.schedules.find(
+      (candidate) => candidate.scheduleId === run.scheduleId,
+    );
+    if (schedule === undefined) throw new Error("canonical interruption schedule is missing");
+
+    assert.equal(run.mode, "accurate");
+    const observation = await runLocalHarnessObservation({
+      run,
+      provider: run.provider,
+      mode: run.mode,
+      behavior: run.behavior,
+      approvedProfile: profileUnderTest.profile,
+      approvedProfileHash: profileUnderTest.profileHash,
+      schedule,
+    });
+    assert.equal(observation.kind, "interruption");
+    if (observation.kind !== "interruption") return;
+    assert.equal(observation.generationCut, true);
+    assert.equal(observation.playoutCleared, true);
+    assert.equal(observation.staleOutputRejected, true);
+    assert.equal(observation.validOutputResumed, true);
+    assert.equal(observation.alerts.length, 0);
+  });
+
+  it("accepts a final normalized transcript at revision zero", async () => {
+    const execution = await executeKeylessBenchmark({
+      outputDirectory: await isolatedDirectory("revision-zero-finality"),
+      profileUnderTest,
+      testOnly: true,
+      localHarnessExecutor: async (input) => {
+        const observation = await runLocalHarnessObservation(input);
+        if (observation.kind !== "formal_terminology" && observation.kind !== "latency") {
+          return observation;
+        }
+        return Object.freeze({
+          ...observation,
+          normalizedEventEvidence: Object.freeze({
+            ...observation.normalizedEventEvidence,
+            sourceRevision: 0,
+            targetRevision: 0,
+          }),
+        });
+      },
+    });
+    const transcriptResults = execution.results.filter((result) =>
+      result.arm === "GLOSSARY_CONTROLLED" &&
+      (result.stage === "formal_terminology" || result.stage === "latency")
+    );
+    assert.equal(transcriptResults.length, 20);
+    assert.equal(transcriptResults.every((result) => result.outcome === "PASS"), true);
+    assert.equal(transcriptResults.every((result) =>
+      (result.observation?.kind === "formal_terminology" || result.observation?.kind === "latency") &&
+      result.observation.normalizedEventEvidence.sourceRevision === 0 &&
+      result.observation.normalizedEventEvidence.targetRevision === 0 &&
+      result.observation.normalizedEventEvidence.targetFinal
+    ), true);
+    assert.equal(execution.score.localMechanismVerdict, "PASS");
   });
 
   it("requires testOnly for a custom executor and marks the resulting bundle", async () => {

@@ -1,6 +1,12 @@
 import { composeApplication, type ApplicationComposition } from "../composition.js";
 import { loadConfig } from "../config.js";
 
+export function operatorStartupUrl(operatorUrl: string): string {
+  const publicUrl = new URL(operatorUrl);
+  publicUrl.hash = "";
+  return publicUrl.toString();
+}
+
 export async function startServer(
   environment: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
@@ -15,9 +21,9 @@ export async function startServer(
     composition.app.log.info(
       {
         address,
-        operatorUrl: composition.operatorUrl,
+        operatorUrl: operatorStartupUrl(composition.operatorUrl),
         publicBaseUrl: config.publicBaseUrl.toString(),
-        translationProfiles: composition.translationProfiles,
+        translation: composition.translation,
       },
       "Fast Translation server listening",
     );

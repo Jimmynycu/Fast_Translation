@@ -3,6 +3,7 @@ import { BrowserWebSocketMediaPort } from "./adapters/media/browser-websocket.js
 import {
   FakeTelephonyMediaPort,
   type FakeTelephonyOutbound,
+  type TelephonyDtmfDigit,
 } from "./adapters/media/fake-telephony.js";
 import type { EndpointGrantFactory } from "./core/relay.js";
 import type { MediaPort, MediaProfile, Side } from "./core/types.js";
@@ -22,6 +23,20 @@ export interface TelephonyTestDriver {
     side: Side,
     sequence: number,
     mulaw8k: Uint8Array,
+    capturedAtMs?: number,
+  ): void;
+  ingestDtmf(
+    sessionId: string,
+    side: Side,
+    digit: TelephonyDtmfDigit,
+    capturedAtMs?: number,
+  ): void;
+  emitAlert(
+    sessionId: string,
+    side: Side,
+    code: string,
+    message: string,
+    retryable: boolean,
     capturedAtMs?: number,
   ): void;
   outbound(sessionId: string, side: Side): readonly FakeTelephonyOutbound[];
