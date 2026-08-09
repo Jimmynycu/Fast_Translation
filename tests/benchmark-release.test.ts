@@ -105,20 +105,24 @@ describe("keyless deterministic healing and signed release gate", () => {
       approvedProfile: approved,
       trustedOwnerPublicKey: ownerKeys.publicKey,
     });
-    assert.equal(gate.localPocReleaseVerdict, "PASS");
+    assert.equal(gate.schemaVersion, 2);
+    assert.equal(gate.localPocReleaseVerdict, "NOT_RUN");
     assert.equal(gate.trustAnchorSource, "operator_supplied_test_key");
     assert.equal(gate.customerOwnerAcceptanceVerdict, "NOT_RUN");
     assert.equal(gate.productAcceptanceVerdict, "NOT_RUN");
     assert.equal(gate.providerAcceptanceVerdict, "NOT_RUN");
     assert.deepEqual(gate.localReleaseEvidence, {
-      targetExact: true,
-      zeroRegression: true,
-      alertsClear: true,
-      latency: true,
-      evidenceComplete: true,
+      targetExact: "PASS",
+      zeroRegression: "PASS",
+      alertsClear: "PASS",
+      latency: "NOT_RUN",
+      bargeIn: "NOT_RUN",
+      evidenceComplete: "NOT_RUN",
     });
     assert.equal(gate.approvedProfileHash, approved.approvedProfile.profileHash);
-    assert.equal(gate.reasons.length, 0);
+    assert.equal(gate.reasons.some((reason) => /acoustic latency/u.test(reason)), true);
+    assert.equal(gate.reasons.some((reason) => /barge-in/u.test(reason)), true);
+    assert.equal(gate.reasons.some((reason) => /four-track audio/u.test(reason)), true);
 
     const unrelated = approveDeterministicHealingProposal(proposal, {
       owner: "Customer Glossary Owner",

@@ -536,6 +536,10 @@ a {
   justify-content: space-between;
 }
 
+.glossary-panel .button + .button {
+  margin-top: 8px;
+}
+
 .button-large {
   min-height: 56px;
   padding: 0 22px;
@@ -653,6 +657,7 @@ a {
 }
 
 .pairing-panel,
+.evidence-console,
 .transcript-panel,
 .compact-panel {
   padding: 24px;
@@ -661,6 +666,13 @@ a {
 .section-heading {
   margin-bottom: 20px;
   align-items: center;
+}
+
+.pairing-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .join-grid {
@@ -975,6 +987,210 @@ a {
   margin-bottom: 16px;
 }
 
+.evidence-console .panel-copy {
+  max-width: 760px;
+  margin: -7px 0 18px;
+}
+
+.evidence-identity-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin: 0;
+}
+
+.evidence-identity-grid > div {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.evidence-identity-grid dt {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.evidence-identity-grid dd {
+  margin: 0;
+}
+
+.evidence-identity-grid dd + dd {
+  margin-top: 6px;
+}
+
+.evidence-identity-grid code {
+  display: block;
+  overflow-wrap: anywhere;
+  color: #d4d7dc;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.evidence-console-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 18px;
+}
+
+.evidence-console-section {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.11);
+}
+
+.evidence-barge-section {
+  grid-column: 1 / -1;
+}
+
+.evidence-finalization-section {
+  grid-column: 1 / -1;
+}
+
+.evidence-section-heading {
+  display: flex;
+  min-height: 25px;
+  margin-bottom: 10px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.evidence-section-heading h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.evidence-status-grid,
+.evidence-participant-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.evidence-status-grid > div,
+.evidence-participant-grid > article {
+  display: grid;
+  min-width: 0;
+  padding: 10px;
+  gap: 4px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.evidence-status-grid dt,
+.evidence-participant-grid strong {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.evidence-status-grid dd,
+.evidence-participant-grid span {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #d4d7dc;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.evidence-status-grid small,
+.evidence-participant-grid small,
+.evidence-unobservable,
+.evidence-lag {
+  margin: 0;
+  color: var(--quiet);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.evidence-unobservable {
+  margin-bottom: 7px;
+}
+
+.evidence-lag {
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+.evidence-feed {
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+.evidence-finalization-record {
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.evidence-finalization-tracks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.evidence-finalization-tracks article {
+  min-width: 0;
+  padding: 9px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.evidence-finalization-tracks strong,
+.evidence-finalization-tracks small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.evidence-finalization-tracks strong {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.evidence-finalization-tracks small {
+  color: #d4d7dc;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.participant-disclosure p {
+  margin: 5px 0 0;
+}
+
+.participant-withdrawal {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.participant-withdrawal .call-status {
+  margin: 10px auto 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .call-panel {
   padding: clamp(24px, 5vw, 40px);
   text-align: center;
@@ -1132,6 +1348,13 @@ a {
   width: 16px;
   height: 16px;
   accent-color: var(--accent);
+}
+
+.participant-consent-check {
+  min-height: 48px;
+  margin: 0 0 12px;
+  justify-content: center;
+  text-align: left;
 }
 
 .mic-symbol {
@@ -1342,6 +1565,7 @@ a {
   .setup-panel,
   .glossary-panel,
   .pairing-panel,
+  .evidence-console,
   .transcript-panel,
   .compact-panel {
     padding: 20px;
@@ -1374,6 +1598,11 @@ a {
   }
 
   .join-grid,
+  .evidence-identity-grid,
+  .evidence-console-grid,
+  .evidence-status-grid,
+  .evidence-participant-grid,
+  .evidence-finalization-tracks,
   .transcript-columns,
   .dashboard-rail {
     grid-template-columns: 1fr;

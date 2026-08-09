@@ -1,298 +1,237 @@
 # Implementation architecture
 
-This document describes the code that is present in this repository. The
-research and prototype documents under `docs/research` and `docs/prototypes`
-remain useful design inputs, but they are not implementation or acceptance
-evidence.
+## Scope and truth boundary
 
-## Deployed POC topology
+Fast Translation is a local-first, two-person live-translation POC for English (en-US) <-> Traditional Chinese (zh-TW), with either language assignable to either fixed side. One Windows operator PC runs the central Harness. Two phone browsers attach as fixed A and B sides. Human sessions require a profile with approved data admission; the checked-in `manufacturing-poc` profile deliberately permits only synthetic benchmarks. The system does not implement PSTN/SIP numbers, inbound ringing, IVR, AI greeting, DTMF call control, carrier provisioning or a general telephony product.
 
-The current POC is one central Harness on one operator PC, with two independent
-phone-browser participants on the same LAN:
+The local deterministic mechanism self-check is executable and reports `MECHANISM_PASS` separately from acceptance. A valid keyless run may contain local **PASS** observations, but the local release evidence gate, external provider behavior, regional/data assurances, production operations, product acceptance, PSTN/SIP and carrier acceptance are not inferred from that result. Unless a credentialed, audited run provides evidence, those verdicts are **NOT_RUN**.
 
 ```text
-                             operator HTTPS UI/API/events
-                                      |
-                                      v
-+----------------+   HTTPS/WSS   +-----------------------------+   server only
-| Phone A browser| <-----------> | Central Harness on one PC   | <------------> selected provider
-| mic + headphones|              | session, routing, modes,    |       OpenAI or Palabra
-+----------------+               | glossary, fence, evidence   |
-                                 +-----------------------------+
-+----------------+   HTTPS/WSS              ^
-| Phone B browser| <-------------------------+
-| mic + headphones|
-+----------------+
+Phone A browser ── secure media/events ──┐
+                                         │
+                                  Central Harness
+                                         │
+Phone B browser ── secure media/events ──┘
+                  operator UI / API / WS
 ```
 
-This is not a carrier call. A phone is an ordinary browser endpoint. There is no
-PSTN/SIP number, inbound ring, IVR, AI greeting, live DTMF control, or
-automated language question in the current implementation. The test-telephony
-driver can inject DTMF only as a normalized fixture alert; it never dials,
-answers, or synthesizes conversational audio.
+`browser_pair` is the actual browser route. `fake_telephony` is an in-process G.711 μ-law test fixture that returns `fake-telephony://` grants and never becomes a carrier integration.
 
-`createMediaRuntime` is the composition seam. `MEDIA_PROFILE=browser_pair`
-builds the browser WebSocket port and signed QR grants.
-`MEDIA_PROFILE=fake_telephony` instead builds the in-process G.711 mu-law test
-port, returns `fake-telephony://` grants, exposes a test driver, and omits the
-browser media route. Capabilities advertise only the active media setting. The
-fake fixture is executable but is not a live carrier.
+## Composition root and approved processing profile
 
-The direct-start rule is enforced by the room lifecycle: the operator creates a
-room, both participants connect through the selected media adapter, the Harness
-becomes ready, and the operator sends the `start` command. No conversational
-agent sits in front of either human.
+`composeApplication()` has one non-secret provider-routing input: an `ApprovedSessionProcessingProfile` loaded from `PROCESSING_PROFILE_PATH` and pinned by `PROCESSING_PROFILE_SHA256`. It also requires `DEPLOYMENT_BUILD_SHA256`, an explicit immutable lowercase 64-hex identity derived by the release process from the exact deployed Git commit; there is no package-version or generated fallback. The loader validates the JSON, validates the embedded canonical body hash and then requires equality with the deployment pin. A session manifest is rebuilt from the approved profile and checked against it, so a caller cannot substitute different endpoints, egress, evidence, retention, consent or fallback fields while retaining only the same profile name.
 
-## Central Harness responsibilities
+The repository reference artifact is [manufacturing-poc.json](../profiles/manufacturing-poc.json):
 
-`ModularGuardedDuplexRelay` is the deep session module. It owns:
-
-- the A-to-B and B-to-A lanes;
-- session lifecycle and idempotent operator command IDs;
-- participant connection state;
-- bounded source and playout queues;
-- per-lane sequence and generation state;
-- fixed-provider, per-session-mode routing;
-- interruption cuts and stale-generation rejection;
-- normalized session events; and
-- non-blocking evidence writes, including active-session closure and evidence
-  flush during graceful `SIGINT`/`SIGTERM` shutdown.
-
-Fastify provides the static operator/participant UI, JSON API, event WebSocket,
-and, for `browser_pair`, media WebSockets. Provider details remain behind
-`TranslationPort`; browser and test-telephony details remain behind `MediaPort`.
-Evidence storage remains behind `EvidencePort`. The core does not consume raw
-OpenAI, future carrier, or browser protocol events.
-
-## Audio and duplex flow
-
-The browser capture worklet resamples microphone input to the canonical format:
-
-| Property | Value |
+| Field | Reference value |
 |---|---|
-| Encoding | signed PCM16LE |
-| Sample rate | 24,000 Hz |
-| Channels | 1 |
-| Frame duration | 20 ms |
-| Samples per frame | 480 |
-| Bytes per frame | 960 |
+| Profile identity | `manufacturing-poc@2026-08-09` |
+| Canonical body SHA-256 | `48ccc7bd514c92c11d6d6e448fb714daf720b87891536d96efacc239e8948294` |
+| Scope | `poc` |
+| Runtime route | `openai_controlled`: transcription → text translation → TTS |
+| Approved modes / default | `fast`, `balanced`, `accurate` / `balanced` |
+| External vendor/data assurances | explicitly `unverified` with `NOT_RUN`; `trainingUse`/`serviceRetention` make admission `synthetic_only`, so human `POST /api/sessions` receives 422 `synthetic_only_profile` |
 
-Phone A audio enters lane `A_TO_B` and only plays to Phone B. Phone B audio
-enters `B_TO_A` and only plays to Phone A. The two lanes have independent queues,
-translation runs, transcript accumulators, and generation fences.
+Validate an artifact before deployment:
 
-When the other participant starts speaking while translated audio is queued, the
-Harness advances the affected generation, aborts the old translation run, clears
-server and browser playout, and rejects any late frame from the old generation.
-The browser playout worklet also drops old or duplicate sequence values and trims
-excess buffering. A provider cancel call may reduce wasted work, but correctness
-does not depend on its acknowledgement.
+```powershell
+pnpm processing-profile:validate -- --input .\profiles\manufacturing-poc.json
+```
 
-Headphones are a required operating condition, not an optional recommendation.
-They keep translated output out of the local microphone and make the two logical
-lanes observable without acoustic feedback.
+In the clean checkout of the exact commit that will be deployed, derive the required build identity without treating a package version as an identity:
 
-## Four-track evidence
+```powershell
+$deployedCommit = (git rev-parse --verify 'HEAD^{commit}').Trim()
+if (git status --porcelain) { throw 'Deploy only a clean checkout of the exact commit.' }
+$deploymentBuildSha256 = [Convert]::ToHexString(
+  [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($deployedCommit))
+).ToLowerInvariant()
+"DEPLOYMENT_BUILD_SHA256=$deploymentBuildSha256"
+```
 
-Every accepted source frame and every accepted translated playout frame is
-recorded with one of four track labels:
+The runtime validates only the 64-hex shape and exposes it to authenticated operators in `evidenceIdentity`; deployment discipline supplies the exact-commit binding. It is not release attestation and must never fall back to a package version or invented static hash.
 
-| Track | Meaning |
+The profile contains service roles/categories, immutable ordered `dataCategories`, HTTPS origins and path templates, named model/voice where applicable, region/training/service-retention/DPA assurances, glossary egress, fallback approval, evidence controls, retention policy and consent policy. `dataCategories` are the non-secret categories actually sent to a service; they are not assertions about vendor training, retention, region or DPA. It is not a place for API keys, tokens, participant IDs, endpoint query strings or raw evidence identifiers.
+
+| Service role | Required ordered `dataCategories` |
 |---|---|
-| `source_a` | microphone audio accepted from Phone A |
-| `source_b` | microphone audio accepted from Phone B |
-| `playout_to_a` | translated audio accepted for Phone A |
-| `playout_to_b` | translated audio accepted for Phone B |
+| controlled transcription | `canonical_audio`, `source_language`, `source_terms`, `aliases` |
+| controlled text translation | `source_transcript`, `source_language`, `target_language`, `opaque_placeholders` |
+| controlled TTS | `authorized_target_text` |
+| OpenAI native speech-to-speech | `canonical_audio`, `target_language` |
+| Palabra speech-to-speech | `canonical_audio`, `source_language`, `target_language` |
 
-Session state, participant state, transcripts, latency observations, glossary
-events, alerts, generation cuts, and closure are recorded beside the audio
-records. `encrypted_local` encrypts each JSONL record independently with
-AES-256-GCM and uses a SHA-256 digest of the session ID as the filename.
-`in_memory` retains bounded cloned records only for the current process.
+Each service projection is profile- and manifest-hash-bound; unknown, duplicate or reordered values reject the profile. The pre-consent disclosure exposes only id/provider/role/category and that ordered category list. It never exposes endpoint, model, voice, assurance body or raw manifest.
 
-The runtime boundary remains four labeled PCM frame streams inside encrypted
-evidence. The separate authorized exporter authenticates every record before
-writing plaintext, aligns all tracks to a common capture origin, and emits four
-mono WAVs plus one interleaved four-channel WAV in the table order. It also emits
-sanitized events, a hash-pinned manifest, and checksums. Export requires the
-recording key plus an explicit plaintext acknowledgement. Live evidence writes
-remain bounded and fail open: an evidence problem is surfaced as a health alert
-without blocking media.
+The composition root selects exactly one adapter route:
 
-## Translation provider and mode contract
-
-`TRANSLATION_PROVIDER` selects exactly one provider while the server starts:
-`openai_native`, `openai_controlled`, or `palabra`. Composition validates the
-selected key and the configured `TRANSLATION_MODE`, constructs only that
-provider's `TranslationPort`, and publishes its static capabilities. The
-provider never changes at runtime.
-
-| Provider | Required server credential | Advertised modes | Deterministic pinned glossary |
+| Profile provider | Adapter construction | Credential | Capability mapping |
 |---|---|---|---|
-| `openai_native` | `OPENAI_API_KEY` | `fast`, `balanced`; `accurate` is unsupported | none; `balanced` is marked degraded because it uses adapter-local holdback rather than a model-quality guarantee |
-| `openai_controlled` | `OPENAI_API_KEY` | `fast`, `balanced`, `accurate` | all three modes advertise it |
-| `palabra` | `PALABRA_API_KEY` | `fast`, `balanced`, `accurate` | none; `accurate` is marked degraded because Palabra account glossaries cannot provide this Harness's deterministic pinned guarantee |
+| `openai_native` | One OpenAI realtime speech-to-speech service | `OPENAI_API_KEY` | `fast` native, `balanced` locally controlled, `accurate` experimental/nonselectable; no deterministic pinned glossary. |
+| `openai_controlled` | OpenAI live transcription, Responses text translation, and TTS | `OPENAI_API_KEY` | `fast`, `balanced`, `accurate` locally controlled; only profile-defined local pinned-glossary egress is allowed. |
+| `palabra` | One Palabra streaming speech-to-speech service | `PALABRA_API_KEY` | all three modes native; input transport maps to fixed 320 ms chunks; provider account glossary does not make deterministic pinned glossary. |
 
-`TRANSLATION_MODE` defaults to `balanced` and must be one of `fast`,
-`balanced`, or `accurate`; it supplies the default UI selection and is validated
-against the chosen provider. It does not force all sessions to use that mode.
-The operator UI reads `/api/capabilities`, displays the fixed provider, and
-offers only the advertised modes. Each option carries a behavior version,
-full/degraded state and reason, and a `deterministicGlossary` flag. A session
-request sends a mode, not a provider; the server rejects unsupported modes and
-pins provider, mode, behavior version, and degradation state into the session
-snapshot.
+The provider and static capabilities are fixed for the process. `/api/capabilities` reports all three mode rows and the profile's `dataAdmission`: `approved_poc_content` or `synthetic_only`. Only `native` and `locally_controlled` are selectable; `experimental` and `unsupported` have an explanatory reason. `fast`, `balanced`, `accurate` specify relay behavior (commit/finality/holdback), not an external-quality claim. If any selected service `trainingUse` or `serviceRetention` assurance is unverified, `POST /api/sessions` rejects with 422 `synthetic_only_profile` before it creates a relay or grants; no client/operator override exists.
 
-The mode behavior is defined independently of an adapter: `fast` continuously
-commits input and permits provisional revisions with no holdback; `balanced`
-continuously commits input, emits final-only transcript segments, and uses a
-250 ms holdback; `accurate` commits at speech end, emits final-only segments,
-and uses a 700 ms holdback. All modes retain the same destination-only
-interruption rule. The capability status is authoritative when a provider cannot
-meet a mode's strongest terminology expectation.
+`fallback.kind` is immutable and only `none` or `same_route_fail_open`, both requiring an approval reference. `none` releases no source substitution when translation fails; `same_route_fail_open` may make the approved bounded source fallback on the same route. Neither authorizes automatic cross-provider or cross-route fallback. The reference profile uses `none`.
 
-`openai_native` is the direct server-side OpenAI realtime path. `openai_controlled`
-is a separate complete path composing transcription, server-side text
-translation, glossary binding/authorization, and TTS. For each controlled lane,
-pinned source terms and aliases are deduplicated into session keyword hints; the
-compiled reverse glossary supplies the opposite lane without runtime mutation.
-Matched terms are replaced by opaque placeholders, translated while preserved,
-then restored to approved `target_exact` values. Missing, duplicate, reordered,
-or unknown placeholders create structured terminology alerts. This path fails
-open with the best available text if control or a provider fails; continuity does
-not make a terminology acceptance claim.
+There is no legacy environment route for a provider, mode, model, voice, profile alias, evidence profile, single evidence directory or arbitrary plaintext export path. Configuration rejects those obsolete keys rather than using a fallback.
 
-`palabra` is a complete independent server-side speech-to-speech alternative.
-It uses the Palabra streaming adapter with `PALABRA_INPUT_CHUNK_MS` pacing
-(20–320 ms in 20 ms increments) and exposes its own capability table. A Palabra
-account glossary is not a substitute for the Harness's deterministic pinned
-target-exact contract.
+## Session lifecycle and consent
 
-Translation ports expose `prepare(context)` and `closeSession(sessionId)`
-lifecycle methods. Opening a room prepares both lane contexts concurrently
-before it becomes active; a preparation failure leaves the room ready and closes
-the provider session.
-
-## Glossary boundary
-
-There are two intentionally different import surfaces:
-
-| Surface | Current capability |
-|---|---|
-| Browser UI and `POST /api/glossaries` | CSV or XLSX bytes carried as bounded canonical base64, plus filename, name, source language, target language, and customer approver. The server derives repository identity/version metadata and stamps the approval time. |
-| `FileGlossaryRepository` | CSV or XLSX parsing, explicit identity/version/languages/approval metadata, immutable create-only persistence, conflict detection, hash verification, and version pinning. |
-
-Both file formats use the required columns `id`, `source`, `aliases`, and
-`target_exact`. A session pins the returned immutable version; it never follows a
-mutable "latest" glossary. The current UI selects one glossary version for one
-session. The Harness compiles both directions: the approved `source` ->
-`target_exact` pair controls the declared lane, and an automatically derived
-`target_exact` -> `source` pair controls the reverse lane. Forward aliases are
-not guessed as reverse aliases. Import compiles both directions up front and
-rejects duplicate or ambiguous reverse terms before storing the version.
-
-Supplying `glossaryVersion` when creating a session is valid only when the
-selected mode advertises `deterministicGlossary: true`. The UI prevents an
-incompatible request, and the HTTP API authoritatively rejects it with
-`glossary_unsupported`, returning the compatible modes. This is capability
-driven: currently all `openai_controlled` modes qualify, while no
-`openai_native` or `palabra` mode does. Palabra account-enabled glossaries are
-outside this pinned target-exact guarantee.
-
-Both CSV and XLSX are advertised by `/api/capabilities` and accepted by the
-browser picker. Header names are normalized before mapping; duplicate normalized
-names are rejected before a row object can overwrite an approved value.
-
-## TLS and credential path
-
-The server can start without TLS for a localhost-only PC smoke test. A phone on a
-LAN is not localhost, and browser microphone capture requires a secure context.
-A real two-phone run must therefore use HTTPS/WSS with:
-
-- a certificate whose subject alternative name matches the LAN hostname or IP;
-- a certificate chain trusted by the operator PC and both phones;
-- `TLS_CERT_PATH` and `TLS_KEY_PATH` configured together; and
-- `PUBLIC_BASE_URL` set to that reachable root `https://` origin, with pathname
-  `/` and no credentials, query, or fragment. Startup rejects a base
-  URL below a subpath because the current static application does not mount
-  there.
-
-Operator browser HTTP calls require the bearer token read from the operator URL
-fragment; operator event sockets use the same token. Set `OPERATOR_TOKEN`
-explicitly for an operable launch URL because startup logging deliberately
-redacts the fragment. Per-session participant grants are HMAC-bound to the
-session and side. A participant link keeps that grant in `#access=...`; the
-browser presents it only when opening the same-session event socket and the
-exact-side media socket. Missing or mismatched HTTP credentials return 401, and
-rejected WebSocket connections close with policy code 1008.
-
-The provider credential path is deliberately short:
+The authoritative lifecycle is:
 
 ```text
-launch process environment -> validated server config -> selected OpenAI or Palabra adapter
+operator create waiting room
+  → each participant accepts recording + processing
+  → both sides connect
+  → recorder preflight
+  → operator arm_recorder
+  → provider prewarm/readiness
+  → ready
+  → operator start
+  → active
+  → end or participant withdrawal
+  → finalization
+  → closed
 ```
 
-`OPENAI_API_KEY` is required only for `openai_native` or `openai_controlled`;
-`PALABRA_API_KEY` is required only for `palabra`. Neither key enters browser
-JavaScript, QR links, participant URLs, API payloads, UI events, glossary files,
-or evidence. QR carries a scoped participant grant rather than a provider key.
-`.env.example` documents the variables; `pnpm dev`, `pnpm start`, and `pnpm
-benchmark` load an optional repository-root `.env` through Node's
-`--env-file-if-exists` flag.
+1. `POST /api/sessions` is operator-authenticated and only permitted when the profile's `dataAdmission` is `approved_poc_content`. It creates an unconsented `waiting` room using the fixed English (en-US) <-> Traditional Chinese (zh-TW) pair in either direction, selected mode and optional glossary version, then builds the session's immutable processing manifest.
+2. The side-bound participant page displays the sanitized processing disclosure. The participant accepts recording and processing on that exact side; the server binds the consent receipt to the session manifest's consent policy reference. Browser media cannot attach before consent.
+3. Both sides must connect and report qualified participant readiness (`fake_telephony` is explicitly N/A). `arm_recorder` runs the persisted recorder preflight: disk capacity, encrypted spool/metadata integrity, manifest binding and exactly four tracks.
+4. Arming persists and flushes four `recorder_track_armed` proofs: `source_a`, `source_b`, `playout_to_a`, `playout_to_b`. Provider preparation/prewarm runs automatically before `ready`, and truthful provider readiness must be present in both directions. `translation_prepare_failed` is an operator-only static-safe alert; raw provider errors never cross this boundary.
+5. The `start` command only transitions a fully qualified `ready` session to `active`; it cannot silently make an unprepared partial session active.
+6. A participant's exact-side withdrawal uses a fresh withdrawal ID. It is terminal by policy: the relay ends the session and initiates finalization; it cannot be treated as a pause or reversed into active.
 
-## Media composition seam and future carrier
+The relay normalizes each browser frame to canonical 24 kHz, mono, PCM16LE, 20 ms audio. Source A drives lane `A_TO_B`; source B drives `B_TO_A`. Barge-in starts a new generation for the destination lane and clears only that destination's old provisional playout. It never erases durable final evidence or stops capture on the other lane.
 
-The core depends on the `MediaPort` contract rather than browser or carrier
-types. `createMediaRuntime` currently selects either the browser WebSocket
-adapter or the in-process fake-telephony adapter from one `MEDIA_PROFILE`
-value. The relay, selected provider/mode contract, glossary control, and evidence
-contract do not change.
+## Evidence lifecycle and cryptographic boundary
 
-The fake adapter converts fixed 8 kHz, mono, 20 ms PCMU/G.711 mu-law frames to
-canonical PCM and back. Its test-only driver is exposed by
-`ApplicationComposition` only in that media setting, so integration tests can connect
-both sides, exercise a bounded reorder window, signal speech, inject numbered
-frames, observe generation-aware clear/output events, and test
-hangup/reconnect. DTMF and transport failures enter the core only as normalized
-alert events; they never create translated audio. It is a keyless mechanism
-fixture, not a live carrier integration or a Twilio/SIP acceptance result. The
-fixture itself is keyless; a full server still enforces the selected translation
-provider's normal API-key preflight.
+`SessionArtifactStore` is the production evidence port. It owns storage paths, encryption, finalization, recovery, retention, deletion and managed export. Tests/local evaluations may inject an in-memory port at a narrow seam, but it is not launch-configurable.
 
-A future Twilio Media Streams, SIP/RTP, or PBX adapter belongs at this seam.
-Production phone work must preserve the product rule: ring/connect the two
-humans directly, with no AI greeting or IVR before the human conversation.
+```text
+EVIDENCE_ROOT_KEY_BASE64
+      │
+      ├── HKDF wrapping key ── wraps one random per-session DEK
+      └── HKDF archive-id key ── opaque archive identity
+      └── HKDF audit keys ── detached encrypted content-free audit chain
 
-## Evidence boundary and known gaps
+per-session DEK ── AES-256-GCM/AAD ── encrypted archive + sealed metadata
+```
 
-- Contract and unit tests use local fakes for provider sockets and HTTP calls.
-- The self-check and keyless runner are deterministic; provider and product
-  acceptance verdicts remain `NOT_RUN`.
-- The PCMU fixture validates adapter mechanics (codec conversion, bounded
-  jitter, lifecycle, alerts, and evidence routing) only. It does not exercise
-  Twilio, SIP/RTP networking, carrier provisioning, phone numbers, or live
-  call acceptance.
-- The local TTS corpus replay hash-validates generated WAVs and exercises
-  mu-law conversion, fake telephony, relay, glossary control, playout, and
-  evidence. It injects manifest text as the transcript and therefore makes no
-  acoustic STT or natural target-speech claim.
-- The keyless runner executes the controlled arm's eight formal cases, twelve
-  local-processing latency cases, twenty interruption state-machine cases, and
-  one sparse virtual duplex mechanism fixture: 30 actual PCM frames per lane
-  placed across a virtual 10-minute (60,000-frame) timeline. Its PASS is not a
-  sustained provider or queue-soak result; that evidence remains `NOT_RUN`.
-- Those observations do not include STT, provider translation, TTS, acoustic
-  playback latency, forced alignment, or human review.
-- The discovery command can call the OpenAI text endpoint, but it is not a live
-  speech-to-speech acceptance run.
-- The `palabra` runtime adapter is implemented and exercised with fake sockets;
-  no live Palabra acceptance runner or provider evidence is included, so Palabra
-  acceptance remains `NOT_RUN` without credentials and a completed provider run.
-- A workspace-local helper issues disposable LAN test certificates; installing
-  its CA on each phone, LAN DNS/routing, and firewall setup remain operator
-  responsibilities.
-- Evidence is not a substitute for recording consent or an approved retention
-  policy.
+The configuration declares five non-overlapping, non-nested roots. Each is a
+strict descendant of the dedicated resolved `SECURITY_DATA_DIRECTORY` parent.
+Loopback HTTP development defaults to `./data`; remote HTTPS requires an
+explicit absolute parent outside the deployment cwd. Recursive ancestor
+boundary checks are fail-closed by default; only a disposable exact-loopback
+HTTP fixture may set `ALLOW_INSECURE_LOOPBACK_DATA_BOUNDARY=true`:
 
-These gaps prohibit a live OpenAI or Palabra PASS claim from repository tests
-alone.
+| Root | Purpose |
+|---|---|
+| `EVIDENCE_ARCHIVE_DIRECTORY` | encrypted active spool and sealed ledger |
+| `EVIDENCE_KEY_DIRECTORY` | wrapped-DEK / encrypted metadata sidecar |
+| `EVIDENCE_EXPORT_DIRECTORY` | store-managed plaintext export workspace |
+| `EVIDENCE_RECEIPT_DIRECTORY` | content-free deletion, sweep-health, and detached review-audit receipts |
+
+The preflight persists its result and refuses arming if free space is insufficient, the spool/metadata cannot be verified, or the exact four tracks are not ready. The relay requires a result bound to the session and processing-manifest SHA.
+
+At finalization the store writes a finalization manifest and seal, verifies the encrypted ledger, final chain and four track digests, and binds the receipt to session ID and processing-manifest SHA. The sealed receipt has a retention deadline equal to finalization time plus the profile's default retention. A `FINALIZATION_FAILED` result is explicit (`seal_write_failed`, integrity failure or manifest write failure) with a recovery directive; it blocks managed export and blocks a local PASS claim.
+
+Evidence visibility is intentionally split:
+
+- accepted final provider-derived transcript/terminology/alert events are durable and retain internal opaque `evidenceRef` values;
+- provisional provider events are live-only, not durable;
+- rejected provider output and adapter diagnostics become `translation_rejected` evidence records only;
+- browser/session/event projections never emit rejection payloads, raw evidence refs, provider credentials, root keys, archive paths or raw archive identities; and
+- the only profile plaintext-export policy is `explicit_owner_acknowledgement`; a frozen authorized reviewer may request sealed metadata and bounded audio windows but never create plaintext.
+
+## Retention, recovery and governance
+
+The only retention policy accepted by the core is scheduled deletion with a 14-day default, one extension, a 30-day maximum, and expiry verification within 24 hours.
+
+- startup calls `recover()` before serving and performs an immediate sweep; fatal recovery errors (for example, an unreadable or unauthenticated evidence root) abort startup, while recoverable finalization failures or crash-orphan quarantines start a restricted degraded health/deletion service;
+- the same server schedules a sweep every hour on the same artifact store;
+- if a sweep fails, retention health becomes degraded and the server refuses new sessions, extension and export while allowing an owner-initiated deletion;
+- extension is owner-only, idempotent by UUID command ID, requires a reason and UTC deadline, and cannot be used more than once or beyond 30 days;
+- early deletion or scheduled expiry delete terminal sealed artifacts or governed/quarantined `FINALIZATION_FAILED` artifacts;
+- deletion erases the encrypted ledger, sidecar and managed plaintext export workspace while retaining a content-free receipt with opaque actor/reason/command information, retention policy/profile/finalization bindings, encrypted-ledger/final-seal hashes, extension audit and the 24-hour verification result. It also retains the detached content-free review-audit chain and records its authenticated head/count in the deletion receipt.
+
+Access scopes are separate:
+
+| Scope | Configuration | Authority |
+|---|---|---|
+| Operator | `OPERATOR_TOKEN` | sessions, commands, glossary import, capability/session/events access |
+| Retention owner (data owner) | `RETENTION_OWNER_ID` + `RETENTION_OWNER_TOKEN` | when matching the frozen session grant: audited retention/metadata/audio review; the retention-owner credential is exclusively authorized for one extension, early deletion, immutable glossary deletion, finalized plaintext export |
+| Evidence reviewer (deployment-assigned bilingual reviewer) | `EVIDENCE_REVIEWER_ID` + `EVIDENCE_REVIEWER_TOKEN` | when matching the frozen session grant: audited retention summary, metadata pages and bounded audio windows; never plaintext creation or lifecycle mutation |
+
+Tokens must be 32–512 non-whitespace characters and all three tokens must differ. Owner and reviewer identities must differ. The two deployment-assigned identities are frozen into `{ dataOwnerId, bilingualReviewerId }` at session creation; the finalization binding exposes only its hash. “Bilingual reviewer” names a deployment authorization role, not a runtime language-skill assertion. Evidence management is HTTP bearer-token authorization, not the operator URL fragment.
+
+```text
+POST   /api/sessions/:sessionId/evidence/review
+POST   /api/sessions/:sessionId/evidence/review/audio-window
+GET    /api/sessions/:sessionId/evidence/retention
+POST   /api/sessions/:sessionId/evidence/retention/extensions
+DELETE /api/sessions/:sessionId/evidence
+POST   /api/sessions/:sessionId/evidence/exports
+DELETE /api/glossaries/:version
+```
+
+### Sealed evidence-review boundary
+
+The application creates one immutable review grant for every session from deployment configuration, not operator/participant input. A retention-owner actor must equal its `dataOwnerId`; an evidence-reviewer actor must equal its `bilingualReviewerId`. A mismatch receives no session/data projection. Operator bearer and every phone/participant credential are excluded. The grant's raw identities remain internal encrypted evidence; finalization binds its SHA-256 only.
+
+`POST /api/sessions/:sessionId/evidence/review` accepts only `{ cursor?: opaque canonical cursor, pageSize?: 1..100 }` and produces a paged sealed summary plus constrained transcript, glossary-provenance, and alert projections—never audio markers. `POST /api/sessions/:sessionId/evidence/review/audio-window` accepts only `{ track, startOffsetMs, durationMs }`, where track is one of the four evidence tracks and start/duration are 20-ms aligned; duration is 20–30,000 ms. Audio is available exclusively through this route, which returns only bounded 24 kHz mono PCM16LE `audio/wav` (maximum 1,440,044 bytes) and an opaque audit ID header. `GET /api/sessions/:sessionId/evidence/retention` uses the same verified review path and returns only sealed retention deadline metadata. These evidence routes use `Cache-Control: no-store`; none emits a filesystem path, archive ID, raw manifest, evidence reference, export location, or an unbounded/conversation JSON copy of audio.
+
+Under the artifact lifecycle lock, the store verifies sealed finalization, retention deadline, encrypted ledger/final-chain/grant binding and the prior audit head before it exposes a result. It atomically commits an encrypted, HMAC-authenticated, detached content-free audit entry first: allowlisted action/outcome/role; HMACed actor; request-selection HMAC; response hash; timestamp; and prior head. The entry contains no transcript, audio, raw identity, session/archive ID, path or export destination. Audit-integrity or persistence failure fails closed before release. Deletion removes evidence/key/export data but not this receipt-root chain; its deletion receipt preserves the verified audit integrity/head/count. The audit proves an authorized disclosure was durably committed, not that the recipient consumed it.
+
+Owner export uses strict `{ commandId: <UUID>, acknowledgePlaintextExport: true }`; no acknowledgement is rejected and a reused command ID with different input returns `409 idempotency_conflict`. Its 200 response is safe metadata only: export ID, manifest/processing/finalization/seal hashes, count, deadline and track digests—never filesystem destination, archive ID, session plaintext or raw archive reads. It rejects degraded retention with 503 and expired evidence with 410. The reviewer cannot invoke it.
+
+Glossary deletion is owner-only and strict `{ commandId: <UUID>, reason: <trimmed 1..500 chars> }`; server derives actor/time. It returns only opaque completed receipt metadata, or `409 glossary_active`, `404 glossary_not_found`, `409 idempotency_conflict`. A selected version stays leased through its active session and is released on terminal events, relay-open failure and shutdown. The operation is intentionally independent of evidence-retention health.
+
+Glossary persistence uses the existing `EVIDENCE_ROOT_KEY_BASE64` with purpose-separated HKDF subkeys, not a separate key/env/fallback. It writes random-nonce/AAD AES-256-GCM `*.glossary.enc` envelopes under a fresh/dedicated encrypted `GLOSSARY_DIRECTORY`, using POSIX owner-only permissions and fsync atomic writes. The server holds an exclusive glossary-root lease from startup through orderly close; a second process, unsafe ancestor, symlink, or realpath change fails closed. HMAC-authenticated content-free deletion receipts and tombstones survive restart: a matching retry returns its original result, a changed retry conflicts, completed versions cannot be reacquired/reimported, and a new immutable version may be imported. Legacy plaintext glossary files are deliberately not read or migrated.
+
+### Mandatory POC-completion master-glossary disposal
+
+Session finalization seals session evidence; it is not POC closure and it does not delete encrypted master glossary versions. There is no automatic glossary-deletion lifecycle or compatibility path. At POC completion, the retention owner must perform this governance checklist:
+
+1. Reconcile the controlled import/session-manifest log to inventory every immutable encrypted master glossary version imported for the POC, including versions never selected by a session.
+2. For every inventoried version, manually invoke owner-only `DELETE /api/glossaries/:version` with a canonical lowercase UUID `commandId` and a reason.
+3. Retain each resulting content-free deletion receipt in the POC closeout record; it records no glossary content.
+4. Verify the deletion receipt/tombstone enforcement prevents each listed version from being reacquired or reimported.
+5. Do not close the POC if any version remains, any deletion fails (including an active lease), a receipt is missing, or reacquisition remains possible. Release terminal session leases and retry as necessary.
+
+An earlier customer deletion request uses the same manual owner-only DELETE operation as soon as its lease is released; its receipt remains part of the final reconciliation. The legacy plaintext glossary root must be securely disposed under the organization’s deletion procedure before the fresh/dedicated encrypted `GLOSSARY_DIRECTORY` is used. It is not read, migrated, or retained as a compatibility or recovery source.
+
+Managed plaintext export is an authenticated owner HTTP client. It accepts only a base URL, session ID, canonical command ID and explicit plaintext acknowledgement; the retention-owner bearer token is injected through `EVIDENCE_OWNER_ACCESS_TOKEN`, never argv. It never accepts a root key, `--local-admin`, managed roots, archive ID or self-reported owner identity. The server derives the actor from the bearer token and enforces the frozen data-owner grant before invoking the owner-only export route. Four-track WAV admission rejects a timeline over five minutes or aggregate WAV output over 128 MiB before opening plaintext files.
+
+```powershell
+$env:EVIDENCE_OWNER_ACCESS_TOKEN = '<retention-owner-bearer-token>'
+pnpm evidence:export -- --base-url http://127.0.0.1:4207 `
+  --session-id <session-id> `
+  --command-id <canonical-lowercase-uuid> `
+  --acknowledge-plaintext-export
+
+pnpm evidence:sweep -- --local-admin `
+  --archive-root .\data\evidence\archive `
+  --key-root .\data\evidence\keys `
+  --export-root .\data\evidence\exports `
+  --receipt-root .\data\evidence\receipts
+```
+
+The export CLI base URL must use HTTPS; only exact `127.0.0.1` or `[::1]` loopback HTTP fixtures are permitted, and `localhost` or remote HTTP is rejected before a bearer is sent. The client streams response bodies through a 256 KiB cap and fixed request deadline before JSON parsing. The export CLI command ID must be reused verbatim after a lost/uncertain result; missing/invalid ID is rejected before any HTTP request. Its output is safe metadata only and never includes plaintext, paths, archive/session identities or bearer tokens; expiry, authorization, conflict and server failures are static nonzero errors. The sweep CLI has no command ID and remains the only offline root-key operation: it uses an `offline_admin` lease for recovery and expiry work while the server is stopped and roots are released. A live foreign lease makes sweep fail closed before evidence I/O. Leases have no fixed expiry: a stale same-host lease is reclaimed only after the OS confirms its process is dead; unknown/cross-host leases refuse administration. Simultaneous server and offline-sweep access to the same roots is never safe or supported.
+
+## HTTP, WebSocket and UI boundary
+
+Fastify serves the operator/participant UI, JSON API, session event WebSocket, participant side-bound consent/withdrawal routes and browser media WebSocket. The server maps internal `SessionEvent` records to a deliberately sanitized `UiEventEnvelope`.
+
+Participant media access is signed and bound to session plus side. Operator token access permits operator API/event access; it does not replace participant consent or evidence-management credentials. Startup logging redacts operator URL fragments and server logging redacts request URL / authorization.
+
+The operator Evidence Console reports state, consent, connections, recorder preflight/arm status, participant/provider readiness, truthful queue/lag provenance, terminology state, genuine barge lifecycle, capability table, glossary state, alerts, generation cuts and closure. It also receives operator-only `evidenceIdentity`: deployment build SHA, profile id/version/SHA, processing-manifest SHA and services SHA. It is not an evidence-review credential and cannot retrieve retention summaries, review metadata, or review WAV data. Headphone confirmation is a participant self-attestation, not a verified hardware fact. Provider readiness preserves adapter semantics rather than claiming a generic external provider connection.
+
+Operator `session_state` / terminal `session_closed` projections may include sanitized `evidenceFinalization`: either sealed manifest/ledger/chain hashes, retention deadline and four track `{sha256, frameCount, byteCount}` values, or `FINALIZATION_FAILED` with allowlisted `failureCode` and recovery directive. Participant projections never include those console fields, raw manifests, evidence refs, tokens, paths, archive IDs or free-form provider errors.
+
+## Validation boundary
+
+Repository checks include TypeScript, unit/integration contracts, browser lifecycle and keyless benchmark artifacts. They exercise processing-manifest binding, consent/withdrawal, four-track preflight/arming, encryption/integrity, retention, opaque references, managed export and local relay mechanics.
+
+`pnpm benchmark` writes `MECHANISM_PASS` / `acceptanceVerdict: NOT_RUN` for the deterministic self-check. A keyless run labels valid local mechanism gate outcomes `PASS` or `FAIL`; it labels malformed/non-opaque evidence references or terminal finalization/manifest integrity failures `INVALID_RUN`, never `FAIL`; intentionally unexecuted acceptance is `NOT_RUN`. The default artifact is 41 `PASS`, 0 `FAIL`, 0 `INVALID_RUN`, 142 `NOT_RUN`. Its local release evidence gate is nevertheless `NOT_RUN`: it lacks acoustic latency/barge-in and exported normalized-event/four-track audio evidence. Content-bound virtual receipt hashes are not encrypted persistence or recorder/audio coverage. No benchmark result may claim credentialed OpenAI/Palabra acceptance, regional/DPA/training/retention assurances, real-phone/PSTN/SIP behavior, operational reliability or human product acceptance. The reference `manufacturing-poc` profile intentionally retains its unverified external assurances as `NOT_RUN` and blocks human session creation.

@@ -1,9 +1,41 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
+import type {
+  ArtifactRecoveryResult,
+  EvidenceDeleteRequest,
+  EvidenceDeletionResult,
+  EvidenceRootLeaseRole,
+  EvidenceRootProcessLease,
+  ManagedEvidenceExportLease,
+  ManagedEvidenceExportLeaseCompletion,
+  ManagedEvidenceExportLeaseRequest,
+  ManagedEvidenceExportLeaseResult,
+  RetentionExtensionRequest,
+  RetentionExtensionResult,
+  RetentionSweepHealth,
+  RetentionSweepResult,
+  SessionArtifactDescriptor,
+  SessionArtifactLookup,
+  SessionArtifactManagementPort,
+  SessionRetentionStatus,
+} from "../../src/adapters/evidence/session-artifact-store.js";
+import type {
+  EvidenceReview,
+  EvidenceReviewRequest,
+  EvidenceReviewResult,
+} from "../../src/adapters/evidence/review.js";
 import { FakeTelephonyMediaPort } from "../../src/adapters/media/fake-telephony.js";
 import { CANONICAL_AUDIO, createAudioFrame } from "../../src/core/audio.js";
+import {
+  canonicalJsonSha256,
+  validateApprovedSessionProcessingProfile,
+  type ApprovedSessionProcessingProfile,
+  type ContractEvidenceReference,
+  type ExternalAssurance,
+} from "../../src/core/processing-profile.js";
 import { ModularGuardedDuplexRelay } from "../../src/core/relay.js";
 import { resolveTranslationBehavior } from "../../src/core/translation-behavior.js";
+import { createSyntheticPocProcessingProfile } from "../../src/local-eval/synthetic-poc-processing-manifest.js";
 import { createMediaRuntime } from "../../src/media-runtime.js";
 import { createServerAccessControl } from "../../src/server/access.js";
 import {
@@ -15,11 +47,16 @@ import type {
   EvidencePort,
   EvidenceRecord,
   EvidenceAudioTrack,
+  EvidenceFinalization,
+  EvidenceFinalizeRequest,
   GenerationRef,
   Lane,
   LaneContext,
+  RecorderPreflightRequest,
+  RecorderPreflightResult,
   TranslationCapabilities,
   TranslationEvent,
+  TranslationPreparation,
   TranslationPort,
   TranslationRequest,
 } from "../../src/core/types.js";
@@ -31,6 +68,89 @@ import type {
  */
 export const ACCEPTANCE_MODES = ["fast", "balanced", "accurate"] as const;
 export type AcceptanceMode = (typeof ACCEPTANCE_MODES)[number];
+
+const SYNTHETIC_EVIDENCE_SHA256 = createHash("sha256")
+  .update("synthetic-acceptance-evidence-v1")
+  .digest("hex");
+export const SYNTHETIC_DEPLOYMENT_BUILD_SHA256 = "d".repeat(64);
+const SYNTHETIC_EVIDENCE_TRACKS = [
+  "source_a",
+  "source_b",
+  "playout_to_a",
+  "playout_to_b",
+] as const;
+const RETENTION_DURATION_MS = 14 * 24 * 60 * 60 * 1_000;
+const TEST_ONLY_ASSURANCE_SHA256 = "e".repeat(64);
+const TEST_ONLY_APPROVED_AT_UTC = "2026-08-09T00:00:00.000Z";
+
+function testOnlyEvidenceReference(subject: string): ContractEvidenceReference {
+  return Object.freeze({
+    id: "urn:test-only:" + subject,
+    revision: "test-fixture-v1",
+    sha256: TEST_ONLY_ASSURANCE_SHA256,
+    approvedBy: "test-fixture@example.test",
+    approvedAtUtc: TEST_ONLY_APPROVED_AT_UTC,
+  });
+}
+
+function testOnlyVerifiedAssurance<T>(value: T, subject: string): ExternalAssurance<T> {
+  return Object.freeze({
+    status: "verified" as const,
+    value,
+    evidenceRef: testOnlyEvidenceReference(subject),
+  });
+}
+
+const TEST_ONLY_VERIFIED_HUMAN_SESSION_PROFILE: ApprovedSessionProcessingProfile = (() => {
+  const { sha256: _syntheticSha256, ...synthetic } = createSyntheticPocProcessingProfile();
+  const body = {
+    ...synthetic,
+    id: "test-only-verified-human-session",
+    version: "2026-08-09-test-only",
+    services: Object.freeze(synthetic.services.map((service) => Object.freeze({
+      ...service,
+      trainingUse: testOnlyVerifiedAssurance(
+        "no_training" as const,
+        service.id + ":training-use",
+      ),
+      serviceRetention: testOnlyVerifiedAssurance(
+        { kind: "zero_retention" } as const,
+        service.id + ":service-retention",
+      ),
+    }))),
+    approval: Object.freeze({
+      approvalId: "test-only-human-session-admission",
+      approvedBy: "test-fixture@example.test",
+      approvedAtUtc: TEST_ONLY_APPROVED_AT_UTC,
+    }),
+  } satisfies Omit<ApprovedSessionProcessingProfile, "sha256">;
+  return Object.freeze({
+    ...body,
+    sha256: canonicalJsonSha256(body),
+  });
+})();
+
+const TEST_ONLY_VERIFIED_HUMAN_SESSION_VALIDATION = validateApprovedSessionProcessingProfile(
+  TEST_ONLY_VERIFIED_HUMAN_SESSION_PROFILE,
+);
+
+if (
+  TEST_ONLY_VERIFIED_HUMAN_SESSION_PROFILE.services.some((service) =>
+    service.trainingUse.status !== "verified" || service.serviceRetention.status !== "verified"
+  ) ||
+  TEST_ONLY_VERIFIED_HUMAN_SESSION_VALIDATION.acceptanceImpact !== "NOT_RUN"
+) {
+  throw new Error("Test-only human-session profile must verify only the admission assurances");
+}
+
+/**
+ * Test-only positive fixture for server admission with injected local adapters.
+ * Its urn:test-only evidence references are never a deployment, CLI, benchmark,
+ * or product-acceptance claim.
+ */
+export function createTestOnlyVerifiedHumanSessionProcessingProfile(): ApprovedSessionProcessingProfile {
+  return TEST_ONLY_VERIFIED_HUMAN_SESSION_PROFILE;
+}
 
 interface DeferredGate {
   readonly reached: Promise<void>;
@@ -59,18 +179,19 @@ function deferredGate(): DeferredGate {
 function acceptanceCapabilities(): TranslationCapabilities {
   return Object.freeze({
     providerId: "openai_controlled",
-    supportedModes: Object.freeze(ACCEPTANCE_MODES.map((mode) => {
+    modes: Object.freeze(ACCEPTANCE_MODES.map((mode) => {
       const behavior = resolveTranslationBehavior(mode);
       return Object.freeze({
         mode,
         behaviorVersion: behavior.version,
-        deterministicGlossary: behavior.requirements.deterministicGlossary,
+        state: "locally_controlled" as const,
+        deterministicGlossary: false,
       });
     })),
     supportsProvisionalRevisions: true,
     supportsFinality: true,
     supportsCancellation: true,
-    supportsDeterministicGlossary: true,
+    supportsDeterministicGlossary: false,
   });
 }
 
@@ -81,13 +202,32 @@ export function acceptanceServerTranslation(
 }
 
 const emptyGlossaries: GlossaryRegistry = Object.freeze({
+  async acquireRootLease() {
+    return Object.freeze({
+      async release(): Promise<void> {},
+    });
+  },
   async importFile() {
     throw new Error("The keyless acceptance harness does not import glossaries");
   },
-  async get() {
+  async acquire() {
     return undefined;
   },
+  async deleteVersion() {
+    throw new Error("The keyless acceptance harness does not delete glossaries");
+  },
 });
+
+/**
+ * Keyless acceptance never creates a sealed artifact review lease. It returns
+ * the same generic absence result as the production review boundary without
+ * pretending its in-memory relay evidence is reviewable.
+ */
+const keylessEvidenceReview = Object.freeze({
+  async review(_request: EvidenceReviewRequest): Promise<EvidenceReviewResult> {
+    return Object.freeze({ status: "not_found" as const });
+  },
+} satisfies Pick<EvidenceReview, "review">);
 
 /**
  * Deterministic test-only adapter. It deliberately emits a post-cancellation
@@ -125,8 +265,12 @@ export class DeterministicAcceptanceTranslation implements TranslationPort {
     gate.release();
   }
 
-  async prepare(context: LaneContext): Promise<void> {
+  async prepare(context: LaneContext): Promise<TranslationPreparation> {
     this.prepared.push(structuredClone(context));
+    return Object.freeze({
+      readiness: "fixture_local" as const,
+      remoteConnection: "not_applicable" as const,
+    });
   }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
@@ -182,6 +326,7 @@ export class DeterministicAcceptanceTranslation implements TranslationPort {
     ordinal: number,
   ): Iterable<TranslationEvent> {
     const prefix = context.turnId + ":" + ordinal;
+    const evidenceRef = "acceptance:" + prefix;
     const source = "[" + context.behavior.mode + " source " + context.lane + " " + ordinal + "]";
     const target = "[" + context.behavior.mode + " target " + context.lane + " " + ordinal + "]";
     const base = {
@@ -189,6 +334,7 @@ export class DeterministicAcceptanceTranslation implements TranslationPort {
       lane: context.lane,
       generation: context.generation,
       turnId: context.turnId,
+      evidenceRef,
       emittedAtMs: performance.now(),
     } as const;
 
@@ -266,7 +412,8 @@ export class DeterministicAcceptanceTranslation implements TranslationPort {
       ...base,
       kind: "audio",
       segmentId: prefix + ":audio",
-      revision: 0,
+      targetSegmentId: prefix + ":target",
+      revision: context.behavior.transcriptPolicy === "provisional_revisions" ? 1 : 0,
       finality: "final",
       playoutSequence: ordinal,
       frame,
@@ -283,22 +430,108 @@ export class DeterministicAcceptanceTranslation implements TranslationPort {
       segmentId: context.turnId + ":completed",
       revision: ordinal,
       finality: "final",
+      evidenceRef: "acceptance:" + context.turnId + ":completed",
       emittedAtMs: performance.now(),
     };
   }
 }
 
+/**
+ * Synthetic lifecycle fake for keyless acceptance. Its opaque receipts prove
+ * ordering only; it does not emulate or claim production evidence storage.
+ */
 export class AcceptanceEvidence implements EvidencePort {
   readonly records: EvidenceRecord[] = [];
-  readonly closedSessionIds: string[] = [];
+  readonly #preflights = new Map<
+    string,
+    Extract<RecorderPreflightResult, { readonly status: "ready" }>
+  >();
+  readonly #finalizations = new Map<string, EvidenceFinalization>();
 
-  record(record: EvidenceRecord): boolean {
+  async persist(record: EvidenceRecord): Promise<void> {
+    if (this.#finalizations.has(record.sessionId)) {
+      throw new Error("Cannot persist synthetic evidence after finalization");
+    }
     this.records.push(structuredClone(record));
-    return true;
   }
 
-  async close(sessionId: string): Promise<void> {
-    this.closedSessionIds.push(sessionId);
+  async preflightRecorder(
+    request: RecorderPreflightRequest,
+  ): Promise<RecorderPreflightResult> {
+    const existing = this.#preflights.get(request.sessionId);
+    if (existing !== undefined) {
+      if (existing.processingManifestSha256 === request.processingManifestSha256) return existing;
+      return Object.freeze({
+        status: "failed" as const,
+        sessionId: request.sessionId,
+        processingManifestSha256: request.processingManifestSha256,
+        checkedAtMonoMs: request.checkedAtMonoMs,
+        failureCode: "evidence_preflight_integrity_failed" as const,
+      });
+    }
+    const preflight = Object.freeze({
+      status: "ready" as const,
+      sessionId: request.sessionId,
+      processingManifestSha256: request.processingManifestSha256,
+      preflightId: "synthetic-acceptance-preflight:" + request.sessionId,
+      checkedAtMonoMs: request.checkedAtMonoMs,
+      requiredFreeBytes: "0",
+      availableFreeBytes: "0",
+      tracks: SYNTHETIC_EVIDENCE_TRACKS,
+      manifestSha256: SYNTHETIC_EVIDENCE_SHA256,
+      encryptedSpoolSha256: SYNTHETIC_EVIDENCE_SHA256,
+      sealedRecordCount: Math.max(1, this.records.filter((record) => record.sessionId === request.sessionId).length),
+      sealSha256: SYNTHETIC_EVIDENCE_SHA256,
+    });
+    this.#preflights.set(request.sessionId, preflight);
+    return preflight;
+  }
+
+  async flush(_sessionId: string): Promise<void> {}
+
+  async finalize(request: EvidenceFinalizeRequest): Promise<EvidenceFinalization> {
+    const existing = this.#finalizations.get(request.sessionId);
+    if (existing !== undefined) return existing;
+
+    const preflight = this.#preflights.get(request.sessionId);
+    if (
+      preflight === undefined ||
+      preflight.processingManifestSha256 !== request.processingManifestSha256
+    ) {
+      return Object.freeze({
+        status: "FINALIZATION_FAILED" as const,
+        sessionId: request.sessionId,
+        processingManifestSha256: request.processingManifestSha256,
+        failureCode: "integrity_verification_failed" as const,
+        recovery: "rebuild_from_spool" as const,
+      });
+    }
+
+    const recordCount = this.records.filter((record) => record.sessionId === request.sessionId).length;
+    if (recordCount === 0) {
+      return Object.freeze({
+        status: "FINALIZATION_FAILED" as const,
+        sessionId: request.sessionId,
+        processingManifestSha256: request.processingManifestSha256,
+        failureCode: "integrity_verification_failed" as const,
+        recovery: "rebuild_from_spool" as const,
+      });
+    }
+
+    const finalization: EvidenceFinalization = Object.freeze({
+      status: "sealed" as const,
+      sessionId: request.sessionId,
+      processingManifestSha256: request.processingManifestSha256,
+      manifestSha256: SYNTHETIC_EVIDENCE_SHA256,
+      encryptedLedgerSha256: SYNTHETIC_EVIDENCE_SHA256,
+      finalChainSha256: SYNTHETIC_EVIDENCE_SHA256,
+      recordCount,
+      finalizedAtUtc: new Date(request.finalizedAtMonoMs).toISOString(),
+      retentionDeadlineAt: new Date(request.finalizedAtMonoMs + RETENTION_DURATION_MS).toISOString(),
+      tracks: this.#trackDigests(request.sessionId),
+    });
+    this.#finalizations.set(request.sessionId, finalization);
+    return finalization;
   }
 
   audioTracks(sessionId: string): readonly EvidenceAudioTrack[] {
@@ -309,6 +542,109 @@ export class AcceptanceEvidence implements EvidencePort {
         )
         .map((record) => record.track)),
     ].sort());
+  }
+
+  #trackDigests(sessionId: string) {
+    return Object.freeze({
+      source_a: this.#trackDigest(sessionId, "source_a"),
+      source_b: this.#trackDigest(sessionId, "source_b"),
+      playout_to_a: this.#trackDigest(sessionId, "playout_to_a"),
+      playout_to_b: this.#trackDigest(sessionId, "playout_to_b"),
+    });
+  }
+
+  #trackDigest(sessionId: string, track: EvidenceAudioTrack) {
+    const records = this.records.filter((record): record is Extract<EvidenceRecord, { type: "audio" }> =>
+      record.type === "audio" && record.sessionId === sessionId && record.track === track
+    );
+    return Object.freeze({
+      sha256: SYNTHETIC_EVIDENCE_SHA256,
+      frameCount: records.length,
+      byteCount: records.reduce((total, record) => total + record.frame.pcm16le.byteLength, 0),
+    });
+  }
+}
+
+/**
+ * Keyless test-only management boundary. It supplies the no-op in-process
+ * root lease required for app startup, but rejects artifact, evidence,
+ * retention, and export operations so it cannot be mistaken for production
+ * storage or cross-process ownership.
+ */
+export class KeylessArtifactManagement implements SessionArtifactManagementPort {
+  async persist(_record: EvidenceRecord): Promise<void> {
+    return this.#unsupported("persist");
+  }
+
+  async flush(_sessionId: string): Promise<void> {
+    return this.#unsupported("flush");
+  }
+
+  async preflightRecorder(_request: RecorderPreflightRequest): Promise<RecorderPreflightResult> {
+    return this.#unsupported("preflightRecorder");
+  }
+
+  async finalize(_request: EvidenceFinalizeRequest): Promise<EvidenceFinalization> {
+    return this.#unsupported("finalize");
+  }
+
+  async artifact(_lookup: SessionArtifactLookup): Promise<SessionArtifactDescriptor | undefined> {
+    return this.#unsupported("artifact");
+  }
+
+  async getRetention(_sessionId: string): Promise<SessionRetentionStatus | undefined> {
+    return this.#unsupported("getRetention");
+  }
+
+  async extendRetention(_request: RetentionExtensionRequest): Promise<RetentionExtensionResult> {
+    return this.#unsupported("extendRetention");
+  }
+
+  async deleteEvidence(_request: EvidenceDeleteRequest): Promise<EvidenceDeletionResult> {
+    return this.#unsupported("deleteEvidence");
+  }
+
+  getRetentionSweepHealth(): RetentionSweepHealth {
+    return Object.freeze({ health: "healthy" as const });
+  }
+
+  async recover(): Promise<ArtifactRecoveryResult> {
+    return Object.freeze({
+      status: "completed" as const,
+      health: "healthy" as const,
+      recoveredDeletions: 0,
+      sealedArtifacts: 0,
+      finalizationFailures: 0,
+      orphanedActiveArtifacts: 0,
+    });
+  }
+
+  async sweepExpired(): Promise<RetentionSweepResult> {
+    return Object.freeze({
+      status: "completed" as const,
+      health: "healthy" as const,
+      expiredArtifactsDeleted: 0,
+    });
+  }
+
+  async acquireEvidenceRootLease(role: EvidenceRootLeaseRole): Promise<EvidenceRootProcessLease> {
+    return Object.freeze({
+      role,
+      async release(): Promise<void> {},
+    });
+  }
+
+  async withManagedExportLease<T>(
+    _request: ManagedEvidenceExportLeaseRequest,
+    _transaction: (
+      lease: ManagedEvidenceExportLease,
+    ) => Promise<ManagedEvidenceExportLeaseCompletion<T>>,
+  ): Promise<ManagedEvidenceExportLeaseResult<T>> {
+    return this.#unsupported("withManagedExportLease");
+  }
+
+  #unsupported(operation: string): never {
+    throw new Error(`Keyless artifact management does not support ${operation}`);
   }
 }
 
@@ -330,6 +666,7 @@ export function createKeylessTelephonyAcceptanceFixture(): Readonly<{
     media,
     translation,
     evidence,
+    processingProfile: createSyntheticPocProcessingProfile(),
     endpointGrant: (sessionId, side) => ({
       kind: "telephony_test",
       side,
@@ -347,9 +684,20 @@ export function createKeylessTelephonyAcceptanceFixture(): Readonly<{
 export async function createKeylessBrowserAcceptanceApplication(
   origin: string,
   defaultMode: AcceptanceMode = "fast",
+  processingProfile: ApprovedSessionProcessingProfile = createTestOnlyVerifiedHumanSessionProcessingProfile(),
 ) {
   const operatorToken = "acceptance-" + randomUUID() + randomUUID();
-  const access = createServerAccessControl({ operatorToken });
+  const access = createServerAccessControl({
+    operatorToken,
+    retentionOwner: {
+      id: "test-data-owner",
+      token: "acceptance-retention-owner-token-0123456789abcdef",
+    },
+    evidenceReviewer: {
+      id: "test-bilingual-reviewer",
+      token: "acceptance-evidence-reviewer-token-0123456789abcdef",
+    },
+  });
   const mediaRuntime = createMediaRuntime({
     profile: "browser_pair",
     publicBaseUrl: new URL(origin),
@@ -360,10 +708,12 @@ export async function createKeylessBrowserAcceptanceApplication(
   }
   const translation = new DeterministicAcceptanceTranslation();
   const evidence = new AcceptanceEvidence();
+  const artifacts = new KeylessArtifactManagement();
   const relay = new ModularGuardedDuplexRelay({
     media: mediaRuntime.port,
     translation,
     evidence,
+    processingProfile,
     endpointGrant: mediaRuntime.endpointGrant,
   });
   const app = await createServerApp({
@@ -373,6 +723,10 @@ export async function createKeylessBrowserAcceptanceApplication(
     browserMedia: mediaRuntime.browserGateway,
     access,
     translation: acceptanceServerTranslation(defaultMode),
+    processingProfile,
+    deploymentBuildSha256: SYNTHETIC_DEPLOYMENT_BUILD_SHA256,
+    artifacts,
+    evidenceReview: keylessEvidenceReview,
     logger: false,
   });
   return Object.freeze({

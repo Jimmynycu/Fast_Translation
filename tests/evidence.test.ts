@@ -2,541 +2,464 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import {
-  EncryptedFileEvidenceStore,
-  readEncryptedEvidence,
-  readVerifiedEncryptedEvidence,
-} from "../src/adapters/evidence/encrypted-file.js";
-import { InMemoryEvidenceStore } from "../src/adapters/evidence/in-memory.js";
-import { exportEncryptedEvidence } from "../src/adapters/evidence/export.js";
-import { ControlledTranslationAdapter } from "../src/adapters/translation/glossary-controlled.js";
-import { createLocalEvalTranslationAdapter } from "../src/adapters/translation/local-eval.js";
-import { AsyncQueue } from "../src/core/async-queue.js";
-import { ModularGuardedDuplexRelay } from "../src/core/relay.js";
+import { SessionArtifactStore } from "../src/adapters/evidence/session-artifact-store.js";
 import { CANONICAL_AUDIO, createAudioFrame } from "../src/core/audio.js";
+import type { SessionProcessingManifest } from "../src/core/processing-profile.js";
 import {
   EVIDENCE_AUDIO_TRACKS,
-  type AudioFrame,
   type EvidenceAudioTrack,
   type EvidenceRecord,
-  type MediaClearRequest,
-  type MediaIngressEvent,
-  type MediaIngressRequest,
-  type MediaPlaybackRequest,
-  type MediaPort,
+  type EvidenceReviewGrant,
+  type SessionSnapshot,
 } from "../src/core/types.js";
-
-interface TestRecord {
-  readonly sessionId: string;
-  readonly type: "transcript" | "audio";
-  readonly secret?: string;
-  readonly pcm16le?: Uint8Array;
-}
+import { createSyntheticPocProcessingManifest } from "../src/local-eval/synthetic-poc-processing-manifest.js";
+import { resolveTranslationBehavior } from "../src/core/translation-behavior.js";
 
 const taskTemp = join(process.cwd(), "work", "tmp", "evidence-tests");
-
-async function isolatedDirectory(name: string): Promise<string> {
-  const directory = join(taskTemp, name);
-  await rm(directory, { recursive: true, force: true });
-  await mkdir(directory, { recursive: true });
-  return directory;
-}
-
-class BatchedTimelineMedia implements MediaPort {
-  readonly #ingress = new AsyncQueue<MediaIngressEvent>(32);
-  readonly played: AudioFrame[] = [];
-
-  push(event: MediaIngressEvent): void {
-    if (!this.#ingress.offer(event)) throw new Error("test media queue closed");
-  }
-
-  frames(request: MediaIngressRequest): AsyncIterable<MediaIngressEvent> {
-    request.signal.addEventListener("abort", () => this.#ingress.close(), { once: true });
-    return this.#ingress;
-  }
-
-  async play(request: MediaPlaybackRequest): Promise<void> {
-    for await (const frame of request.frames) {
-      if (request.signal.aborted) return;
-      this.played.push(frame);
-      request.onPlayoutStarted(frame, 2_000);
-    }
-  }
-
-  async clear(_request: MediaClearRequest): Promise<void> {}
-
-  closeSession(_sessionId: string): void {
-    this.#ingress.close();
-  }
-}
-
-async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
-  const deadline = performance.now() + 2_000;
-  while (!predicate()) {
-    if (performance.now() > deadline) throw new Error(message);
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  }
-}
-
-describe("encrypted evidence store", () => {
-  it("never writes transcript or PCM evidence in plaintext", async () => {
-    const directory = await isolatedDirectory("encrypted");
-    const key = Buffer.alloc(32, 9);
-    const store = new EncryptedFileEvidenceStore<TestRecord>({ directory, key });
-
-    assert.equal(store.record({ sessionId: "session-one", type: "transcript", secret: "Abbe error" }), true);
-    assert.equal(
-      store.record({ sessionId: "session-one", type: "audio", pcm16le: Uint8Array.from([1, 2, 3, 4]) }),
-      true,
-    );
-    await store.close("session-one");
-
-    const path = store.filePath("session-one");
-    const raw = await readFile(path, "utf8");
-    assert.doesNotMatch(raw, /Abbe error/);
-    const decrypted = await readEncryptedEvidence<TestRecord>(path, key);
-    assert.equal(decrypted[0]?.secret, "Abbe error");
-    assert.deepEqual(decrypted[1]?.pcm16le, Uint8Array.from([1, 2, 3, 4]));
-    const verified = await readVerifiedEncryptedEvidence<TestRecord>(path, key);
-    assert.deepEqual(verified.seal, {
-      schemaVersion: 2,
-      recordCount: 2,
-      finalChainSha256: verified.seal.finalChainSha256,
-      sealSha256: verified.seal.sealSha256,
-    });
-  });
-
-  it("authenticates every record and rejects the wrong key", async () => {
-    const directory = await isolatedDirectory("wrong-key");
-    const store = new EncryptedFileEvidenceStore<TestRecord>({
-      directory,
-      key: Buffer.alloc(32, 1),
-    });
-    store.record({ sessionId: "session-two", type: "transcript", secret: "private" });
-    await store.close("session-two");
-    await assert.rejects(
-      readEncryptedEvidence<TestRecord>(store.filePath("session-two"), Buffer.alloc(32, 2)),
-    );
-  });
-
-  it("rejects a truncated or reordered record chain even with the correct key", async () => {
-    const directory = await isolatedDirectory("immutable-seal");
-    const key = Buffer.alloc(32, 11);
-    const store = new EncryptedFileEvidenceStore<TestRecord>({ directory, key });
-    store.record({ sessionId: "session-sealed", type: "transcript", secret: "first" });
-    store.record({ sessionId: "session-sealed", type: "transcript", secret: "second" });
-    await store.close("session-sealed");
-    const path = store.filePath("session-sealed");
-    const lines = (await readFile(path, "utf8")).trim().split(/\r?\n/u);
-    assert.equal(lines.length, 3, "two records plus the final seal");
-
-    await writeFile(path, [lines[0], lines[2]].join("\n") + "\n", "utf8");
-    await assert.rejects(
-      readVerifiedEncryptedEvidence<TestRecord>(path, key),
-      /Evidence seal validation failed/u,
-    );
-
-    await writeFile(path, [lines[1], lines[0], lines[2]].join("\n") + "\n", "utf8");
-    await assert.rejects(
-      readVerifiedEncryptedEvidence<TestRecord>(path, key),
-      /Evidence seal validation failed/u,
-    );
-  });
-
-  it("derives the same immutable seal from the same ordered evidence", async () => {
-    const key = Buffer.alloc(32, 12);
-    const [leftDirectory, rightDirectory] = await Promise.all([
-      isolatedDirectory("deterministic-seal-left"),
-      isolatedDirectory("deterministic-seal-right"),
-    ]);
-    const left = new EncryptedFileEvidenceStore<TestRecord>({ directory: leftDirectory, key });
-    const right = new EncryptedFileEvidenceStore<TestRecord>({ directory: rightDirectory, key });
-    const records: readonly TestRecord[] = [
-      { sessionId: "repeatable-seal", type: "transcript", secret: "first" },
-      { sessionId: "repeatable-seal", type: "audio", pcm16le: Uint8Array.from([1, 2, 3]) },
-    ];
-    for (const record of records) {
-      assert.equal(left.record(record), true);
-      assert.equal(right.record(record), true);
-    }
-    await Promise.all([left.close("repeatable-seal"), right.close("repeatable-seal")]);
-    const [leftVerified, rightVerified] = await Promise.all([
-      readVerifiedEncryptedEvidence<TestRecord>(left.filePath("repeatable-seal"), key),
-      readVerifiedEncryptedEvidence<TestRecord>(right.filePath("repeatable-seal"), key),
-    ]);
-    assert.deepEqual(leftVerified.seal, rightVerified.seal);
-  });
-
-  it("fails open at its bounded non-blocking queue instead of stalling media", async () => {
-    const directory = await isolatedDirectory("bounded");
-    const store = new EncryptedFileEvidenceStore<TestRecord>({
-      directory,
-      key: Buffer.alloc(32, 3),
-      maxPendingRecords: 1,
-    });
-    assert.equal(store.record({ sessionId: "session-three", type: "transcript", secret: "first" }), true);
-    assert.equal(store.record({ sessionId: "session-three", type: "transcript", secret: "overflow" }), false);
-    await store.close("session-three");
-  });
+const finalizedAtMs = Date.parse("2026-08-09T00:00:00.000Z");
+const retentionDeadlineAt = "2026-08-23T00:00:00.000Z";
+const fixtureSecret = "fixture-secret: tungsten-bore";
+const FIXED_EVIDENCE_REVIEW_GRANT: EvidenceReviewGrant = Object.freeze({
+  dataOwnerId: "evidence-test-data-owner",
+  bilingualReviewerId: "evidence-test-bilingual-reviewer",
 });
 
-describe("in-memory evidence store", () => {
-  it("clones records and rejects writes after close", async () => {
-    const store = new InMemoryEvidenceStore<TestRecord>();
-    const pcm = Uint8Array.from([7, 8]);
-    assert.equal(store.record({ sessionId: "test", type: "audio", pcm16le: pcm }), true);
-    pcm[0] = 99;
-    assert.deepEqual(store.records("test")[0]?.pcm16le, Uint8Array.from([7, 8]));
-    await store.close("test");
-    assert.equal(store.record({ sessionId: "test", type: "transcript" }), false);
-  });
+const FIXED_FINALIZED_TRACKS = Object.freeze({
+  source_a: Object.freeze({
+    sha256: "d6de9b4bc487a188e6c2e1fc1eea85b7e4199fd6aa1c15e25dfadf54656e410d",
+    frameCount: 1,
+    byteCount: CANONICAL_AUDIO.bytesPerFrame,
+  }),
+  source_b: Object.freeze({
+    sha256: "149d9c76d7fb4f71116db2729beac2c3d1252b429815820f39ddec67661335be",
+    frameCount: 1,
+    byteCount: CANONICAL_AUDIO.bytesPerFrame,
+  }),
+  playout_to_a: Object.freeze({
+    sha256: "0374edf91fb39833c8c49e01341b2a1355b03b4a80ff42816e0ae07ff7ce6c8c",
+    frameCount: 1,
+    byteCount: CANONICAL_AUDIO.bytesPerFrame,
+  }),
+  playout_to_b: Object.freeze({
+    sha256: "5e77ece80a3c68ef0a79868b891ae684642092ed49e998eceecc003104970465",
+    frameCount: 1,
+    byteCount: CANONICAL_AUDIO.bytesPerFrame,
+  }),
 });
 
-describe("controlled fallback evidence", () => {
-  it("records a nonfatal glossary-bypass fallback alert before source playout", async () => {
-    const media = new BatchedTimelineMedia();
-    const evidence = new InMemoryEvidenceStore<EvidenceRecord>();
-    const translation = new ControlledTranslationAdapter({
-      transcriber: {
-        async *transcribe(input) {
-          for await (const _event of input.events) {
-            // Consume the committed turn before returning the deterministic fixture.
-          }
-          yield {
-            type: "transcript_completed" as const,
-            sessionId: input.context.sessionId,
-            lane: input.context.lane,
-            generation: input.context.generation,
-            itemId: "fallback-item",
-            turnId: input.context.turnId,
-            emittedAtMs: 1,
-            transcript: "Inspect the spindle.",
-          };
-        },
-        async cancel() {},
-      },
-      translator: {
-        async translate() {
-          throw new Error("provider unavailable");
-        },
-      },
-      tts: {
-        outputFormat: CANONICAL_AUDIO,
-        async *synthesize() {
-          yield new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(7);
-        },
-      },
-      now: () => 10,
-    });
-    const relay = new ModularGuardedDuplexRelay({
-      media,
-      evidence,
-      translation,
-      createSessionId: () => "controlled-fallback-evidence",
-      endpointGrant: (_sessionId, side) => ({
-        kind: "browser_link",
-        side,
-        url: "local-" + side,
-        qrDataUrl: "local-qr",
-      }),
-    });
-    const snapshot = await relay.open({
+type EvidenceSessionEvent = Extract<EvidenceRecord, { readonly type: "session_event" }>["event"];
+
+async function isolatedRoot(name: string): Promise<string> {
+  const root = join(taskTemp, name);
+  await rm(root, { recursive: true, force: true });
+  await mkdir(root, { recursive: true });
+  return root;
+}
+
+function storeFor(root: string, rootKeyByte = 7): SessionArtifactStore {
+  return new SessionArtifactStore({
+    archiveDirectory: join(root, "archive"),
+    keyDirectory: join(root, "keys"),
+    exportDirectory: join(root, "exports"),
+    receiptDirectory: join(root, "receipts"),
+    securityBoundaryDirectory: root,
+    strictAncestors: false,
+    rootKey: Buffer.alloc(32, rootKeyByte),
+    dataOwnerId: FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId,
+    minimumFreeBytes: 0,
+    now: () => finalizedAtMs,
+  });
+}
+
+function sessionEvent(sessionId: string, event: EvidenceSessionEvent): EvidenceRecord {
+  return { type: "session_event", sessionId, event };
+}
+
+function openedRecord(sessionId: string, manifest: SessionProcessingManifest): EvidenceRecord {
+  const snapshot = {
+    sessionId,
+    status: "waiting",
+    spec: {
       sideA: { language: "en-US" },
       sideB: { language: "zh-TW" },
-      provider: "openai_controlled",
-      mode: "accurate",
-      glossary: {
-        id: "factory-terms",
-        version: "v1",
-        sourceLanguage: "en-US",
-        targetLanguage: "zh-TW",
-        entries: [{
-          id: "spindle",
-          source: "spindle",
-          aliases: [],
-          targetExact: "主軸",
-        }],
-      },
-    });
-    for (const side of ["A", "B"] as const) {
-      media.push({
-        type: "participant_state",
-        sessionId: snapshot.sessionId,
-        side,
-        timestampMonoMs: 1,
-        connected: true,
-      });
-    }
-    await waitUntil(
-      () => relay.snapshot(snapshot.sessionId).status === "ready",
-      "controlled fallback session did not become ready",
-    );
-    await relay.command(snapshot.sessionId, { type: "start", commandId: "start-fallback" });
-    media.push({
-      type: "speech_started",
-      sessionId: snapshot.sessionId,
-      side: "A",
-      timestampMonoMs: 2,
-    });
-    media.push({
-      type: "audio",
-      sessionId: snapshot.sessionId,
-      side: "A",
-      timestampMonoMs: 3,
-      frame: createAudioFrame({
-        sessionId: snapshot.sessionId,
-        lane: "A_TO_B",
-        generation: 0,
-        sequence: 0,
-        capturedAtMs: 3,
-        pcm16le: new Uint8Array(CANONICAL_AUDIO.bytesPerFrame),
-      }),
-    });
-    media.push({
-      type: "speech_ended",
-      sessionId: snapshot.sessionId,
-      side: "A",
-      timestampMonoMs: 4,
-    });
-    await waitUntil(() => media.played.length === 1, "fallback audio did not play");
-
-    const sessionEvents = evidence.records(snapshot.sessionId)
-      .filter((record) => record.type === "session_event")
-      .map((record) => record.event);
-    const fallbackAlertIndex = sessionEvents.findIndex((event) =>
-      event.type === "alert" && event.alert.code === "GLOSSARY_BYPASSED_TRANSLATION_FALLBACK"
-    );
-    const fallbackTargetIndex = sessionEvents.findIndex((event) =>
-      event.type === "target_transcript" && event.text === "Inspect the spindle."
-    );
-    assert.ok(fallbackAlertIndex >= 0, "fallback alert must be recorded as evidence");
-    assert.ok(fallbackTargetIndex > fallbackAlertIndex, "alert evidence must precede fallback text");
-    assert.equal(
-      sessionEvents.some((event) => event.type === "glossary_authorized"),
-      false,
-    );
-
-    await relay.command(snapshot.sessionId, { type: "end", commandId: "end-fallback" });
+      provider: manifest.selectedTranslation.provider,
+      mode: manifest.selectedTranslation.mode,
+      processingManifest: manifest,
+      evidenceReviewGrant: FIXED_EVIDENCE_REVIEW_GRANT,
+    },
+    participants: {
+      A: { kind: "browser_link", side: "A", url: "https://example.test/a", qrDataUrl: "data:,a" },
+      B: { kind: "browser_link", side: "B", url: "https://example.test/b", qrDataUrl: "data:,b" },
+    },
+    participantConsent: {
+      A: { consented: false, recording: false, processing: false },
+      B: { consented: false, recording: false, processing: false },
+    },
+    recorderArmState: "awaiting_consents",
+    recordingArmed: false,
+    participantReadiness: { A: undefined, B: undefined },
+    providerReadiness: { A_TO_B: undefined, B_TO_A: undefined },
+    generations: { A_TO_B: 0, B_TO_A: 0 },
+    behavior: resolveTranslationBehavior(manifest.selectedTranslation.mode),
+    eventCursor: 1,
+    openedAtMs: 0,
+  } satisfies SessionSnapshot;
+  return sessionEvent(sessionId, {
+    type: "session_opened",
+    cursor: 1,
+    sessionId,
+    timestampMonoMs: 0,
+    lane: null,
+    generation: null,
+    snapshot,
   });
-});
+}
 
-describe("encrypted evidence export", () => {
-  it("decrypts authenticated records and exports synchronized mono plus four-channel WAV files", async () => {
-    const encryptedDirectory = await isolatedDirectory("export-source");
-    const outputDirectory = join(taskTemp, "export-output");
-    await rm(outputDirectory, { recursive: true, force: true });
-    const key = Buffer.alloc(32, 7);
-    const store = new EncryptedFileEvidenceStore<EvidenceRecord>({
-      directory: encryptedDirectory,
-      key,
+function consentRecord(
+  sessionId: string,
+  manifest: SessionProcessingManifest,
+  side: "A" | "B",
+  cursor: number,
+): EvidenceRecord {
+  return sessionEvent(sessionId, {
+    type: "participant_consent",
+    cursor,
+    sessionId,
+    timestampMonoMs: cursor,
+    lane: null,
+    generation: null,
+    side,
+    consentId: "fixture-consent-" + side,
+    consentPolicyRef: manifest.consentPolicyRef,
+    recording: true,
+    processing: true,
+    acceptedAtMonoMs: cursor,
+  });
+}
+
+function transcriptRecord(sessionId: string): EvidenceRecord {
+  return sessionEvent(sessionId, {
+    type: "target_transcript",
+    cursor: 4,
+    sessionId,
+    timestampMonoMs: 200,
+    lane: "A_TO_B",
+    generation: 0,
+    turnId: "fixture-turn",
+    segmentId: "fixture-segment",
+    revision: 0,
+    text: fixtureSecret,
+    final: true,
+    evidenceRef: "opaque-fixture-provider-ref",
+  });
+}
+
+function audioRecord(sessionId: string, track: EvidenceAudioTrack): EvidenceRecord {
+  const index = EVIDENCE_AUDIO_TRACKS.indexOf(track);
+  const timelineAtMonoMs = 100 + index * CANONICAL_AUDIO.frameDurationMs;
+  const lane = track === "source_a" || track === "playout_to_b" ? "A_TO_B" : "B_TO_A";
+  return {
+    type: "audio",
+    sessionId,
+    track,
+    timelineAtMonoMs,
+    frame: createAudioFrame({
+      sessionId,
+      lane,
+      generation: 0,
+      sequence: index,
+      capturedAtMs: timelineAtMonoMs,
+      pcm16le: new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(index + 1),
+    }),
+  };
+}
+
+async function encryptedArchiveLines(archivePath: string): Promise<string[]> {
+  return (await readFile(archivePath, "utf8"))
+    .split(/\r?\n/u)
+    .filter((line) => line.length > 0);
+}
+
+interface SealedFixture {
+  readonly root: string;
+  readonly sessionId: string;
+  readonly manifest: SessionProcessingManifest;
+  readonly archiveId: string;
+  readonly archivePath: string;
+  readonly finalization: Extract<Awaited<ReturnType<SessionArtifactStore["finalize"]>>, { readonly status: "sealed" }>;
+}
+
+async function sealFixture(name: string, sessionId: string): Promise<SealedFixture> {
+  const root = await isolatedRoot(name);
+  const store = storeFor(root);
+  const manifest = createSyntheticPocProcessingManifest({ mode: "accurate" });
+  const lease = await store.acquireEvidenceRootLease("server");
+
+  try {
+    await store.persist(openedRecord(sessionId, manifest));
+    await store.persist(consentRecord(sessionId, manifest, "A", 2));
+    await store.persist(consentRecord(sessionId, manifest, "B", 3));
+
+    const preflight = await store.preflightRecorder({
+      sessionId,
+      processingManifestSha256: manifest.manifestSha256,
+      checkedAtMonoMs: 10,
     });
-    const sessionId = "export-session";
-    const laneByTrack: Readonly<Record<EvidenceAudioTrack, "A_TO_B" | "B_TO_A">> = {
-      source_a: "A_TO_B",
-      source_b: "B_TO_A",
-      playout_to_a: "B_TO_A",
-      playout_to_b: "A_TO_B",
-    };
-    EVIDENCE_AUDIO_TRACKS.forEach((track, index) => {
-      assert.equal(store.record({
-        type: "audio",
+    assert.equal(preflight.status, "ready");
+    if (preflight.status !== "ready") throw new Error("fixture recorder preflight failed");
+
+    await store.persist({
+      type: "recorder_preflight",
+      sessionId,
+      timestampMonoMs: 10,
+      preflight,
+    });
+    for (const track of EVIDENCE_AUDIO_TRACKS) {
+      await store.persist({
+        type: "recorder_track_armed",
         sessionId,
         track,
-        timelineAtMonoMs: 1_000,
-        frame: createAudioFrame({
-          sessionId,
-          lane: laneByTrack[track],
-          generation: 0,
-          sequence: index,
-          capturedAtMs: 1_000,
-          pcm16le: new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(index + 1),
-        }),
-      }), true);
-    });
-    assert.equal(store.record({
-      type: "session_event",
+        armedAtMonoMs: 11,
+        consentPolicyRef: manifest.consentPolicyRef,
+      });
+      await store.persist(audioRecord(sessionId, track));
+    }
+    await store.persist(transcriptRecord(sessionId));
+    await store.flush(sessionId);
+
+    const finalization = await store.finalize({
       sessionId,
-      event: {
-        type: "session_closed",
-        cursor: 1,
-        sessionId,
-        timestampMonoMs: 1_020,
-        lane: null,
-        generation: null,
-        reason: "test complete",
-      },
-    }), true);
-    await store.close(sessionId);
-
-    const exported = await exportEncryptedEvidence({
-      encryptedPath: store.filePath(sessionId),
-      key,
-      outputDirectory,
+      processingManifestSha256: manifest.manifestSha256,
+      finalizedAtMonoMs: 250,
+      reason: "operator_end",
+      lastPersistedEventCursor: 4,
     });
-    assert.equal(exported.sessionId, sessionId);
-    assert.equal(exported.recordCount, 5);
-    assert.equal(exported.eventCount, 1);
-    assert.deepEqual(exported.trackFrameCounts, {
-      source_a: 1,
-      source_b: 1,
-      playout_to_a: 1,
-      playout_to_b: 1,
-    });
-    assert.equal(exported.schemaVersion, 2);
-    assert.equal(exported.evidenceSeal.recordCount, 5);
-    assert.match(exported.evidenceSeal.finalChainSha256, /^[a-f0-9]{64}$/u);
-    assert.equal(exported.fourTrack.channels, 4);
-    assert.match(exported.exportSha256, /^[a-f0-9]{64}$/u);
+    if (finalization.status !== "sealed") {
+      throw new Error(
+        `fixture finalization failed: ${finalization.failureCode}/${finalization.recovery}`,
+      );
+    }
+    assert.equal(finalization.status, "sealed");
 
-    const events = await readFile(join(outputDirectory, "events.jsonl"), "utf8");
-    assert.match(events, /session_closed/u);
-    assert.doesNotMatch(events, /pcm16le|base64/u);
+    const descriptor = await store.artifact({ sessionId });
+    if (descriptor === undefined) throw new Error("sealed fixture has no artifact descriptor");
+    return {
+      root,
+      sessionId,
+      manifest,
+      archiveId: descriptor.archiveId,
+      archivePath: descriptor.archivePath,
+      finalization,
+    };
+  } finally {
+    await lease.release();
+  }
+}
 
-    const mono = await readFile(join(outputDirectory, "source_a.wav"));
-    assert.equal(mono.toString("ascii", 0, 4), "RIFF");
-    assert.equal(mono.readUInt16LE(22), 1);
-    assert.equal(mono.readUInt32LE(24), 24_000);
-    assert.equal(mono.readUInt16LE(34), 16);
-    assert.equal(mono.readUInt32LE(40), CANONICAL_AUDIO.bytesPerFrame);
-
-    const mux = await readFile(join(outputDirectory, "four-track.wav"));
-    assert.equal(mux.readUInt16LE(22), 4);
-    assert.equal(mux.readUInt32LE(40), CANONICAL_AUDIO.bytesPerFrame * 4);
-    assert.deepEqual(
-      [...mux.subarray(44, 52)],
-      [1, 1, 2, 2, 3, 3, 4, 4],
-    );
+describe("session artifact evidence", () => {
+  it("rejects unarmed audio persistence rather than silently dropping it", async () => {
+    const store = storeFor(await isolatedRoot("unarmed-persist"));
+    const lease = await store.acquireEvidenceRootLease("server");
+    try {
+      await assert.rejects(store.persist(audioRecord("unarmed-persist-session", "source_a")));
+    } finally {
+      await lease.release();
+    }
   });
 
-  it("normalizes batched source and multi-frame playout timelines before WAV export", async () => {
-    const encryptedDirectory = await isolatedDirectory("batched-relay-source");
-    const outputDirectory = join(taskTemp, "batched-relay-output");
-    await rm(outputDirectory, { recursive: true, force: true });
-    const key = Buffer.alloc(32, 8);
-    const store = new EncryptedFileEvidenceStore<EvidenceRecord>({
-      directory: encryptedDirectory,
-      key,
-    });
-    const media = new BatchedTimelineMedia();
-    let now = 100;
-    const relay = new ModularGuardedDuplexRelay({
-      media,
-      evidence: store,
-      translation: createLocalEvalTranslationAdapter({
-        transcriptByLane: {
-          A_TO_B: "Verify the Abbe offset.",
-          B_TO_A: "請檢查阿貝偏移。",
+  it("seals encrypted canonical evidence with a fixed four-track vector and survives restart", async () => {
+    const fixture = await sealFixture("sealed-durable-vector", "evidence-vector-session");
+
+    assert.equal(fixture.finalization.sessionId, fixture.sessionId);
+    assert.equal(fixture.finalization.processingManifestSha256, fixture.manifest.manifestSha256);
+    assert.equal(fixture.finalization.recordCount, 13);
+    assert.equal(fixture.finalization.finalizedAtUtc, "2026-08-09T00:00:00.000Z");
+    assert.equal(fixture.finalization.retentionDeadlineAt, retentionDeadlineAt);
+    assert.deepEqual(fixture.finalization.tracks, FIXED_FINALIZED_TRACKS);
+    assert.match(fixture.finalization.manifestSha256, /^[a-f0-9]{64}$/u);
+    assert.match(fixture.finalization.encryptedLedgerSha256, /^[a-f0-9]{64}$/u);
+    assert.match(fixture.finalization.finalChainSha256, /^[a-f0-9]{64}$/u);
+    assert.match(fixture.archiveId, /^[a-f0-9]{64}$/u);
+    assert.doesNotMatch(fixture.archivePath, /evidence-vector-session/u);
+
+    const ciphertext = await readFile(fixture.archivePath, "utf8");
+    assert.doesNotMatch(ciphertext, /fixture-secret: tungsten-bore/u);
+    assert.doesNotMatch(ciphertext, /fixture-consent-A/u);
+    assert.equal(ciphertext.includes(FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId), false);
+    assert.equal(ciphertext.includes(FIXED_EVIDENCE_REVIEW_GRANT.bilingualReviewerId), false);
+
+    const reopened = storeFor(fixture.root);
+    const reopenedLease = await reopened.acquireEvidenceRootLease("server");
+    try {
+      const replayedRecords: EvidenceRecord[] = [];
+      const review = await reopened.withVerifiedSealedReviewLease({
+        kind: "metadata_page",
+        sessionId: fixture.sessionId,
+        actor: {
+          role: "retention_owner",
+          actorId: FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId,
         },
-      }),
-      now: () => now += 1,
-      createSessionId: () => "batched-evidence-session",
-      endpointGrant: (_sessionId, side) => ({
-        kind: "browser_link",
-        side,
-        url: "local-" + side,
-        qrDataUrl: "local-qr",
-      }),
-    });
-    const snapshot = await relay.open({
-      sideA: { language: "en-US" },
-      sideB: { language: "zh-TW" },
-      provider: "openai_controlled",
-      mode: "accurate",
-      glossary: {
-        id: "batched-terms",
-        version: "1",
-        sourceLanguage: "en-US",
-        targetLanguage: "zh-TW",
-        entries: [{
-          id: "abbe-offset",
-          source: "Abbe offset",
-          aliases: [],
-          targetExact: "阿貝偏移",
-        }],
-      },
-      maxQueueFrames: 16,
-    });
-    for (const side of ["A", "B"] as const) {
-      media.push({
-        type: "participant_state",
-        sessionId: snapshot.sessionId,
-        side,
-        timestampMonoMs: 900,
-        connected: true,
+        pageSize: 100,
+      }, async (lease) => {
+        assert.deepEqual(lease.summary, {
+          status: "sealed",
+          finalizationSha256: fixture.finalization.manifestSha256,
+          recordCount: 13,
+          retentionDeadlineAtMs: finalizedAtMs + 14 * 24 * 60 * 60 * 1_000,
+        });
+        assert.equal(lease.originTimelineAtMonoMs, 100);
+        assert.equal(lease.durationMs, 80);
+        for await (const record of lease.records()) replayedRecords.push(record);
+        return {
+          value: null,
+          responseSha256: "a".repeat(64),
+        };
       });
-    }
-    await waitUntil(
-      () => relay.snapshot(snapshot.sessionId).status === "ready",
-      "batched evidence session did not become ready",
-    );
-    await relay.command(snapshot.sessionId, { type: "start", commandId: "start" });
-    media.push({
-      type: "speech_started",
-      sessionId: snapshot.sessionId,
-      side: "A",
-      timestampMonoMs: 1_000,
-    });
-    for (let sequence = 0; sequence < 3; sequence += 1) {
-      media.push({
-        type: "audio",
-        sessionId: snapshot.sessionId,
-        side: "A",
-        timestampMonoMs: 1_000,
-        frame: createAudioFrame({
-          sessionId: snapshot.sessionId,
-          lane: "A_TO_B",
-          generation: 0,
-          sequence,
-          capturedAtMs: 1_000,
-          pcm16le: new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(sequence + 1),
-        }),
-      });
-    }
-    media.push({
-      type: "speech_ended",
-      sessionId: snapshot.sessionId,
-      side: "A",
-      timestampMonoMs: 1_000,
-    });
-    await waitUntil(() => media.played.length === 3, "local_eval did not play three frames");
-    await relay.command(snapshot.sessionId, { type: "end", commandId: "end" });
+      assert.equal(review.status, "completed");
+      assert.equal(replayedRecords.length, 13);
 
-    const records = await readEncryptedEvidence<EvidenceRecord>(
-      store.filePath(snapshot.sessionId),
-      key,
-    );
-    const timeline = (track: EvidenceAudioTrack): number[] => records
-      .filter((record) => record.type === "audio" && record.track === track)
-      .map((record) => record.type === "audio" ? record.timelineAtMonoMs : -1);
-    assert.deepEqual(timeline("source_a"), [1_000, 1_020, 1_040]);
-    assert.deepEqual(timeline("playout_to_b"), [2_000, 2_020, 2_040]);
+      const restoredAudio = replayedRecords.filter(
+        (record): record is Extract<EvidenceRecord, { readonly type: "audio" }> => record.type === "audio",
+      );
+      assert.equal(restoredAudio.length, EVIDENCE_AUDIO_TRACKS.length);
+      for (const [index, track] of EVIDENCE_AUDIO_TRACKS.entries()) {
+        const record = restoredAudio[index];
+        if (record === undefined) throw new Error("sealed fixture is missing a restored audio record");
+        assert.equal(record.track, track);
+        assert.ok(record.frame.pcm16le instanceof Uint8Array);
+        assert.deepEqual(
+          record.frame.pcm16le,
+          new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(index + 1),
+        );
+      }
 
-    const exported = await exportEncryptedEvidence({
-      encryptedPath: store.filePath(snapshot.sessionId),
-      key,
-      outputDirectory,
-    });
-    assert.equal(exported.trackFrameCounts.source_a, 3);
-    assert.equal(exported.trackFrameCounts.playout_to_b, 3);
+      const durableTranscript = replayedRecords.find((record) =>
+        record.type === "session_event" && record.event.type === "target_transcript"
+      );
+      if (
+        durableTranscript === undefined ||
+        durableTranscript.type !== "session_event" ||
+        durableTranscript.event.type !== "target_transcript"
+      ) {
+        throw new Error("sealed fixture did not retain its final transcript evidence");
+      }
+      assert.equal(durableTranscript.event.text, fixtureSecret);
+    } finally {
+      await reopenedLease.release();
+    }
+
+    const wrongKeyStore = storeFor(fixture.root, 8);
+    const wrongKeyLease = await wrongKeyStore.acquireEvidenceRootLease("server");
+    try {
+      let callbackInvoked = false;
+      assert.deepEqual(await wrongKeyStore.withManagedExportLease({
+        lookup: { archiveId: fixture.archiveId },
+        commandId: "wrong-key-streaming-lease",
+        authority: {
+          kind: "retention_owner",
+          actorId: FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId,
+        },
+        requestedAtMs: finalizedAtMs,
+      }, async () => {
+        callbackInvoked = true;
+        return {
+          value: null,
+          manifestFileSha256: "b".repeat(64),
+          completedAtMs: finalizedAtMs,
+        };
+      }), { status: "not_found" });
+      assert.equal(callbackInvoked, false);
+    } finally {
+      await wrongKeyLease.release();
+    }
   });
-  it("rejects the wrong key before exporting plaintext artifacts", async () => {
-    const encryptedDirectory = await isolatedDirectory("export-wrong-key-source");
-    const outputDirectory = join(taskTemp, "export-wrong-key-output");
-    await rm(outputDirectory, { recursive: true, force: true });
-    const store = new EncryptedFileEvidenceStore<TestRecord>({
-      directory: encryptedDirectory,
-      key: Buffer.alloc(32, 4),
-    });
-    store.record({ sessionId: "wrong-key-export", type: "transcript", secret: "private" });
-    await store.close("wrong-key-export");
 
-    await assert.rejects(
-      exportEncryptedEvidence({
-        encryptedPath: store.filePath("wrong-key-export"),
-        key: Buffer.alloc(32, 5),
-        outputDirectory,
-      }),
+  it("rejects independent truncated, reordered, and cross-artifact ciphertext vectors", async () => {
+    const truncated = await sealFixture("tamper-truncated", "tamper-session-truncated");
+    const truncatedLines = await encryptedArchiveLines(truncated.archivePath);
+    assert.ok(truncatedLines.length >= 3, "fixture must contain records, a finalization manifest, and a seal");
+    await writeFile(truncated.archivePath, truncatedLines.slice(0, -1).join("\n") + "\n", "utf8");
+    const truncatedStore = storeFor(truncated.root);
+    const truncatedLease = await truncatedStore.acquireEvidenceRootLease("server");
+    try {
+      let callbackInvoked = false;
+      assert.deepEqual(await truncatedStore.withVerifiedSealedReviewLease({
+        kind: "retention_summary",
+        sessionId: truncated.sessionId,
+        actor: {
+          role: "retention_owner",
+          actorId: FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId,
+        },
+      }, async () => {
+        callbackInvoked = true;
+        return { value: "must-not-disclose", responseSha256: "c".repeat(64) };
+      }), { status: "integrity_failed" });
+      assert.equal(callbackInvoked, false);
+    } finally {
+      await truncatedLease.release();
+    }
+
+    const reordered = await sealFixture("tamper-reordered", "tamper-session-reordered");
+    const reorderedLines = await encryptedArchiveLines(reordered.archivePath);
+    const first = reorderedLines[0];
+    const second = reorderedLines[1];
+    if (first === undefined || second === undefined) throw new Error("fixture archive is too short");
+    await writeFile(
+      reordered.archivePath,
+      [second, first, ...reorderedLines.slice(2)].join("\n") + "\n",
+      "utf8",
     );
-    await assert.rejects(readFile(join(outputDirectory, "export-manifest.json")));
+    const reorderedStore = storeFor(reordered.root);
+    const reorderedLease = await reorderedStore.acquireEvidenceRootLease("server");
+    try {
+      let callbackInvoked = false;
+      // Authorization is decided before integrity; a reordered first envelope
+      // prevents the immutable grant from authenticating, so this is denied.
+      assert.deepEqual(await reorderedStore.withVerifiedSealedReviewLease({
+        kind: "retention_summary",
+        sessionId: reordered.sessionId,
+        actor: {
+          role: "retention_owner",
+          actorId: FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId,
+        },
+      }, async () => {
+        callbackInvoked = true;
+        return { value: "must-not-disclose", responseSha256: "d".repeat(64) };
+      }), { status: "grant_denied" });
+      assert.equal(callbackInvoked, false);
+    } finally {
+      await reorderedLease.release();
+    }
+
+    const target = await sealFixture("tamper-cross-target", "tamper-session-cross-target");
+    const source = await sealFixture("tamper-cross-source", "tamper-session-cross-source");
+    const targetLines = await encryptedArchiveLines(target.archivePath);
+    const sourceLines = await encryptedArchiveLines(source.archivePath);
+    const targetFirst = targetLines[0];
+    const sourceFirst = sourceLines[0];
+    if (targetFirst === undefined || sourceFirst === undefined) {
+      throw new Error("cross-artifact fixture archive is too short");
+    }
+    targetLines[0] = sourceFirst;
+    await writeFile(target.archivePath, targetLines.join("\n") + "\n", "utf8");
+    const targetStore = storeFor(target.root);
+    const targetLease = await targetStore.acquireEvidenceRootLease("server");
+    try {
+      let callbackInvoked = false;
+      assert.deepEqual(await targetStore.withVerifiedSealedReviewLease({
+        kind: "retention_summary",
+        sessionId: target.sessionId,
+        actor: {
+          role: "retention_owner",
+          actorId: FIXED_EVIDENCE_REVIEW_GRANT.dataOwnerId,
+        },
+      }, async () => {
+        callbackInvoked = true;
+        return { value: "must-not-disclose", responseSha256: "e".repeat(64) };
+      }), { status: "grant_denied" });
+      assert.equal(callbackInvoked, false);
+    } finally {
+      await targetLease.release();
+    }
   });
 });

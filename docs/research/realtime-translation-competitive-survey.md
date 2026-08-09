@@ -161,7 +161,7 @@ Invariants：
 - PlayoutCut(generation) 後，遲到的舊 audio 永不得播放；provider 不支援 cancel 也能在 transport 端立刻停。
 - Close 必須 idempotent；metrics/exporter 不得阻塞 media。
 
-Seams/adapters：
+Research seams/adapters（這是調查中的目標邊界，不是已實作 adapter 清單）：
 
 | Seam | Adapters |
 |---|---|
@@ -171,22 +171,58 @@ Seams/adapters：
 
 GlossaryCascadeAdapter 內部再組 STT/text/TTS；不要把三個 SDK 直接暴露給 Session module。
 
-Current provider and session contract：
+### Post-research implementation note: approved processing profile
 
-    TRANSLATION_PROVIDER=openai_native
-    TRANSLATION_MODE=balanced
-    MEDIA_PROFILE=browser_pair
+The implemented runtime no longer selects translation routing through former
+provider/mode environment settings, profile names, or a runtime
+provider/endpoint/model/voice override. Deployment supplies the approved
+profile path and its canonical pin (`PROCESSING_PROFILE_PATH` and
+`PROCESSING_PROFILE_SHA256`). The loader verifies the canonical profile-body
+SHA before accepting an `ApprovedSessionProcessingProfile`.
 
-`TRANSLATION_PROVIDER` selects one provider for the server process at startup;
-it is not selected by a session or changed at runtime. `TRANSLATION_MODE` is
-only the default UI selection. Before each new session, the operator selects a
-mode advertised by `/api/capabilities`; the session pins that mode's behavior
-version and full/degraded capability state. `deterministicGlossary` in the same
-capability entry, rather than a provider name, determines whether a glossary
-version may be attached.
+That profile is the single non-secret routing artifact: it pins the provider,
+default mode, allowed modes, service endpoints, model identifiers, voice, and
+the associated glossary, evidence, retention, consent, fallback, and assurance
+controls. A new session may choose only a mode listed in `allowedModes`; its
+manifest then records that selection and the profile identity. It cannot switch
+provider, endpoint, model, voice, or profile route while running. Provider
+labels and old profile-name semantics are therefore not a glossary guarantee or
+a compatibility route.
 
-Phone-media research remains a media-adapter concern; it does not introduce a
-translation profile or let a session switch the server's provider.
+The manifest also binds every service's ordered `dataCategories` egress list;
+pre-consent disclosure deliberately excludes endpoint/model/voice/assurance
+details. If selected-service `trainingUse` or `serviceRetention` is unverified,
+the server exposes `dataAdmission: "synthetic_only"` and rejects human session
+creation with `synthetic_only_profile` before it opens a relay. The checked-in
+`manufacturing-poc` profile is exactly such a synthetic-only reference, not a
+provider or product acceptance artifact. Its profile fallback is `none`; a
+profile may authorize only `none` or same-route `same_route_fail_open`, never
+silent cross-provider fallback.
+
+The current benchmark is a deterministic mechanism self-check, not this
+survey's market acceptance comparison: its keyless PASS/FAIL observations are
+separate from `INVALID_RUN` evidence/finalization integrity failures and
+`NOT_RUN` acceptance scopes. It cannot establish acoustic latency, four-track
+recorder coverage, live vendor behavior or product readiness.
+
+Sealed-evidence review is likewise an implemented local control, not evidence
+for any vendor assurance in this survey. Deployment assigns distinct data-owner
+and bilingual-reviewer identities and the server freezes them into each
+session's review grant; only a bearer matching that exact role/identity can use
+the audited `POST /api/sessions/:sessionId/evidence/review` metadata or
+`POST /api/sessions/:sessionId/evidence/review/audio-window` routes, or read
+the audited sealed retention summary. The audio route is bounded 24 kHz mono
+PCM16LE WAV in 20 ms-aligned windows; all review responses are `no-store` and
+never disclose archive paths/IDs, raw manifests or evidence refs. A detached,
+content-free authenticated audit chain survives evidence deletion. None of this
+changes the reference POC's synthetic-only/`NOT_RUN` status or the mandatory
+owner-led encrypted-master-glossary closeout.
+
+Phone-media research remains a future media-adapter concern and does not change
+the approved translation route. In the implemented POC, `fake_telephony` is an
+in-process G.711 μ-law test fixture with `fake-telephony://` addresses; it is
+not a Twilio/SIP/PSTN integration, telephone number, carrier media stream, or
+caller flow. Its fixture results must not be represented as phone acceptance.
 
 ## 8. Barge-in policy
 

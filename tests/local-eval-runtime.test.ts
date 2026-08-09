@@ -2,22 +2,38 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { createServer } from "node:net";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import WebSocket, { type RawData } from "ws";
-import { InMemoryEvidenceStore } from "../src/adapters/evidence/in-memory.js";
 import { FileGlossaryRepository } from "../src/adapters/glossary/file-repository.js";
 import { createLocalEvalTranslationAdapter } from "../src/adapters/translation/local-eval.js";
+import type { EvidenceReview } from "../src/adapters/evidence/review.js";
 import { FileGlossaryRegistry } from "../src/composition.js";
 import { CANONICAL_AUDIO } from "../src/core/audio.js";
+import { deriveOpaqueTermId } from "../src/core/glossary.js";
 import { ModularGuardedDuplexRelay } from "../src/core/relay.js";
-import type { EvidenceRecord } from "../src/core/types.js";
 import { createMediaRuntime } from "../src/media-runtime.js";
 import { createServerAccessControl } from "../src/server/access.js";
 import { createServerApp } from "../src/server/app.js";
 import { unpackPlayoutAudio } from "../src/server/protocol.js";
+import {
+  AcceptanceEvidence,
+  createTestOnlyVerifiedHumanSessionProcessingProfile,
+  KeylessArtifactManagement,
+  SYNTHETIC_DEPLOYMENT_BUILD_SHA256,
+} from "./support/acceptance.js";
 
 const WAIT_MS = 5_000;
+const POKA_YOKE_OPAQUE_ID = deriveOpaqueTermId({
+  source: "poka-yoke",
+  aliases: ["mistake proofing"],
+  targetExact: "防呆",
+});
+const keylessEvidenceReview: Pick<EvidenceReview, "review"> = Object.freeze({
+  async review(_request) {
+    return Object.freeze({ status: "not_found" as const });
+  },
+});
 type JsonObject = Record<string, unknown>;
 
 interface RunningHarness {
@@ -39,6 +55,14 @@ function isObject(value: unknown): value is JsonObject {
 
 function dataOf(message: JsonObject): JsonObject {
   return isObject(message.data) ? message.data : {};
+}
+
+function hasEntryId(data: JsonObject, entryId: string): boolean {
+  return Array.isArray(data.entryIds) && data.entryIds.includes(entryId);
+}
+
+function hasText(data: JsonObject, expected: string): boolean {
+  return typeof data.text === "string" && data.text.includes(expected);
 }
 
 function rawBytes(data: RawData): Uint8Array {
@@ -202,9 +226,8 @@ async function postJson(
   return body;
 }
 
-function mediaUrl(
+function participantAccessToken(
   created: JsonObject,
-  origin: string,
   sessionId: string,
   side: "A" | "B",
 ): string {
@@ -215,8 +238,21 @@ function mediaUrl(
   assert.ok(isObject(grant) && typeof grant.url === "string");
   if (!isObject(grant) || typeof grant.url !== "string") throw new Error("missing grant");
   const participant = new URL(grant.url);
+  assert.equal(participant.searchParams.get("sessionId"), sessionId);
+  assert.equal(participant.searchParams.get("side"), side);
   const access = new URLSearchParams(participant.hash.slice(1)).get("access");
   assert.ok(access);
+  if (access === null || access.length === 0) throw new Error("missing participant access token");
+  return access;
+}
+
+function mediaUrl(
+  created: JsonObject,
+  origin: string,
+  sessionId: string,
+  side: "A" | "B",
+): string {
+  const access = participantAccessToken(created, sessionId, side);
   const url = new URL(`/ws/media/${encodeURIComponent(sessionId)}/${side}`, origin);
   url.protocol = "ws:";
   url.searchParams.set("access", access);
@@ -230,7 +266,17 @@ async function startHarness(
   const port = await availablePort();
   const operatorToken = "local-eval-operator-0123456789abcdef";
   const origin = `http://127.0.0.1:${port}`;
-  const access = createServerAccessControl({ operatorToken });
+  const access = createServerAccessControl({
+    operatorToken,
+    retentionOwner: {
+      id: "test-data-owner",
+      token: "local-eval-retention-owner-token-0123456789abcdef",
+    },
+    evidenceReviewer: {
+      id: "test-bilingual-reviewer",
+      token: "local-eval-evidence-reviewer-token-0123456789abcdef",
+    },
+  });
   const media = createMediaRuntime({
     profile: "browser_pair",
     publicBaseUrl: new URL(origin),
@@ -246,19 +292,30 @@ async function startHarness(
     },
     translationMode,
   });
+  const processingProfile = createTestOnlyVerifiedHumanSessionProcessingProfile();
   const relay = new ModularGuardedDuplexRelay({
     media: media.port,
     translation,
-    evidence: new InMemoryEvidenceStore<EvidenceRecord>(),
+    evidence: new AcceptanceEvidence(),
+    processingProfile,
     endpointGrant: media.endpointGrant,
   });
   const app = await createServerApp({
     relay,
-    glossaries: new FileGlossaryRegistry(new FileGlossaryRepository({ directory })),
+    glossaries: new FileGlossaryRegistry(new FileGlossaryRepository({
+      directory,
+      securityBoundaryDirectory: dirname(directory),
+      strictAncestors: false,
+      rootKey: Buffer.alloc(32, 19),
+    })),
     mediaProfile: media.profile,
     browserMedia: media.browserGateway,
     access,
     translation: { ...translation.capabilities, defaultMode: "accurate" },
+    processingProfile,
+    deploymentBuildSha256: SYNTHETIC_DEPLOYMENT_BUILD_SHA256,
+    artifacts: new KeylessArtifactManagement(),
+    evidenceReview: keylessEvidenceReview,
     logger: false,
   });
   await app.listen({ host: "127.0.0.1", port });
@@ -279,7 +336,6 @@ async function startHarness(
     languages: { A: "en-US", B: "zh-TW" },
     translationMode: "accurate",
     glossaryVersion: imported.glossaryVersion,
-    recordingConsent: true,
   }, 201);
   assert.equal(typeof created.sessionId, "string");
   if (typeof created.sessionId !== "string") throw new Error("missing session id");
@@ -294,6 +350,39 @@ async function startHarness(
     (message) => message.type === "session_state" && dataOf(message).status === "waiting",
     "event stream subscription",
   );
+  const participantAccessA = participantAccessToken(created, sessionId, "A");
+  const participantAccessB = participantAccessToken(created, sessionId, "B");
+  const consentA = events.waitFor(
+    (message) => message.type === "participant_consent" &&
+      dataOf(message).side === "A" &&
+      dataOf(message).recording === true &&
+      dataOf(message).processing === true,
+    "participant A recording and processing consent",
+  );
+  const consentB = events.waitFor(
+    (message) => message.type === "participant_consent" &&
+      dataOf(message).side === "B" &&
+      dataOf(message).recording === true &&
+      dataOf(message).processing === true,
+    "participant B recording and processing consent",
+  );
+  await Promise.all([
+    postJson(
+      origin,
+      `/api/sessions/${sessionId}/participants/A/recording-processing-consent`,
+      participantAccessA,
+      { accepted: true, consentId: randomUUID() },
+      202,
+    ),
+    postJson(
+      origin,
+      `/api/sessions/${sessionId}/participants/B/recording-processing-consent`,
+      participantAccessB,
+      { accepted: true, consentId: randomUUID() },
+      202,
+    ),
+  ]);
+  await Promise.all([consentA, consentB]);
   const joinedA = events.waitFor(
     (message) => message.type === "participant_joined" && dataOf(message).side === "A",
     "participant A joined",
@@ -302,15 +391,71 @@ async function startHarness(
     (message) => message.type === "participant_joined" && dataOf(message).side === "B",
     "participant B joined",
   );
-  const ready = events.waitFor(
-    (message) => message.type === "session_state" && dataOf(message).status === "ready",
-    "ready",
-  );
   const [socketA, socketB] = await Promise.all([
     connect(mediaUrl(created, origin, sessionId, "A")),
     connect(mediaUrl(created, origin, sessionId, "B")),
   ]);
-  await Promise.all([joinedA, joinedB, ready]);
+  await Promise.all([joinedA, joinedB]);
+  const readinessA = events.waitFor(
+    (message) => message.type === "participant_readiness" &&
+      dataOf(message).side === "A" &&
+      dataOf(message).source === "participant_browser_self_report" &&
+      dataOf(message).microphone === "browser_capture_active" &&
+      dataOf(message).headphones === "self_attested",
+    "participant A readiness",
+  );
+  const readinessB = events.waitFor(
+    (message) => message.type === "participant_readiness" &&
+      dataOf(message).side === "B" &&
+      dataOf(message).source === "participant_browser_self_report" &&
+      dataOf(message).microphone === "browser_capture_active" &&
+      dataOf(message).headphones === "self_attested",
+    "participant B readiness",
+  );
+  await Promise.all([
+    sendSocketMessage(socketA, JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }), false),
+    sendSocketMessage(socketB, JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }), false),
+  ]);
+  await Promise.all([readinessA, readinessB]);
+  const recorderArmed = events.waitFor(
+    (message) => message.type === "recorder_state" &&
+      dataOf(message).state === "armed" &&
+      dataOf(message).recordingArmed === true,
+    "armed recorder",
+  );
+  const ready = events.waitFor(
+    (message) => message.type === "session_state" && dataOf(message).status === "ready",
+    "ready",
+  );
+  const providerA = events.waitFor(
+    (message) => message.type === "provider_readiness" &&
+      message.lane === "A_TO_B" &&
+      dataOf(message).readiness === "fixture_local" &&
+      dataOf(message).remoteConnection === "not_applicable",
+    "A_TO_B provider prewarm",
+  );
+  const providerB = events.waitFor(
+    (message) => message.type === "provider_readiness" &&
+      message.lane === "B_TO_A" &&
+      dataOf(message).readiness === "fixture_local" &&
+      dataOf(message).remoteConnection === "not_applicable",
+    "B_TO_A provider prewarm",
+  );
+  await postJson(origin, `/api/sessions/${sessionId}/commands`, operatorToken, {
+    kind: "arm_recorder",
+    commandId: randomUUID(),
+  }, 202);
+  await Promise.all([recorderArmed, providerA, providerB, ready]);
   const active = events.waitFor(
     (message) => message.type === "session_state" && dataOf(message).status === "active",
     "active",
@@ -384,15 +529,22 @@ test("local_eval authorizes alias and reverse glossary through real HTTP and Web
 }, async () => {
   const harness = await startHarness("preserve");
   try {
-    const validatedA = harness.events.waitFor(
-      (message) => message.type === "target_validated" &&
-        message.lane === "A_TO_B" && dataOf(message).text?.toString().includes("防呆") === true,
-      "A_TO_B target_exact",
+    const authorizedA = harness.events.waitFor(
+      (message) => message.type === "terminology_gate" &&
+        dataOf(message).status === "authorized" &&
+        message.lane === "A_TO_B" && hasEntryId(dataOf(message), POKA_YOKE_OPAQUE_ID),
+      "A_TO_B glossary authorization",
+    );
+    const targetA = harness.events.waitFor(
+      (message) => message.type === "target_segment" &&
+        message.lane === "A_TO_B" && hasText(dataOf(message), "防呆"),
+      "A_TO_B target exact text",
     );
     const audioToB = waitBinary(harness.socketB, "A_TO_B canonical audio");
     await sendTurn(harness.socketA, 4);
-    const [resultA, packetB] = await Promise.all([validatedA, audioToB]);
-    assert.deepEqual(dataOf(resultA).guaranteedTargetExact, ["防呆"]);
+    const [authorizationA, targetAEvent, packetB] = await Promise.all([authorizedA, targetA, audioToB]);
+    assert.deepEqual(dataOf(authorizationA).entryIds, [POKA_YOKE_OPAQUE_ID]);
+    assert.equal(hasText(dataOf(targetAEvent), "防呆"), true);
     const playoutB = unpackPlayoutAudio(packetB);
     assert.equal(playoutB.pcm16le.byteLength, CANONICAL_AUDIO.bytesPerFrame);
     await sendSocketMessage(harness.socketB, JSON.stringify({
@@ -401,15 +553,22 @@ test("local_eval authorizes alias and reverse glossary through real HTTP and Web
       sequence: playoutB.sequence,
     }), false);
 
-    const validatedB = harness.events.waitFor(
-      (message) => message.type === "target_validated" &&
-        message.lane === "B_TO_A" && dataOf(message).text?.toString().includes("poka-yoke") === true,
-      "B_TO_A reverse target_exact",
+    const authorizedB = harness.events.waitFor(
+      (message) => message.type === "terminology_gate" &&
+        dataOf(message).status === "authorized" &&
+        message.lane === "B_TO_A" && hasEntryId(dataOf(message), POKA_YOKE_OPAQUE_ID),
+      "B_TO_A glossary authorization",
+    );
+    const targetB = harness.events.waitFor(
+      (message) => message.type === "target_segment" &&
+        message.lane === "B_TO_A" && hasText(dataOf(message), "poka-yoke"),
+      "B_TO_A reverse target exact text",
     );
     const audioToA = waitBinary(harness.socketA, "B_TO_A canonical audio");
     await sendTurn(harness.socketB, 7);
-    const [resultB, packetA] = await Promise.all([validatedB, audioToA]);
-    assert.deepEqual(dataOf(resultB).guaranteedTargetExact, ["poka-yoke"]);
+    const [authorizationB, targetBEvent, packetA] = await Promise.all([authorizedB, targetB, audioToA]);
+    assert.deepEqual(dataOf(authorizationB).entryIds, [POKA_YOKE_OPAQUE_ID]);
+    assert.equal(hasText(dataOf(targetBEvent), "poka-yoke"), true);
     assert.equal(unpackPlayoutAudio(packetA).pcm16le.byteLength, CANONICAL_AUDIO.bytesPerFrame);
   } finally {
     await stopHarness(harness);
@@ -434,6 +593,7 @@ test("local_eval runtime fails open with alert and uninterrupted canonical audio
     await sendTurn(harness.socketA, 9);
     const [alertEvent, targetEvent, packet] = await Promise.all([alert, target, audio]);
     assert.equal(dataOf(alertEvent).code, "GLOSSARY_PLACEHOLDER_MISSING");
+    assert.equal(dataOf(alertEvent).retryable, true);
     assert.equal(typeof dataOf(targetEvent).text, "string");
     assert.equal(unpackPlayoutAudio(packet).pcm16le.byteLength, CANONICAL_AUDIO.bytesPerFrame);
   } finally {

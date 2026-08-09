@@ -277,27 +277,58 @@ interface PlayoutPort {
 - queue 超過 latency budget 時丟 stale audio，不用無限 buffer 假裝可靠。
 - metrics、logging、caption UI 都不能阻塞 media loop。
 
-### 9.2 Provider configuration and session capability contract
+### 9.2 Post-research implementation: approved profile and session contract
 
-~~~ini
-# Server process: select exactly one provider.
-TRANSLATION_PROVIDER=palabra
+The former provider/mode environment setup was a research sketch, not a
+supported runtime route. Deployment now supplies an approved profile location
+and canonical pin (`PROCESSING_PROFILE_PATH` and
+`PROCESSING_PROFILE_SHA256`). The loader verifies the canonical profile-body
+SHA before accepting an `ApprovedSessionProcessingProfile`.
 
-# Default UI choice, validated against the selected provider.
-TRANSLATION_MODE=balanced
-MEDIA_PROFILE=browser_pair
-~~~
+The approved profile pins the provider, default mode, allowed modes, service
+endpoints, model identifiers, voice, and the accompanying glossary egress,
+fallback, evidence, retention, consent, and assurance controls. At session
+creation, the only translation choice is a mode contained in that profile's
+`allowedModes`; the resulting manifest records both the selected mode and the
+profile identity. A session cannot change provider, endpoint, model, voice, or
+profile route at runtime, and there is no profile-name or legacy environment
+variable compatibility path. A glossary can be attached only when the approved
+profile and selected mode pass the implemented glossary policy checks.
 
-The provider remains fixed for the lifetime of the server. `TRANSLATION_MODE`
-does not impose a single mode on every session: each session selects from the
-chosen provider's advertised `/api/capabilities` modes and pins the selected
-mode's behavior version and full/degraded state. A glossary version is allowed
-only when that mode advertises `deterministicGlossary`; provider labels and
-legacy profile names are not a glossary guarantee.
+The runtime additionally pins each service's ordered `dataCategories` in the
+manifest and exposes only that safe projection before consent. It treats
+unverified selected-service `trainingUse` or `serviceRetention` as
+`synthetic_only`: human session creation is refused before relay/grant. The
+checked-in `manufacturing-poc` profile deliberately has this restriction, so
+its `NOT_RUN` assurances are not evidence of Palabra/OpenAI terms or product
+acceptance. Profile fallback is only `none` or approved `same_route_fail_open`,
+never a cross-provider automatic substitute.
+
+Harness glossary persistence is separate from a provider's account glossary:
+it is encrypted using purpose-separated subkeys of `EVIDENCE_ROOT_KEY_BASE64`.
+An owner may delete only an unleased immutable version with an idempotent UUID
+command and bounded reason; deletion leaves a signed content-free tombstone,
+blocks resurrection of that version, and never reads/migrates legacy plaintext
+glossary files.
+
+The implemented sealed-evidence review boundary is also provider-independent.
+Deployment assigns distinct data-owner and bilingual-reviewer identities; the
+server freezes them into each session grant, and only the matching bearer can
+make the audited metadata `POST /api/sessions/:sessionId/evidence/review`, the
+bounded 20 ms-aligned 24 kHz mono WAV `POST /api/sessions/:sessionId/evidence/review/audio-window`,
+or the audited retention-summary request. These responses are `no-store` and
+contain no archive path/ID, raw manifest, or evidence reference. An encrypted,
+content-free authenticated audit chain is detached from the evidence and remains
+after deletion; it does not establish any Palabra/OpenAI privacy, retention, or
+product assurance. The reference POC stays synthetic-only/`NOT_RUN`, and its
+mandatory owner-led encrypted-master-glossary closeout remains required.
 
 DuplexSession、TerminologyGuard、TranslationPort 與驗收 harness retain these
-provider-independent boundaries; phone-media research (Twilio/SIP 8 kHz
-μ-law/A-law、RTP、call SID) remains inside its media adapter.
+provider-independent boundaries. Phone-media material (Twilio/SIP 8 kHz
+μ-law/A-law、RTP、call SID) remains research for a future adapter. The current
+`fake_telephony` path is only an in-process G.711 μ-law fixture using
+`fake-telephony://` addresses; it neither provisions a number nor connects to
+Twilio, SIP, PSTN, or a carrier, and must not be treated as phone acceptance.
 
 ## 10. Selective Commit：怎麼做到「稍慢，但專有名詞完全可控」
 

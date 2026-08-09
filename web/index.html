@@ -54,10 +54,6 @@
                 <select id="language-a" name="languageA">
                   <option value="en-US">English (US)</option>
                   <option value="zh-TW">&#20013;&#25991;&#65288;&#21488;&#28771;&#65289;</option>
-                  <option value="ja-JP">&#26085;&#26412;&#35486;</option>
-                  <option value="ko-KR">&#54620;&#44397;&#50612;</option>
-                  <option value="es-ES">Espa&#241;ol</option>
-                  <option value="fr-FR">Fran&#231;ais</option>
                 </select>
               </label>
               <span class="swap-glyph" aria-hidden="true">&#8644;</span>
@@ -66,10 +62,6 @@
                 <select id="language-b" name="languageB">
                   <option value="zh-TW">&#20013;&#25991;&#65288;&#21488;&#28771;&#65289;</option>
                   <option value="en-US">English (US)</option>
-                  <option value="ja-JP">&#26085;&#26412;&#35486;</option>
-                  <option value="ko-KR">&#54620;&#44397;&#50612;</option>
-                  <option value="es-ES">Espa&#241;ol</option>
-                  <option value="fr-FR">Fran&#231;ais</option>
                 </select>
               </label>
             </div>
@@ -80,11 +72,6 @@
                 <option>Checking available modes&hellip;</option>
               </select>
               <small id="translation-mode-detail" aria-live="polite">The server will show the behavior and any known trade-offs for this mode.</small>
-            </label>
-
-            <label class="consent-check">
-              <input id="recording-consent" type="checkbox" />
-              <span>I have everyone&rsquo;s consent to record this session for evaluation.</span>
             </label>
 
             <button id="create-session" class="button button-primary button-wide" type="submit" disabled>
@@ -114,6 +101,7 @@
               <span><strong id="file-label">Choose a glossary</strong><small>CSV or XLSX &middot; id, source, aliases, target_exact</small></span>
             </label>
             <button id="import-glossary" class="button button-secondary button-wide" type="submit">Import glossary</button>
+            <button id="clear-glossary" class="button button-secondary button-wide" type="button" disabled>Clear imported glossary</button>
             <p id="glossary-error" class="form-error" role="alert" hidden></p>
           </form>
         </section>
@@ -127,8 +115,9 @@
               <p id="session-translation" class="session-reference">Translation behavior will be pinned before the room starts.</p>
             </div>
             <div class="dashboard-actions">
-              <span id="recording-badge" class="recording-badge is-off"><span></span><span id="recording-label">Recording off</span></span>
-              <button id="start-session" class="button button-primary" type="button">Start session</button>
+              <span id="recording-badge" class="recording-badge is-off"><span></span><span id="recording-label">Recorder off</span></span>
+              <button id="arm-recorder" class="button button-secondary" type="button" disabled>Arm recorder</button>
+              <button id="start-session" class="button button-primary" type="button" disabled>Start session</button>
               <button id="pause-session" class="button button-secondary" type="button" disabled>Pause</button>
               <button id="end-session" class="button button-danger" type="button" disabled>End</button>
             </div>
@@ -139,9 +128,93 @@
               <section class="panel pairing-panel" aria-labelledby="pairing-title">
                 <div class="section-heading">
                   <div><p class="step-label">02 / Connect</p><h3 id="pairing-title">Pair both phones</h3></div>
-                  <span id="participant-count" class="quiet-badge">0 / 2 joined</span>
+                  <div class="pairing-statuses">
+                    <span id="participant-count" class="quiet-badge">0 / 2 joined</span>
+                    <span id="participant-consent-status" class="quiet-badge">0 / 2 consented</span>
+                  </div>
                 </div>
                 <div id="join-cards" class="join-grid"></div>
+              </section>
+
+              <section id="evidence-console" class="panel evidence-console" aria-labelledby="evidence-console-title">
+                <div class="section-heading">
+                  <div>
+                    <p class="step-label">Operator-only evidence</p>
+                    <h3 id="evidence-console-title">Evidence Console</h3>
+                  </div>
+                  <span class="quiet-badge">Immutable identity</span>
+                </div>
+                <p class="panel-copy">These exact hashes identify the approved deployment, processing profile, session manifest, and declared services. They are not participant-visible.</p>
+                <dl class="evidence-identity-grid">
+                  <div>
+                    <dt>Deployment build SHA-256</dt>
+                    <dd><code id="evidence-build-sha256">Waiting for operator identity</code></dd>
+                  </div>
+                  <div>
+                    <dt>Processing profile</dt>
+                    <dd><code id="evidence-profile-reference">Waiting for operator identity</code></dd>
+                    <dd><code id="evidence-profile-sha256">Waiting for operator identity</code></dd>
+                  </div>
+                  <div>
+                    <dt>Processing manifest SHA-256</dt>
+                    <dd><code id="evidence-manifest-sha256">Waiting for operator identity</code></dd>
+                  </div>
+                  <div>
+                    <dt>Declared services SHA-256</dt>
+                    <dd><code id="evidence-services-sha256">Waiting for operator identity</code></dd>
+                  </div>
+                </dl>
+                <div class="evidence-console-grid">
+                  <section class="evidence-console-section" aria-labelledby="evidence-recorder-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-recorder-title">Recorder lifecycle</h4></div>
+                    <dl class="evidence-status-grid">
+                      <div><dt>Preflight</dt><dd id="evidence-recorder-preflight">Not run</dd><small id="evidence-recorder-preflight-detail">Arm only after an authoritative preflight passes.</small></div>
+                      <div><dt>Recorder arm</dt><dd id="evidence-recorder-arm">Awaiting consents</dd><small id="evidence-recorder-arm-detail">No tracks armed.</small></div>
+                    </dl>
+                  </section>
+
+                  <section class="evidence-console-section evidence-finalization-section" aria-labelledby="evidence-finalization-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-finalization-title">Evidence finalization</h4><span class="quiet-badge">Operator review</span></div>
+                    <dl class="evidence-status-grid">
+                      <div><dt>Review verdict</dt><dd id="evidence-finalization-status">Not finalized</dd><small id="evidence-finalization-detail">No review verdict is available until a verified seal is published.</small></div>
+                    </dl>
+                    <div id="evidence-finalization-record" class="evidence-finalization-record" aria-live="polite">No sanitized finalization record has been published.</div>
+                    <div id="evidence-finalization-tracks" class="evidence-finalization-tracks"><p class="empty-state">No sealed track digests.</p></div>
+                  </section>
+
+                  <section class="evidence-console-section" aria-labelledby="evidence-participants-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-participants-title">Participant capture</h4><span class="quiet-badge">Self-report</span></div>
+                    <div class="evidence-participant-grid">
+                      <article><strong>Phone A</strong><span id="evidence-capture-a">Capture not reported</span><small id="evidence-headphones-a">Headphones not attested</small></article>
+                      <article><strong>Phone B</strong><span id="evidence-capture-b">Capture not reported</span><small id="evidence-headphones-b">Headphones not attested</small></article>
+                    </div>
+                  </section>
+
+                  <section class="evidence-console-section" aria-labelledby="evidence-provider-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-provider-title">Provider readiness</h4></div>
+                    <div class="evidence-participant-grid">
+                      <article><strong>A to B</strong><span id="evidence-provider-a-to-b">Not prepared</span><small id="evidence-provider-a-to-b-detail">No provider readiness report.</small></article>
+                      <article><strong>B to A</strong><span id="evidence-provider-b-to-a">Not prepared</span><small id="evidence-provider-b-to-a-detail">No provider readiness report.</small></article>
+                    </div>
+                  </section>
+
+                  <section class="evidence-console-section" aria-labelledby="evidence-queue-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-queue-title">Queues and audible lag</h4></div>
+                    <p class="evidence-unobservable">Provider-internal queue: unobservable by this client.</p>
+                    <p id="evidence-audible-lag" class="evidence-lag">No audible-start acknowledgement yet.</p>
+                    <div id="evidence-queue-feed" class="event-feed evidence-feed" aria-live="polite"><p class="empty-state">No scoped queue samples yet.</p></div>
+                  </section>
+
+                  <section class="evidence-console-section" aria-labelledby="evidence-terminology-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-terminology-title">Terminology gate</h4></div>
+                    <div id="evidence-terminology-feed" class="event-feed evidence-feed" aria-live="polite"><p class="empty-state">No terminology gate events.</p></div>
+                  </section>
+
+                  <section class="evidence-console-section evidence-barge-section" aria-labelledby="evidence-barge-title">
+                    <div class="evidence-section-heading"><h4 id="evidence-barge-title">Barge-in causal chain</h4><span class="quiet-badge">Correlated</span></div>
+                    <div id="evidence-barge-feed" class="event-feed evidence-feed" aria-live="polite"><p class="empty-state">No interruption chain yet.</p></div>
+                  </section>
+                </div>
               </section>
 
               <section class="panel transcript-panel" aria-labelledby="transcript-title">
@@ -192,7 +265,12 @@
 
           <div class="disclosure participant-disclosure" role="note">
             <span class="disclosure-icon" aria-hidden="true">AI</span>
-            <div><strong>AI-translated voice</strong><p>Your microphone audio and transcripts may be recorded for this evaluation.</p></div>
+            <div>
+              <strong>Recording and processing notice</strong>
+              <p>Notice version: <span id="participant-notice-version">Waiting for the server notice</span></p>
+              <p id="participant-processing-services">Waiting for the configured cloud processing services.</p>
+              <p>Accepting covers microphone recording and transcript processing. Withdrawing consent immediately ends this session for both participants.</p>
+            </div>
           </div>
 
           <section class="panel call-panel">
@@ -212,7 +290,11 @@
               </div>
 
               <label class="headphone-check"><input id="headphones-confirmed" type="checkbox" /><span>I&rsquo;m wearing headphones</span></label>
-              <button id="start-microphone" class="button button-primary button-wide button-large" type="button">
+              <label class="consent-check participant-consent-check">
+                <input id="recording-processing-consent" type="checkbox" />
+                <span>I accept recording and processing of my microphone audio and transcripts for this evaluation.</span>
+              </label>
+              <button id="start-microphone" class="button button-primary button-wide button-large" type="button" disabled>
                 <span class="mic-symbol" aria-hidden="true"></span> Start microphone
               </button>
               <p id="participant-error" class="form-error" role="alert" hidden></p>
@@ -235,6 +317,15 @@
                 <div class="playback-state"><span></span><span id="playback-label">Translated audio ready</span></div>
                 <button id="stop-microphone" class="button button-danger" type="button">Stop microphone</button>
               </div>
+            </div>
+
+            <div class="participant-withdrawal">
+              <button id="withdraw-recording-processing-consent" class="button button-danger button-wide" type="button" disabled>
+                Withdraw recording and processing consent
+              </button>
+              <p id="participant-withdrawal-status" class="call-status" role="status" aria-live="polite">
+                You can withdraw consent at any time. Withdrawal ends the session immediately.
+              </p>
             </div>
           </section>
 

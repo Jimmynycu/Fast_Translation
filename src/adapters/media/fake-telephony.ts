@@ -1,4 +1,4 @@
-import { createAudioFrame, laneFromSource } from "../../core/audio.js";
+import { createAudioFrame, destinationForLane, laneFromSource } from "../../core/audio.js";
 import { AsyncQueue } from "../../core/async-queue.js";
 import type {
   Lane,
@@ -49,7 +49,9 @@ export interface FakeTelephonyAudio {
 
 export interface FakeTelephonyClear {
   readonly type: "clear";
+  readonly lane: Lane;
   readonly generation: number;
+  readonly clearId: string;
 }
 
 export type FakeTelephonyOutbound = FakeTelephonyAudio | FakeTelephonyClear;
@@ -80,10 +82,17 @@ interface FakeSideState {
   readonly outbound: FakeTelephonyOutbound[];
 }
 
+interface FakeClearState {
+  readonly clearId: string;
+  readonly generation: number;
+  acknowledged: boolean;
+}
+
 interface FakeTelephonySession {
   readonly ingress: AsyncQueue<MediaIngressEvent>;
   readonly sides: Record<Side, FakeSideState>;
   readonly generations: Record<Lane, number>;
+  readonly clears: Record<Lane, FakeClearState | undefined>;
   closed: boolean;
 }
 
@@ -126,6 +135,12 @@ function assertAlert(code: string, message: string, retryable: boolean): void {
   if (typeof retryable !== "boolean") throw new TypeError("alert retryable must be boolean");
 }
 
+function assertClearId(clearId: string): void {
+  if (typeof clearId !== "string" || clearId.trim().length === 0 || clearId.length > 256) {
+    throw new TypeError("clearId must be a non-empty string of at most 256 characters");
+  }
+}
+
 export class FakeTelephonyMediaPort implements MediaPort {
   readonly #queueCapacity: number;
   readonly #jitterBufferFrames: number;
@@ -157,16 +172,32 @@ export class FakeTelephonyMediaPort implements MediaPort {
     if (session.closed) throw new TelephonyConnectionError("Cannot connect a closed session");
     const state = session.sides[side];
     if (state.connected) return;
-    state.connected = true;
-    this.#resetIngress(state);
-    state.outputSequence = 0;
-    this.#requireOffer(session, {
+    const availableCapacity =
+      session.ingress.pendingConsumers + session.ingress.capacity - session.ingress.size;
+    if (availableCapacity < 2) {
+      throw new TelephonyConnectionError("Telephony ingress queue is closed or full");
+    }
+    const connected = {
       type: "participant_state",
       sessionId,
       side,
       timestampMonoMs: this.#now(),
       connected: true,
-    });
+    } as const;
+    const readiness = {
+      type: "participant_readiness",
+      sessionId,
+      side,
+      timestampMonoMs: this.#now(),
+      microphone: "not_applicable",
+      headphones: "not_applicable",
+      source: "fake_telephony_fixture",
+    } as const;
+    this.#requireOffer(session, connected);
+    this.#requireOffer(session, readiness);
+    state.connected = true;
+    this.#resetIngress(state);
+    state.outputSequence = 0;
   }
 
   hangup(sessionId: string, side: Side): void {
@@ -175,15 +206,16 @@ export class FakeTelephonyMediaPort implements MediaPort {
     if (session === undefined) return;
     const state = session.sides[side];
     if (!state.connected) return;
-    state.connected = false;
-    this.#resetIngress(state);
-    this.#requireOffer(session, {
+    const disconnected = {
       type: "participant_state",
       sessionId,
       side,
       timestampMonoMs: this.#now(),
       connected: false,
-    });
+    } as const;
+    this.#requireOffer(session, disconnected, true);
+    state.connected = false;
+    this.#resetIngress(state);
   }
 
   reconnect(sessionId: string, side: Side): void {
@@ -305,7 +337,15 @@ export class FakeTelephonyMediaPort implements MediaPort {
       return;
     }
     for (const side of ["A", "B"] as const) {
-      if (session.sides[side].connected) this.hangup(sessionId, side);
+      if (!session.sides[side].connected) continue;
+      try {
+        this.hangup(sessionId, side);
+      } catch {
+        // Session closure must still release/tombstone the fixture if a
+        // terminal ingress event cannot be admitted.
+        session.sides[side].connected = false;
+        this.#resetIngress(session.sides[side]);
+      }
     }
     session.closed = true;
     session.ingress.close();
@@ -341,13 +381,59 @@ export class FakeTelephonyMediaPort implements MediaPort {
     if (!Number.isSafeInteger(request.generation) || request.generation < 0) {
       throw new RangeError("generation must be a non-negative safe integer");
     }
+    assertClearId(request.clearId);
+    if (request.lane !== "A_TO_B" && request.lane !== "B_TO_A") {
+      throw new RangeError("lane must be A_TO_B or B_TO_A");
+    }
+    if (destinationForLane(request.lane) !== request.side) {
+      throw new RangeError("clear side must be the destination for its lane");
+    }
     const session = this.#session(request.sessionId);
+    const previous = session.clears[request.lane];
+    if (previous !== undefined) {
+      if (request.generation < previous.generation) {
+        throw new RangeError("clear generation must not move backward");
+      }
+      if (request.generation === previous.generation && request.clearId !== previous.clearId) {
+        throw new RangeError("clearId must match an existing generation clear");
+      }
+      if (request.generation === previous.generation && previous.acknowledged) return;
+    }
+    const connected = session.sides[request.side].connected;
+    if (connected) {
+      const result = session.ingress.offerPriority(
+        {
+          type: "playout_cleared",
+          sessionId: request.sessionId,
+          side: request.side,
+          timestampMonoMs: this.#now(),
+          lane: request.lane,
+          generation: request.generation,
+          clearId: request.clearId,
+        },
+        (candidate) => candidate.type === "audio",
+      );
+      if (result !== "accepted" && result !== "evicted") {
+        throw new TelephonyConnectionError("Telephony ingress queue is closed or full");
+      }
+    }
     session.generations[request.lane] = request.generation;
-    if (session.sides[request.side].connected) {
+    if (previous === undefined || request.generation > previous.generation) {
+      session.clears[request.lane] = {
+        clearId: request.clearId,
+        generation: request.generation,
+        acknowledged: false,
+      };
+    }
+    if (connected) {
       session.sides[request.side].outbound.push(Object.freeze({
         type: "clear",
+        lane: request.lane,
         generation: request.generation,
+        clearId: request.clearId,
       }));
+      const current = session.clears[request.lane];
+      if (current !== undefined && current.clearId === request.clearId) current.acknowledged = true;
     }
   }
 
@@ -362,6 +448,7 @@ export class FakeTelephonyMediaPort implements MediaPort {
       ingress: new AsyncQueue<MediaIngressEvent>(this.#queueCapacity),
       sides: { A: sideState(), B: sideState() },
       generations: { A_TO_B: 0, B_TO_A: 0 },
+      clears: { A_TO_B: undefined, B_TO_A: undefined },
       closed: false,
     };
     this.#sessions.set(sessionId, created);
@@ -459,8 +546,30 @@ export class FakeTelephonyMediaPort implements MediaPort {
     this.#requireOffer(session, event);
   }
 
-  #requireOffer(session: FakeTelephonySession, event: MediaIngressEvent): void {
-    if (session.closed || !session.ingress.offer(event)) {
+  #requireOffer(
+    session: FakeTelephonySession,
+    event: MediaIngressEvent,
+    preserveTeardown = false,
+  ): void {
+    if (session.closed) {
+      throw new TelephonyConnectionError("Telephony ingress queue is closed or full");
+    }
+    let result: "accepted" | "evicted" | "full" | "closed";
+    if (event.type === "audio") {
+      result = session.ingress.offer(event) ? "accepted" : "full";
+    } else {
+      result = session.ingress.offerPriority(event, (candidate) => candidate.type === "audio");
+      if (preserveTeardown && result === "full") {
+        result = session.ingress.offerPriority(event, (candidate) => {
+          if (candidate.type === "participant_state") return candidate.connected;
+          if (candidate.type === "participant_readiness") {
+            return candidate.microphone !== "stopped";
+          }
+          return candidate.type !== "audio";
+        });
+      }
+    }
+    if (result !== "accepted" && result !== "evicted") {
       throw new TelephonyConnectionError("Telephony ingress queue is closed or full");
     }
   }

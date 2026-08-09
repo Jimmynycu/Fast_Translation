@@ -131,10 +131,9 @@ test("capture worklet clamps PCM and drives VAD with hysteresis", async () => {
   ));
 });
 
-test("playout worklet makes equal-generation clear idempotent and acks actual start", async () => {
+test("playout worklet applies id-correlated clears before acknowledging them", async () => {
   let Processor: (new (options: unknown) => {
     readonly port: WorkletPort;
-    readonly queue: unknown[];
     process(inputs: unknown[], outputs: Float32Array[][]): boolean;
   }) | undefined;
   class Port implements WorkletPort {
@@ -165,23 +164,90 @@ test("playout worklet makes equal-generation clear idempotent and acks actual st
   const processor = new Processor({ processorOptions: { sourceSampleRate: 24_000 } });
   const samples = new Float32Array(480).fill(0.25);
 
-  processor.port.onmessage?.({ data: { type: "clear", generation: 2 } });
-  processor.port.onmessage?.({ data: { type: "push", generation: 2, sequence: 0, samples } });
-  assert.equal(processor.queue.length, 1);
-  processor.port.onmessage?.({ data: { type: "clear", generation: 2 } });
-  assert.equal(processor.queue.length, 1, "late duplicate clear erased current audio");
+  processor.port.onmessage?.({
+    data: { type: "clear", lane: "A_TO_B", generation: 2, clearId: "clear-2" },
+  });
+  assert.deepEqual(processor.port.messages.find((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === "clear_applied"
+  ), {
+    type: "clear_applied",
+    lane: "A_TO_B",
+    generation: 2,
+    clearId: "clear-2",
+  });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 0, samples },
+  });
+  assert.deepEqual(processor.port.messages.find((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === "queue_sample" &&
+    "depthFrames" in message &&
+    message.depthFrames === 1
+  ), {
+    type: "queue_sample",
+    lane: "A_TO_B",
+    generation: 2,
+    depthFrames: 1,
+    capacityFrames: 60,
+    bufferedAudioMs: 20,
+    oldestQueuedAgeMs: 0,
+  });
+  processor.port.onmessage?.({
+    data: { type: "clear", lane: "A_TO_B", generation: 2, clearId: "clear-2" },
+  });
+  assert.equal(processor.port.messages.filter((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === "clear_applied"
+  ).length, 2, "a duplicate clearId receives an idempotent acknowledgement");
+  const acknowledged = processor.port.messages.filter((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === "clear_applied"
+  ).length;
+  for (const control of [
+    { lane: "A_TO_B", generation: 1, clearId: "stale-clear" },
+    { lane: "A_TO_B", generation: 2, clearId: "foreign-clear" },
+    { lane: "B_TO_A", generation: 2, clearId: "clear-2" },
+  ]) {
+    processor.port.onmessage?.({ data: { type: "clear", ...control } });
+  }
+  assert.equal(processor.port.messages.filter((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === "clear_applied"
+  ).length, acknowledged, "stale, foreign, and mismatched controls are not acknowledged");
 
   const output = [[new Float32Array(128)]];
   assert.equal(processor.process([], output), true);
-  assert.deepEqual(processor.port.messages, [{
-    type: "playout_started",
-    generation: 2,
-    sequence: 0,
-  }]);
+  assert.ok(
+    output[0]?.[0]?.some((sample) => sample > 0) === true,
+    "duplicate or mismatched clears must not erase current-generation audible output",
+  );
+  assert.ok(processor.port.messages.some((message) =>
+    typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === "playout_started" &&
+    "generation" in message &&
+    message.generation === 2 &&
+    "sequence" in message &&
+    message.sequence === 0
+  ));
 
   for (let sequence = 1; sequence <= 70; sequence += 1) {
     const chunk = new Float32Array(480).fill(0.1);
-    processor.port.onmessage?.({ data: { type: "push", generation: 2, sequence, samples: chunk } });
+    processor.port.onmessage?.({
+      data: { type: "push", lane: "A_TO_B", generation: 2, sequence, samples: chunk },
+    });
   }
   assert.ok(processor.port.messages.some((message) =>
     typeof message === "object" &&

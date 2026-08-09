@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { setImmediate as nextTurn, setTimeout as delay } from "node:timers/promises";
@@ -11,6 +11,10 @@ import { CANONICAL_AUDIO } from "../core/audio.js";
 import type { GlossarySpec } from "../core/glossary.js";
 import { ModularGuardedDuplexRelay } from "../core/relay.js";
 import { assertManifestFixturePath } from "./path-safety.js";
+import {
+  createSyntheticPocProcessingManifest,
+  createSyntheticPocProcessingProfile,
+} from "./synthetic-poc-processing-manifest.js";
 import { createKeylessLocalEvalVerification, type LocalEvalVerification } from "./verification.js";
 import type {
   EvidenceRecord,
@@ -400,6 +404,7 @@ function observe(
       if (record.track === playoutTrack) playoutAudioFrames += 1;
       continue;
     }
+    if (record.type !== "session_event") continue;
     const event: SessionEvent = record.event;
     if (event.lane !== direction) continue;
     if (event.type === "source_transcript" && event.final) sourceFinal = event.text;
@@ -435,10 +440,49 @@ async function waitForReady(
 ): Promise<void> {
   const deadline = performance.now() + OUTCOME_TIMEOUT_MS;
   while (performance.now() < deadline) {
-    if (relay.snapshot(sessionId).status === "ready") return;
+    const snapshot = relay.snapshot(sessionId);
+    if (
+      snapshot.status === "ready" &&
+      snapshot.recorderArmState === "armed" &&
+      snapshot.recordingArmed &&
+      snapshot.providerReadiness.A_TO_B !== undefined &&
+      snapshot.providerReadiness.B_TO_A !== undefined
+    ) {
+      return;
+    }
     await delay(1);
   }
   throw new Error("Timed out waiting for fake telephony participants");
+}
+
+async function waitForParticipantConnections(
+  relay: ModularGuardedDuplexRelay,
+  sessionId: string,
+): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OUTCOME_TIMEOUT_MS);
+  const connected = new Set<"A" | "B">();
+  const ready = new Set<"A" | "B">();
+  try {
+    for await (const event of relay.events(sessionId, 0, controller.signal)) {
+      if (event.type === "participant_state" && event.connected) connected.add(event.side);
+      if (
+        event.type === "participant_readiness" &&
+        event.source === "fake_telephony_fixture" &&
+        event.microphone === "not_applicable" &&
+        event.headphones === "not_applicable"
+      ) {
+        ready.add(event.side);
+      }
+      if (connected.size === 2 && ready.size === 2) return;
+    }
+  } catch (error: unknown) {
+    if (!controller.signal.aborted) throw error;
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+  throw new Error("Timed out waiting for fake telephony participant connections and readiness");
 }
 
 async function waitForOutcome(
@@ -488,6 +532,7 @@ async function replayFixture(
     media,
     translation,
     evidence,
+    processingProfile: createSyntheticPocProcessingProfile(),
     endpointGrant: (sessionId, side) => ({
       kind: "telephony_test",
       side,
@@ -499,6 +544,14 @@ async function replayFixture(
     sideB: { language: targetLanguage },
     provider: "openai_controlled",
     mode: "accurate",
+    processingManifest: createSyntheticPocProcessingManifest({
+      mode: "accurate",
+      glossary,
+    }),
+    evidenceReviewGrant: {
+      dataOwnerId: "test-data-owner",
+      bilingualReviewerId: "test-bilingual-reviewer",
+    },
     glossary,
     maxQueueFrames: Math.max(25, loaded.frames.length + 1),
   });
@@ -506,8 +559,25 @@ async function replayFixture(
   let ended = false;
 
   try {
+    await Promise.all(([
+      "A",
+      "B",
+    ] as const).map((side) => relay.command(sessionId, {
+      type: "participant_consent",
+      commandId: randomUUID(),
+      side,
+      consentId: randomUUID(),
+      consentPolicyRef: snapshot.spec.processingManifest.consentPolicyRef,
+      recording: true,
+      processing: true,
+    })));
     media.connect(sessionId, "A");
     media.connect(sessionId, "B");
+    await waitForParticipantConnections(relay, sessionId);
+    await relay.command(sessionId, {
+      type: "arm_recorder",
+      commandId: randomUUID(),
+    });
     await waitForReady(relay, sessionId);
     await relay.command(sessionId, {
       type: "start",

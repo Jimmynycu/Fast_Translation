@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { hashHealingProfile, type HealingProfile } from "./healing.js";
 import {
   runLocalHarnessObservation,
+  TerminalEvidenceIntegrityError,
   type LocalHarnessExecutor,
 } from "./local-harness.js";
 import {
@@ -15,11 +16,34 @@ import {
   type ExecutableSchedule,
 } from "./executable-manifest.js";
 import type { BenchmarkArm } from "./protocol.js";
+import {
+  validateEvidenceFinalization,
+  type EvidenceFinalization,
+  type EvidenceFinalizationExpectation,
+} from "../core/evidence-lifecycle.js";
 
-export type BenchmarkRunOutcome = "PASS" | "FAIL" | "NOT_RUN";
-export type BenchmarkMarkerState = "STARTED" | "COMPLETED" | "FAILED" | "NOT_RUN";
+export type BenchmarkRunOutcome = "PASS" | "FAIL" | "INVALID_RUN" | "NOT_RUN";
+export type BenchmarkMarkerState =
+  | "STARTED"
+  | "COMPLETED"
+  | "FAILED"
+  | "INVALID_RUN"
+  | "NOT_RUN";
+const BENCHMARK_ARTIFACT_SCHEMA_VERSION = 5 as const;
+export type LocalReleaseEvidenceVerdict = "PASS" | "FAIL" | "INVALID_RUN" | "NOT_RUN";
+const TERMINAL_EVIDENCE_INTEGRITY_FAILURE_REASON =
+  "local terminal evidence finalization integrity failed";
 
-export interface FormalTerminologyObservation {
+export interface TranslationEvidenceObservation {
+  /** Opaque provider-event references observed at the TranslationPort boundary. */
+  readonly translationEvidenceRefs: readonly string[];
+  /** Terminal evidence seal for the exact local execution represented by this result. */
+  readonly evidenceFinalization: EvidenceFinalization;
+  /** Immutable session-manifest binding used to validate the terminal receipt. */
+  readonly evidenceFinalizationExpectation: EvidenceFinalizationExpectation;
+}
+
+export interface FormalTerminologyObservation extends TranslationEvidenceObservation {
   readonly kind: "formal_terminology";
   readonly fixtureId: string;
   readonly scenario: "protected" | "confuser" | "ordinary";
@@ -43,7 +67,7 @@ export interface FormalTerminologyObservation {
   readonly elapsedMs: number;
 }
 
-export interface LocalLatencyObservation {
+export interface LocalLatencyObservation extends TranslationEvidenceObservation {
   readonly kind: "latency";
   readonly fixtureId: string;
   readonly scenario: "protected" | "ordinary";
@@ -69,7 +93,7 @@ export interface LocalLatencyObservation {
   }>;
 }
 
-export interface LocalInterruptionObservation {
+export interface LocalInterruptionObservation extends TranslationEvidenceObservation {
   readonly kind: "interruption";
   readonly scheduleId: string;
   readonly measurementScope: "local_state_machine_not_acoustic";
@@ -82,7 +106,7 @@ export interface LocalInterruptionObservation {
   readonly alerts: readonly string[];
 }
 
-export interface LocalSoakObservation {
+export interface LocalSoakObservation extends TranslationEvidenceObservation {
   readonly kind: "continuous_duplex";
   readonly scheduleId: string;
   /** This is a sparse local mechanism fixture, never a live sustained-soak result. */
@@ -123,7 +147,7 @@ export interface BenchmarkProfileUnderTest {
 }
 
 export interface BenchmarkRunResult {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: typeof BENCHMARK_ARTIFACT_SCHEMA_VERSION;
   readonly manifestSha256: string;
   readonly profileUnderTestSha256: string;
   readonly profileHash: string;
@@ -145,7 +169,7 @@ export interface BenchmarkRunResult {
 }
 
 export interface BenchmarkRunMarker {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: typeof BENCHMARK_ARTIFACT_SCHEMA_VERSION;
   readonly manifestSha256: string;
   readonly profileUnderTestSha256: string;
   readonly profileHash: string;
@@ -166,33 +190,39 @@ export interface BenchmarkStageScore {
   readonly completed: number;
   readonly passed: number;
   readonly failed: number;
+  readonly invalidRun: number;
   readonly notRun: number;
 }
 
 export interface BenchmarkArmVerdict {
-  readonly verdict: "PASS" | "FAIL" | "NOT_RUN";
+  readonly verdict: "PASS" | "FAIL" | "INVALID_RUN" | "NOT_RUN";
   readonly scope: "local_mechanism_only" | "external_provider";
   readonly formal: BenchmarkStageScore;
   readonly latency: BenchmarkStageScore;
   readonly interruption: BenchmarkStageScore;
   readonly soak: BenchmarkStageScore;
   readonly failures: readonly string[];
+  readonly invalidRuns: readonly string[];
 }
 
 export interface BenchmarkAcceptanceScore {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: typeof BENCHMARK_ARTIFACT_SCHEMA_VERSION;
   readonly manifestSha256: string;
   readonly profileUnderTestSha256: string;
   readonly profileHash: string;
   readonly armVerdicts: Readonly<Record<BenchmarkArm, BenchmarkArmVerdict>>;
   readonly discovery: BenchmarkStageScore;
-  readonly localMechanismVerdict: "PASS" | "FAIL";
+  readonly localMechanismVerdict: "PASS" | "FAIL" | "INVALID_RUN";
   readonly localReleaseEvidence: Readonly<{
-    readonly targetExact: boolean;
-    readonly zeroRegression: boolean;
-    readonly alertsClear: boolean;
-    readonly latency: boolean;
-    readonly evidenceComplete: boolean;
+    readonly targetExact: LocalReleaseEvidenceVerdict;
+    readonly zeroRegression: LocalReleaseEvidenceVerdict;
+    readonly alertsClear: LocalReleaseEvidenceVerdict;
+    /** Local processing timings are not acoustic latency measurements. */
+    readonly latency: LocalReleaseEvidenceVerdict;
+    /** Local state-machine clears are not acoustic barge-in measurements. */
+    readonly bargeIn: LocalReleaseEvidenceVerdict;
+    /** No normalized event export or four-track capture artifact is in the keyless bundle. */
+    readonly evidenceComplete: LocalReleaseEvidenceVerdict;
   }>;
   readonly providerAcceptanceVerdict: "NOT_RUN";
   readonly productAcceptanceVerdict: "NOT_RUN";
@@ -201,7 +231,7 @@ export interface BenchmarkAcceptanceScore {
 }
 
 export interface KeylessBenchmarkBundle {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: typeof BENCHMARK_ARTIFACT_SCHEMA_VERSION;
   readonly kind: "keyless_benchmark_bundle";
   readonly executionMode: "default_local_relay" | "test_only_custom_executor";
   readonly manifestSha256: string;
@@ -362,7 +392,7 @@ export function validateBenchmarkRunResult(result: BenchmarkRunResult): void {
     throw new Error(`${result.runId} cannot pass outside local mechanism scope`);
   }
   if (
-    result.schemaVersion !== 1 ||
+    result.schemaVersion !== BENCHMARK_ARTIFACT_SCHEMA_VERSION ||
     !/^[a-f0-9]{64}$/u.test(result.profileUnderTestSha256) ||
     !/^[a-f0-9]{64}$/u.test(result.profileHash) ||
     result.runId.trim().length === 0 ||
@@ -400,24 +430,51 @@ export function validateBenchmarkRunResult(result: BenchmarkRunResult): void {
     throw new Error(`${result.runId} has an invalid acceptance scope`);
   }
   if (result.outcome === "NOT_RUN") {
-    if (result.observation !== undefined || result.reason?.trim().length === 0) {
+    if (
+      result.acceptanceScope === "local_mechanism_only" ||
+      result.arm === "GLOSSARY_CONTROLLED"
+    ) {
+      throw new Error(`${result.runId} controlled local execution cannot be NOT_RUN`);
+    }
+    if (
+      result.observation !== undefined ||
+      result.reason === undefined ||
+      result.reason.trim().length === 0
+    ) {
       throw new Error(`${result.runId} NOT_RUN requires a reason and no observation`);
     }
     return;
   }
-  if (result.outcome === "FAIL" && result.reason?.trim().length === 0) {
-    throw new Error(`${result.runId} FAIL requires a reason`);
+  if (
+    (result.outcome === "FAIL" || result.outcome === "INVALID_RUN") &&
+    (result.reason === undefined || result.reason.trim().length === 0)
+  ) {
+    throw new Error(`${result.runId} ${result.outcome} requires a reason`);
   }
   if (result.observation === undefined) {
-    if (result.outcome === "PASS") {
-      throw new Error(`${result.runId} PASS requires a verified observation`);
+    if (
+      result.outcome === "PASS" ||
+      (result.outcome === "INVALID_RUN" &&
+        result.reason !== TERMINAL_EVIDENCE_INTEGRITY_FAILURE_REASON)
+    ) {
+      throw new Error(`${result.runId} ${result.outcome} requires a verified observation`);
     }
     return;
   }
   if (!observationMatchesStage(result.stage, result.observation)) {
     throw new Error(`${result.runId} observation does not match its stage`);
   }
-  const passed = observationPassed(result.observation);
+  const evidenceIntegrityPassed = observationEvidenceIntegrityPassed(result.observation);
+  if (result.outcome === "INVALID_RUN") {
+    if (evidenceIntegrityPassed) {
+      throw new Error(`${result.runId} INVALID_RUN requires failed evidence integrity`);
+    }
+    return;
+  }
+  if (!evidenceIntegrityPassed) {
+    throw new Error(`${result.runId} evidence integrity failure requires INVALID_RUN`);
+  }
+  const passed = observationMechanismPassed(result.observation);
   if (
     (result.outcome === "PASS" && !passed) ||
     (result.outcome === "FAIL" && passed)
@@ -431,6 +488,7 @@ function validateMarker(marker: BenchmarkRunMarker): void {
   if (
     !/^[a-f0-9]{64}$/u.test(markerSha256) ||
     markerSha256 !== benchmarkArtifactSha256(body) ||
+    marker.schemaVersion !== BENCHMARK_ARTIFACT_SCHEMA_VERSION ||
     !/^[a-f0-9]{64}$/u.test(marker.profileUnderTestSha256) ||
     !/^[a-f0-9]{64}$/u.test(marker.profileHash)
   ) {
@@ -465,10 +523,42 @@ function requiredSchedule(
   return schedule;
 }
 
-function observationPassed(observation: BenchmarkObservation): boolean {
+function hasWellFormedTranslationEvidenceRefs(observation: BenchmarkObservation): boolean {
+  return observation.translationEvidenceRefs.every((ref) =>
+    /^[a-z][a-z0-9_-]*:v1:sha256:[a-f0-9]{64}$/u.test(ref)
+  );
+}
+
+function hasRequiredOpaqueTranslationEvidenceRefs(observation: BenchmarkObservation): boolean {
+  return observation.translationEvidenceRefs.length > 0 &&
+    hasWellFormedTranslationEvidenceRefs(observation);
+}
+
+function hasSealedEvidenceFinalization(observation: BenchmarkObservation): boolean {
+  if (observation.evidenceFinalization.status !== "sealed") return false;
+  try {
+    validateEvidenceFinalization(
+      observation.evidenceFinalization,
+      observation.evidenceFinalizationExpectation,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function observationEvidenceIntegrityPassed(observation: BenchmarkObservation): boolean {
+  // A functional fixture failure can end before the provider produces an event.
+  // Empty refs therefore fail the mechanism gate below, not integrity itself.
+  return hasWellFormedTranslationEvidenceRefs(observation) &&
+    hasSealedEvidenceFinalization(observation);
+}
+
+function observationMechanismPassed(observation: BenchmarkObservation): boolean {
   switch (observation.kind) {
     case "formal_terminology":
       return observation.uninterrupted &&
+        hasRequiredOpaqueTranslationEvidenceRefs(observation) &&
         observation.alerts.length === 0 &&
         observation.normalizedEventEvidence.sourceRevision >= 0 &&
         observation.normalizedEventEvidence.targetRevision >= 0 &&
@@ -487,6 +577,7 @@ function observationPassed(observation: BenchmarkObservation): boolean {
             observation.matchedSourceTexts.length === 0);
     case "latency":
       return observation.uninterrupted &&
+        hasRequiredOpaqueTranslationEvidenceRefs(observation) &&
         observation.alerts.length === 0 &&
         observation.normalizedEventEvidence.sourceRevision >= 0 &&
         observation.normalizedEventEvidence.targetRevision >= 0 &&
@@ -506,6 +597,7 @@ function observationPassed(observation: BenchmarkObservation): boolean {
         );
     case "interruption":
       return observation.generationCut &&
+        hasRequiredOpaqueTranslationEvidenceRefs(observation) &&
         observation.alerts.length === 0 &&
         observation.playoutCleared &&
         observation.staleOutputRejected &&
@@ -513,6 +605,7 @@ function observationPassed(observation: BenchmarkObservation): boolean {
         Number.isFinite(observation.clearLatencyMs);
     case "continuous_duplex":
       return observation.virtualDurationMs === 600_000 &&
+        hasRequiredOpaqueTranslationEvidenceRefs(observation) &&
         observation.coverageScope === "virtual_mechanism_only" &&
         observation.alerts.length === 0 &&
         observation.virtualFramesRepresented === 60_000 &&
@@ -531,31 +624,35 @@ function observationAlerts(observation: BenchmarkObservation | undefined): reado
 
 function releaseEvidence(results: readonly BenchmarkRunResult[]): BenchmarkAcceptanceScore["localReleaseEvidence"] {
   const local = results.filter((result) => result.arm === "GLOSSARY_CONTROLLED");
+  if (local.some((result) => result.outcome === "INVALID_RUN")) {
+    return deepFreeze({
+      targetExact: "INVALID_RUN" as const,
+      zeroRegression: "INVALID_RUN" as const,
+      alertsClear: "INVALID_RUN" as const,
+      latency: "INVALID_RUN" as const,
+      bargeIn: "INVALID_RUN" as const,
+      evidenceComplete: "INVALID_RUN" as const,
+    });
+  }
   const formal = local.filter((result) => result.stage === "formal_terminology");
-  const latency = local.filter((result) => result.stage === "latency");
   const targetExact = formal.filter((result) =>
     result.observation?.kind === "formal_terminology" && result.observation.scenario === "protected"
   ).length === 4 && formal.every((result) =>
     result.observation?.kind !== "formal_terminology" ||
-    result.observation.scenario !== "protected" || result.observation.targetExactSatisfied
+    result.observation.scenario !== "protected" ||
+    (result.outcome === "PASS" && result.observation.targetExactSatisfied)
   );
   const zeroRegression = formal.length === 8 && formal.every((result) => result.outcome === "PASS");
   const alertsClear = local.length > 0 && local.every((result) =>
     observationAlerts(result.observation)?.length === 0
   );
-  const latencyPassed = latency.length === 12 && latency.every((result) =>
-    result.outcome === "PASS" && result.observation?.kind === "latency" &&
-    Object.values(result.observation.metricsMs).every((sample) => Number.isFinite(sample) && sample >= 0)
-  );
-  const evidenceComplete = local.length === 41 && local.every((result) =>
-    result.outcome === "PASS" && result.observation !== undefined
-  );
   return deepFreeze({
-    targetExact,
-    zeroRegression,
-    alertsClear,
-    latency: latencyPassed,
-    evidenceComplete,
+    targetExact: targetExact ? "PASS" as const : "FAIL" as const,
+    zeroRegression: zeroRegression ? "PASS" as const : "FAIL" as const,
+    alertsClear: alertsClear ? "PASS" as const : "FAIL" as const,
+    latency: "NOT_RUN" as const,
+    bargeIn: "NOT_RUN" as const,
+    evidenceComplete: "NOT_RUN" as const,
   });
 }
 
@@ -568,6 +665,7 @@ function stageScore(
     completed: results.filter((result) => result.outcome !== "NOT_RUN").length,
     passed: results.filter((result) => result.outcome === "PASS").length,
     failed: results.filter((result) => result.outcome === "FAIL").length,
+    invalidRun: results.filter((result) => result.outcome === "INVALID_RUN").length,
     notRun: results.filter((result) => result.outcome === "NOT_RUN").length,
   });
 }
@@ -584,13 +682,22 @@ function armVerdict(
   const failures = armResults
     .filter((result) => result.outcome === "FAIL")
     .map((result) => `${result.runId}: ${result.reason ?? "local observation failed"}`);
+  const invalidRuns = armResults
+    .filter((result) => result.outcome === "INVALID_RUN")
+    .map((result) => `${result.runId}: ${result.reason ?? "evidence integrity failed"}`);
   const allNotRun = armResults.every((result) => result.outcome === "NOT_RUN");
   const complete =
     formalResults.filter((result) => result.outcome === "PASS").length === 8 &&
     latencyResults.filter((result) => result.outcome === "PASS").length === 12 &&
     interruptionResults.filter((result) => result.outcome === "PASS").length === 20 &&
     soakResults.filter((result) => result.outcome === "PASS").length === 1;
-  const verdict = allNotRun ? "NOT_RUN" : complete && failures.length === 0 ? "PASS" : "FAIL";
+  const verdict = allNotRun
+    ? "NOT_RUN"
+    : invalidRuns.length > 0
+      ? "INVALID_RUN"
+      : complete && failures.length === 0
+        ? "PASS"
+        : "FAIL";
   return deepFreeze({
     verdict,
     scope: arm === "GLOSSARY_CONTROLLED"
@@ -601,6 +708,7 @@ function armVerdict(
     interruption: stageScore(interruptionResults, 20),
     soak: stageScore(soakResults, 1),
     failures: Object.freeze(failures),
+    invalidRuns: Object.freeze(invalidRuns),
   });
 }
 
@@ -660,12 +768,15 @@ export function scoreBenchmarkResults(
     OPENAI_NATIVE_TRANSLATE: armVerdict("OPENAI_NATIVE_TRANSLATE", results),
     GLOSSARY_CONTROLLED: armVerdict("GLOSSARY_CONTROLLED", results),
   });
-  const localMechanismVerdict =
-    armVerdicts.GLOSSARY_CONTROLLED.verdict === "PASS" ? "PASS" as const : "FAIL" as const;
+  const localMechanismVerdict = armVerdicts.GLOSSARY_CONTROLLED.verdict === "PASS"
+    ? "PASS" as const
+    : armVerdicts.GLOSSARY_CONTROLLED.verdict === "INVALID_RUN"
+      ? "INVALID_RUN" as const
+      : "FAIL" as const;
   const discoveryResults = results.filter((result) => result.stage === "discovery");
   const localReleaseEvidence = releaseEvidence(results);
   const body = {
-    schemaVersion: 1 as const,
+    schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
     manifestSha256: manifest.manifestSha256,
     profileUnderTestSha256: profileUnderTest.profileUnderTestSha256,
     profileHash: profileUnderTest.profileHash,
@@ -677,6 +788,8 @@ export function scoreBenchmarkResults(
     productAcceptanceVerdict: "NOT_RUN" as const,
     limitations: Object.freeze([
       "The local arm measures deterministic mechanism behavior, not live acoustic latency.",
+      "Local latency and barge-in fixture gates remain NOT_RUN until an acoustic capture benchmark is executed.",
+      "Keyless receipt digests are content-bound virtual evidence; normalized event export and four-track audio coverage remain NOT_RUN.",
       "Continuous duplex PASS covers only 60 sampled virtual frames (30 per lane); a sustained provider or queue soak remains NOT_RUN.",
       "OpenAI and Palabra adapters were not configured and remain NOT_RUN.",
       "Discovery requires the separately budgeted paid command and remains NOT_RUN.",
@@ -740,7 +853,7 @@ export async function executeKeylessBenchmark(
     const startedAt = isoTimestamp(now);
     const markerPath = join(runsDirectory, `${safeRunFileStem(run)}.marker.json`);
     const startedMarker = artifactMarker({
-      schemaVersion: 1,
+      schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
       manifestSha256: manifest.manifestSha256,
       ...profileBinding,
       runId: run.runId,
@@ -755,7 +868,7 @@ export async function executeKeylessBenchmark(
     let result: BenchmarkRunResult;
     if (run.stage === "discovery") {
       result = artifactResult({
-        schemaVersion: 1,
+        schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
         manifestSha256: manifest.manifestSha256,
         ...profileBinding,
         runId: run.runId,
@@ -771,7 +884,7 @@ export async function executeKeylessBenchmark(
     } else if (run.arm !== "GLOSSARY_CONTROLLED") {
       if (run.arm === undefined) throw new Error(`${run.runId} is missing its arm`);
       result = artifactResult({
-        schemaVersion: 1,
+        schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
         manifestSha256: manifest.manifestSha256,
         ...profileBinding,
         runId: run.runId,
@@ -810,9 +923,15 @@ export async function executeKeylessBenchmark(
           ...(fixture === undefined ? {} : { fixture }),
           ...(schedule === undefined ? {} : { schedule }),
         });
-        const passed = observationPassed(observation);
+        const evidenceIntegrityPassed = observationEvidenceIntegrityPassed(observation);
+        const mechanismPassed = observationMechanismPassed(observation);
+        const outcome = !evidenceIntegrityPassed
+          ? "INVALID_RUN" as const
+          : mechanismPassed
+            ? "PASS" as const
+            : "FAIL" as const;
         result = artifactResult({
-          schemaVersion: 1,
+          schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
           manifestSha256: manifest.manifestSha256,
           ...profileBinding,
           runId: run.runId,
@@ -821,15 +940,22 @@ export async function executeKeylessBenchmark(
           arm: run.arm,
           acceptanceScope: "local_mechanism_only",
           providerAcceptanceVerdict: "NOT_RUN",
-          outcome: passed ? "PASS" : "FAIL",
+          outcome,
           startedAt,
           completedAt: isoTimestamp(now),
           observation,
-          ...(passed ? {} : { reason: "local deterministic observation failed its gate" }),
+          ...(outcome === "PASS"
+            ? {}
+            : {
+                reason: outcome === "INVALID_RUN"
+                  ? "local evidence integrity validation failed"
+                  : "local deterministic observation failed its gate",
+              }),
         });
       } catch (error: unknown) {
+        const terminalEvidenceIntegrityFailure = error instanceof TerminalEvidenceIntegrityError;
         result = artifactResult({
-          schemaVersion: 1,
+          schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
           manifestSha256: manifest.manifestSha256,
           ...profileBinding,
           runId: run.runId,
@@ -838,10 +964,14 @@ export async function executeKeylessBenchmark(
           arm: run.arm,
           acceptanceScope: "local_mechanism_only",
           providerAcceptanceVerdict: "NOT_RUN",
-          outcome: "FAIL",
+          outcome: terminalEvidenceIntegrityFailure ? "INVALID_RUN" : "FAIL",
           startedAt,
           completedAt: isoTimestamp(now),
-          reason: error instanceof Error ? error.message : "local deterministic execution failed",
+          reason: terminalEvidenceIntegrityFailure
+            ? TERMINAL_EVIDENCE_INTEGRITY_FAILURE_REASON
+            : error instanceof Error
+              ? error.message
+              : "local deterministic execution failed",
         });
       }
     }
@@ -850,7 +980,7 @@ export async function executeKeylessBenchmark(
     await writeJson(resultPath, result);
 
     const marker = artifactMarker({
-      schemaVersion: 1,
+      schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
       manifestSha256: manifest.manifestSha256,
       ...profileBinding,
       runId: run.runId,
@@ -859,9 +989,11 @@ export async function executeKeylessBenchmark(
       ...(run.arm === undefined ? {} : { arm: run.arm }),
       state: result.outcome === "PASS"
         ? "COMPLETED"
-        : result.outcome === "NOT_RUN"
-          ? "NOT_RUN"
-          : "FAILED",
+        : result.outcome === "FAIL"
+          ? "FAILED"
+          : result.outcome === "INVALID_RUN"
+            ? "INVALID_RUN"
+            : "NOT_RUN",
       startedAt,
       completedAt: result.completedAt,
       resultSha256: result.resultSha256,
@@ -895,7 +1027,7 @@ export async function executeKeylessBenchmark(
   const scoreText = await writeJson(join(options.outputDirectory, "score.json"), score);
   const generatedAt = isoTimestamp(now);
   const bundleBody = {
-    schemaVersion: 1 as const,
+    schemaVersion: BENCHMARK_ARTIFACT_SCHEMA_VERSION,
     kind: "keyless_benchmark_bundle" as const,
     executionMode,
     manifestSha256: manifest.manifestSha256,
@@ -962,7 +1094,7 @@ function parseJsonLines<T>(text: string, label: string): readonly T[] {
 function validateBundle(bundle: KeylessBenchmarkBundle): void {
   const { bundleSha256, ...body } = bundle;
   if (
-    bundle.schemaVersion !== 1 ||
+    bundle.schemaVersion !== BENCHMARK_ARTIFACT_SCHEMA_VERSION ||
     bundle.kind !== "keyless_benchmark_bundle" ||
     (bundle.executionMode !== "default_local_relay" &&
       bundle.executionMode !== "test_only_custom_executor") ||
@@ -1090,7 +1222,9 @@ export async function readAndValidateKeylessBenchmark(
       ? "COMPLETED"
       : result.outcome === "FAIL"
         ? "FAILED"
-        : "NOT_RUN";
+        : result.outcome === "INVALID_RUN"
+          ? "INVALID_RUN"
+          : "NOT_RUN";
     if (
       marker.manifestSha256 !== manifest.manifestSha256 ||
       marker.profileUnderTestSha256 !== profileUnderTest.profileUnderTestSha256 ||

@@ -52,7 +52,7 @@ export interface ApprovedProfileArtifact {
 }
 
 export interface LocalReleaseGateArtifact {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly kind: "local_poc_release_gate";
   readonly benchmarkBundleSha256: string;
   readonly benchmarkScoreSha256: string;
@@ -62,7 +62,7 @@ export interface LocalReleaseGateArtifact {
   readonly ownerKeyIdSha256: string;
   readonly trustAnchorSource: "operator_supplied_test_key";
   readonly customerOwnerAcceptanceVerdict: "NOT_RUN";
-  readonly localPocReleaseVerdict: "PASS" | "FAIL";
+  readonly localPocReleaseVerdict: "PASS" | "FAIL" | "INVALID_RUN" | "NOT_RUN";
   readonly localReleaseEvidence: BenchmarkAcceptanceScore["localReleaseEvidence"];
   readonly providerAcceptanceVerdict: "NOT_RUN";
   readonly productAcceptanceVerdict: "NOT_RUN";
@@ -349,20 +349,52 @@ export async function evaluateLocalReleaseGate(input: Readonly<{
   }
 
   const reasons: string[] = [];
-  if (benchmark.score.localMechanismVerdict !== "PASS") {
+  if (benchmark.score.localMechanismVerdict === "INVALID_RUN") {
+    reasons.push("local Harness evidence integrity was invalid");
+  } else if (benchmark.score.localMechanismVerdict !== "PASS") {
     reasons.push("local Harness mechanism score did not pass");
   }
-  if (benchmark.score.armVerdicts.GLOSSARY_CONTROLLED.verdict !== "PASS") {
+  if (benchmark.score.armVerdicts.GLOSSARY_CONTROLLED.verdict === "INVALID_RUN") {
+    reasons.push("GLOSSARY_CONTROLLED local arm has invalid evidence");
+  } else if (benchmark.score.armVerdicts.GLOSSARY_CONTROLLED.verdict !== "PASS") {
     reasons.push("GLOSSARY_CONTROLLED local arm did not complete every gate");
   }
   const evidence = benchmark.score.localReleaseEvidence;
-  if (!evidence.targetExact) reasons.push("target_exact gate did not pass");
-  if (!evidence.zeroRegression) reasons.push("zero-regression gate did not pass");
-  if (!evidence.alertsClear) reasons.push("runtime alert gate did not pass");
-  if (!evidence.latency) reasons.push("latency evidence gate did not pass");
-  if (!evidence.evidenceComplete) reasons.push("normalized event evidence gate did not pass");
+  const evidenceGates = Object.entries(evidence) as readonly [string, typeof evidence.targetExact][];
+  for (const [gate, verdict] of evidenceGates) {
+    if (verdict === "PASS") continue;
+    if (verdict === "INVALID_RUN") {
+      reasons.push(`${gate} evidence integrity was invalid`);
+      continue;
+    }
+    if (verdict === "NOT_RUN") {
+      const reason = gate === "latency"
+        ? "acoustic latency evidence was not run"
+        : gate === "bargeIn"
+          ? "acoustic barge-in evidence was not run"
+          : gate === "evidenceComplete"
+            ? "normalized events and four-track audio were not exported"
+            : `${gate} gate was not run`;
+      reasons.push(reason);
+      continue;
+    }
+    reasons.push(`${gate} gate did not pass`);
+  }
+  const evidenceVerdicts = Object.values(evidence);
+  const localPocReleaseVerdict =
+    benchmark.score.localMechanismVerdict === "INVALID_RUN" ||
+      benchmark.score.armVerdicts.GLOSSARY_CONTROLLED.verdict === "INVALID_RUN" ||
+      evidenceVerdicts.includes("INVALID_RUN")
+      ? "INVALID_RUN" as const
+      : benchmark.score.localMechanismVerdict === "FAIL" ||
+          benchmark.score.armVerdicts.GLOSSARY_CONTROLLED.verdict === "FAIL" ||
+          evidenceVerdicts.includes("FAIL")
+        ? "FAIL" as const
+        : evidenceVerdicts.includes("NOT_RUN")
+          ? "NOT_RUN" as const
+          : "PASS" as const;
   const body = {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     kind: "local_poc_release_gate" as const,
     benchmarkBundleSha256: benchmark.bundle.bundleSha256,
     benchmarkScoreSha256: benchmark.score.scoreSha256,
@@ -372,7 +404,7 @@ export async function evaluateLocalReleaseGate(input: Readonly<{
     ownerKeyIdSha256: input.approvedProfile.ownerSignature.keyIdSha256,
     trustAnchorSource: input.approvedProfile.trustAnchorSource,
     customerOwnerAcceptanceVerdict: input.approvedProfile.customerOwnerAcceptanceVerdict,
-    localPocReleaseVerdict: reasons.length === 0 ? "PASS" as const : "FAIL" as const,
+    localPocReleaseVerdict,
     localReleaseEvidence: evidence,
     providerAcceptanceVerdict: "NOT_RUN" as const,
     productAcceptanceVerdict: "NOT_RUN" as const,

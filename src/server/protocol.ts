@@ -28,30 +28,41 @@ export const sideSchema = z.enum(["A", "B"]);
 export const laneSchema = z.enum(["A_TO_B", "B_TO_A"]);
 export const translationModeSchema = z.enum(["fast", "balanced", "accurate"]);
 
+const pocLanguageSchema = z.enum(["en-US", "zh-TW"]);
+const sessionLanguagesSchema = z.object({
+  A: pocLanguageSchema,
+  B: pocLanguageSchema,
+}).refine(
+  (value) => value.A !== value.B,
+  { path: ["B"], message: "POC supports only the en-US <-> zh-TW language pair" },
+);
+
 export const createSessionRequestSchema = z.object({
-  languages: z.object({
-    A: z.string().trim().min(2).max(64),
-    B: z.string().trim().min(2).max(64),
-  }),
+  languages: sessionLanguagesSchema,
   translationMode: translationModeSchema,
   glossaryVersion: z.string().trim().min(1).max(256).optional(),
-  recordingConsent: z.literal(true),
-}).refine(
-  (value) => value.languages.A.toLocaleLowerCase("en-US") !== value.languages.B.toLocaleLowerCase("en-US"),
-  { path: ["languages", "B"], message: "participant languages must be different" },
-);
+}).strict();
+
+export const participantRecordingProcessingConsentRequestSchema = z.object({
+  accepted: z.literal(true),
+  consentId: z.string().uuid(),
+}).strict();
+
+export const participantRecordingProcessingWithdrawalRequestSchema = z.object({
+  withdrawalId: z.string().uuid(),
+}).strict();
 
 export const importGlossaryRequestSchema = z.object({
   name: z.string().trim().min(1).max(128),
   fileName: z.string().trim().min(5).max(255)
     .regex(/^[^./\\\u0000][^/\\\u0000]*\.(?:csv|xlsx)$/iu, "fileName must be a .csv or .xlsx base name"),
   contentsBase64: glossaryContentsBase64Schema,
-  sourceLanguage: z.string().trim().min(2).max(64),
-  targetLanguage: z.string().trim().min(2).max(64),
+  sourceLanguage: pocLanguageSchema,
+  targetLanguage: pocLanguageSchema,
   approvedBy: z.string().trim().min(1).max(128),
 }).refine(
-  (value) => value.sourceLanguage.toLocaleLowerCase("en-US") !== value.targetLanguage.toLocaleLowerCase("en-US"),
-  { path: ["targetLanguage"], message: "glossary languages must be different" },
+  (value) => value.sourceLanguage !== value.targetLanguage,
+  { path: ["targetLanguage"], message: "POC supports only the en-US <-> zh-TW language pair" },
 );
 
 const commandBase = z.object({
@@ -63,6 +74,7 @@ export const sessionCommandSchema = z.discriminatedUnion("kind", [
   commandBase.extend({ kind: z.literal("pause") }),
   commandBase.extend({ kind: z.literal("resume") }),
   commandBase.extend({ kind: z.literal("end") }),
+  commandBase.extend({ kind: z.literal("arm_recorder") }),
 ]);
 
 export const mediaControlSchema = z.discriminatedUnion("type", [
@@ -71,6 +83,12 @@ export const mediaControlSchema = z.discriminatedUnion("type", [
 ]);
 
 export type CreateSessionRequest = z.infer<typeof createSessionRequestSchema>;
+export type ParticipantRecordingProcessingConsentRequest = z.infer<
+  typeof participantRecordingProcessingConsentRequestSchema
+>;
+export type ParticipantRecordingProcessingWithdrawalRequest = z.infer<
+  typeof participantRecordingProcessingWithdrawalRequestSchema
+>;
 export type ImportGlossaryRequest = z.infer<typeof importGlossaryRequestSchema>;
 export type SessionCommandRequest = z.infer<typeof sessionCommandSchema>;
 export type MediaControl = z.infer<typeof mediaControlSchema>;

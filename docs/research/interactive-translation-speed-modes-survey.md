@@ -95,18 +95,59 @@ The shared interruption contract is therefore: the Relay increments the local ge
 
 OpenAI's standard Realtime VAD and conversation interruption/truncation controls are separate capabilities: semantic VAD changes chunking eagerness, and standard conversation mode can cancel/truncate a response. They must not be silently treated as controls on the dedicated translation endpoint ([Realtime VAD](https://developers.openai.com/api/docs/guides/realtime-vad), [Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations)).
 
-## Config-only switching
+## Post-research implementation: approved-profile selection
 
-Expose the provider and behavior as separate configuration dimensions:
+The former provider/mode environment-variable sketch is historical research,
+not a supported runtime route. Deployment now loads an
+`ApprovedSessionProcessingProfile` from `PROCESSING_PROFILE_PATH` and accepts
+it only when `PROCESSING_PROFILE_SHA256` matches its canonical profile-body
+SHA. This one approved artifact pins the provider, default mode, allowed modes,
+service endpoints, model identifiers, voice, and the related glossary,
+fallback, evidence, retention, consent, and assurance controls.
 
-```text
-TRANSLATION_PROVIDER=palabra | openai_native | openai_controlled
-TRANSLATION_MODE=fast | balanced | accurate
-```
+At session creation, an operator may select only a mode listed in the approved
+profile's `allowedModes`; the resulting processing manifest retains the
+selection and profile identity. No session may switch provider, endpoint,
+model, voice, or profile route at runtime. Former provider/mode environment
+selection, legacy profile names, and direct runtime routing overrides are
+intentionally unsupported rather than compatibility paths.
 
-The composition root selects the pipeline from `TRANSLATION_PROVIDER`: `palabra` is the black-box Palabra Speech-to-Speech path, `openai_native` is the dedicated `gpt-realtime-translate` path, and `openai_controlled` is the separate application-composed path. It maps `TRANSLATION_MODE` to provider options and local policy. Palabra can accept live `set_task` changes ([management API](https://docs.palabra.ai/docs/streaming_api/management)), but for cross-provider consistency any mode or provider change becomes pending and applies at the next clean generation/speech boundary; never splice settings mid-phrase. Relay/core code consumes only `TranslationBehavior`, normalized `TranslationEvent` values, generation cuts, and `media.clear`; it must not branch on `palabra_live` or `native_live_baseline`. Unsupported provider features should surface capability metadata and metrics, then use the documented local degradation. Remove profile-name semantics as this seam lands rather than adding a compatibility layer. Keep adapter conformance tests for event revisions, finality, interruption, and capability reporting.
+Current enforcement is stricter than a routing choice: every service carries a
+manifest-bound ordered `dataCategories` egress list, and the participant
+disclosure exposes only service id/provider/role/category/list—not endpoints,
+models or assurance bodies. A selected profile with unverified `trainingUse`
+or `serviceRetention` is `synthetic_only`; `POST /api/sessions` rejects it
+before a relay or grant is made. The checked-in `manufacturing-poc` sample has
+that status and is not a human-demo/provider-acceptance profile. Fallback is
+only approved `none` or `same_route_fail_open`; it never silently switches
+provider or route.
 
-The current code already has separate OpenAI and Palabra adapters and generation-aware media clearing, but its three product profiles still bundle provider and turn semantics. The minimal seam is to move behavior into `SessionSpec` / `LaneContext`, make Relay branches behavior-based, and require a revision-aware event contract before enabling Palabra partials across providers ([core types](../../src/core/types.ts), [Relay](../../src/core/relay.ts), [OpenAI adapter](../../src/adapters/openai/native-realtime-translate.ts), [Palabra adapter](../../src/adapters/palabra/index.ts)).
+The repository's `pnpm benchmark` remains a deterministic mechanism
+self-check (`MECHANISM_PASS`, acceptance `NOT_RUN`). Keyless local observations
+can be `PASS`/`FAIL`, evidence/finalization integrity failures are
+`INVALID_RUN`, and unexecuted scopes are `NOT_RUN`; it does not supply acoustic
+latency/barge-in/four-track evidence or live provider/product acceptance.
+
+Evidence review is a separate sealed-artifact contract, not a speed-mode or
+provider-acceptance result. Deployment freezes distinct data-owner and
+bilingual-reviewer identities into a per-session grant; only a matching bearer
+may call metadata `POST /api/sessions/:sessionId/evidence/review`, bounded
+20 ms-aligned 24 kHz mono WAV `POST /api/sessions/:sessionId/evidence/review/audio-window`, or the
+audited sealed retention summary. Those `no-store` responses expose neither
+archive paths/IDs nor raw manifests/evidence refs. A detached content-free
+authenticated audit chain remains after evidence deletion; it records a
+committed disclosure authorization, not proof of human consumption. It neither
+upgrades vendor assurances nor removes the synthetic-only/`NOT_RUN` status of
+the reference POC or its mandatory encrypted-master-glossary closeout.
+
+The adapter boundary from this survey remains useful: Relay/core consumes
+normalized `TranslationEvent` values, selected behavior, generation cuts, and
+`media.clear`, rather than provider-specific event names. Unsupported provider
+features must surface truthful capability/assurance state and use the documented
+local degradation. Cross-provider changes require a newly approved profile and
+a new session; no settings are spliced mid-phrase. Adapter conformance tests
+continue to cover event revisions, finality, interruption, and capability
+reporting.
 
 ## Barge-in implementation contract
 

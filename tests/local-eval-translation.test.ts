@@ -64,6 +64,11 @@ test("local_eval recognizes a configured alias, restores target_exact, and emits
     now: () => 10,
   });
 
+  assert.deepEqual(
+    await adapter.prepare(context),
+    { readiness: "fixture_local", remoteConnection: "not_applicable" },
+  );
+
   const events = await collect(adapter.translate(request()));
   const authorized = events.find(
     (event) => event.kind === "terminology" && event.status === "authorized",
@@ -108,4 +113,25 @@ test("local_eval fail-open fixture alerts but continues target text and canonica
   assert.ok(events.some((event) => event.kind === "target_transcript"));
   assert.ok(events.some((event) => event.kind === "audio"));
   assert.equal(events.at(-1)?.kind, "completed");
+});
+
+test("local_eval TranslationPort emits stable opaque references for generated fixture events", async () => {
+  const options = {
+    transcriptByLane: {
+      A_TO_B: "Verify the mistake proofing fixture.",
+      B_TO_A: "請確認防呆治具。",
+    },
+    confidence: 0.99,
+    translationMode: "preserve" as const,
+    now: () => 10,
+  };
+  const first = await collect(createLocalEvalTranslationAdapter(options).translate(request()));
+  const second = await collect(createLocalEvalTranslationAdapter(options).translate(request()));
+  const refs = first.map((event) => event.evidenceRef);
+
+  assert.ok(refs.length > 0);
+  assert.ok(refs.every((ref) => /^local_eval:v1:sha256:[a-f0-9]{64}$/u.test(ref)));
+  assert.equal(new Set(refs).size, refs.length);
+  assert.equal(refs.some((ref) => ref.includes(context.sessionId)), false);
+  assert.deepEqual(refs, second.map((event) => event.evidenceRef));
 });

@@ -175,7 +175,7 @@ describe("executable benchmark manifest", () => {
     assert.equal(first.manifestSha256, second.manifestSha256);
     assert.deepEqual(first, second);
     assert.match(first.manifestSha256, /^[a-f0-9]{64}$/u);
-    assert.equal(first.schemaVersion, 3);
+    assert.equal(first.schemaVersion, 7);
     assert.equal(first.runs.length, 183);
     assert.equal(first.runs.filter((run) => run.stage === "discovery").length, 60);
     assert.equal(first.runs.filter((run) => run.stage === "formal_terminology").length, 24);
@@ -205,12 +205,19 @@ describe("executable benchmark manifest", () => {
       ["OPENAI_NATIVE_TRANSLATE", "openai_native", "balanced"],
       ["GLOSSARY_CONTROLLED", "openai_controlled", "accurate"],
     ]);
+    assert.equal(
+      first.arms.find((arm) => arm.arm === "OPENAI_NATIVE_TRANSLATE")?.config.transport,
+      "dedicated_websocket",
+    );
+    assert.equal(first.evidence.output, "run_results_jsonl_without_event_or_audio_export");
     assert.deepEqual(first.gates, {
       targetExact: "all_bound_committed_terms",
       zeroOpenRegression: true,
       alertsClear: true,
-      latencyEvidence: "all_local_latency_samples",
-      normalizedEventEvidence: "revisions_finality_audio_sequence",
+      latencyEvidence: "not_run_without_acoustic_capture",
+      bargeInEvidence: "not_run_without_acoustic_capture",
+      normalizedEventEvidence:
+        "not_run_without_exported_events_and_four_track_audio",
       noRuntimeHotSwap: true,
       gatesSha256: first.gates.gatesSha256,
     });

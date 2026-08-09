@@ -3,14 +3,17 @@ import {
   createAudioFrame,
   type AudioFrame,
 } from "../../core/audio.js";
+import { GenerationPlayoutSequence } from "../../core/playout-sequence.js";
 import { resolveTranslationBehavior } from "../../core/translation-behavior.js";
+import { assertTranslationBehaviorCapability } from "../../core/translation-capabilities.js";
 import type {
   GenerationRef,
   LaneContext,
-  TranslationBehavior,
   TranslationCapabilities,
   TranslationErrorEvent,
   TranslationEvent,
+  TranslationFallbackPolicy,
+  TranslationPreparation,
   TranslationProviderId,
   TranslationPort,
   TranslationRequest,
@@ -21,6 +24,7 @@ import {
   type ControlledTranscriptionPort,
   type ControlledTtsPort,
 } from "../translation/glossary-controlled.js";
+import { createOpaqueEvidenceRef } from "../translation/evidence-ref.js";
 import {
   appendModel,
   authorizationHeaders,
@@ -28,13 +32,11 @@ import {
   closeSocket,
   defaultWebSocketFactory,
   encodePcm16,
-  GenerationPlayoutSequence,
+  isRecord,
   LocalPlayoutQueue,
   OpenAIAdapterError,
-  parseJsonObject,
   requireApiKey,
   resolveTimeoutMs,
-  sendJson,
   stringField,
   waitForOpen,
   type WebSocketFactory,
@@ -50,27 +52,50 @@ import {
   OpenAITtsAdapter,
 } from "./tts.js";
 
-const DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime";
+/** Dedicated GA Realtime Translation WebSocket route. */
+const DEFAULT_REALTIME_URL =
+  "wss://api.openai.com/v1/realtime/translations";
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
-const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
+const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
 const DEFAULT_INPUT_APPEND_MS = 200;
+const MAX_NATIVE_WIRE_PAYLOAD_BYTES = 512 * 1024;
+const MAX_NATIVE_OUTBOUND_BUFFERED_BYTES = 512 * 1024;
+const MAX_NATIVE_QUEUED_NON_AUDIO_EVENTS = 256;
+const MAX_NATIVE_QUEUED_NON_AUDIO_BYTES = 256 * 1024;
+const MAX_NATIVE_PROVIDER_EVENT_TEXT_BYTES = 64 * 1024;
+const MAX_NATIVE_PROVIDER_EVENT_ID_BYTES = 256;
+const MAX_NATIVE_PARSE_VALUE_DEPTH = 8;
+const MAX_NATIVE_JSON_NESTING = 64;
+
+const OPENAI_LOCAL_ROUTE_PREPARATION: TranslationPreparation = Object.freeze({
+  readiness: "local_route_validated",
+  remoteConnection: "deferred_until_first_turn",
+});
 
 /** Static metadata: safe to inspect before a server-side key is available. */
 export const OPENAI_NATIVE_TRANSLATION_CAPABILITIES: TranslationCapabilities =
   Object.freeze({
     providerId: "openai_native",
-    supportedModes: Object.freeze([
+    modes: Object.freeze([
       Object.freeze({
         mode: "fast" as const,
         behaviorVersion: 1 as const,
+        state: "native" as const,
         deterministicGlossary: false,
       }),
       Object.freeze({
         mode: "balanced" as const,
         behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
         deterministicGlossary: false,
-        degradation:
-          "Balanced uses adapter-local holdback; it is not a model-quality claim.",
+      }),
+      Object.freeze({
+        mode: "accurate" as const,
+        behaviorVersion: 1 as const,
+        state: "experimental" as const,
+        deterministicGlossary: false,
+        reason:
+          "Native Realtime accurate mode is experimental and unavailable until benchmark parity is established.",
       }),
     ]),
     supportsProvisionalRevisions: true,
@@ -82,20 +107,23 @@ export const OPENAI_NATIVE_TRANSLATION_CAPABILITIES: TranslationCapabilities =
 export const OPENAI_CONTROLLED_TRANSLATION_CAPABILITIES: TranslationCapabilities =
   Object.freeze({
     providerId: "openai_controlled",
-    supportedModes: Object.freeze([
+    modes: Object.freeze([
       Object.freeze({
         mode: "fast" as const,
         behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
         deterministicGlossary: true,
       }),
       Object.freeze({
         mode: "balanced" as const,
         behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
         deterministicGlossary: true,
       }),
       Object.freeze({
         mode: "accurate" as const,
         behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
         deterministicGlossary: true,
       }),
     ]),
@@ -114,13 +142,15 @@ export interface NativeRealtimeTranslateAdapterOptions {
   readonly apiKey: string;
   readonly webSocketFactory?: WebSocketFactory;
   readonly endpoint?: string;
+  /** Translation model selected in the dedicated endpoint query string. */
   readonly model?: string;
-  readonly voice?: string;
+  /** Optional dedicated-route source transcript model. */
   readonly inputTranscriptionModel?: string | null;
+  /** Optional dedicated-route input noise reduction. */
   readonly noiseReduction?: "near_field" | "far_field" | null;
   readonly now?: () => number;
   readonly connectTimeoutMs?: number;
-  readonly responseTimeoutMs?: number;
+  readonly closeTimeoutMs?: number;
   /** Coalesce canonical 20 ms input frames into Realtime append events. */
   readonly inputAppendMs?: number;
 }
@@ -145,6 +175,20 @@ class RealtimeInputError extends Error {
   }
 }
 
+class NativePayloadTooLargeError extends Error {
+  constructor() {
+    super("OpenAI native translation message exceeds the supported size.");
+    this.name = "NativePayloadTooLargeError";
+  }
+}
+
+class NativePayloadDepthError extends Error {
+  constructor() {
+    super("OpenAI native translation message nesting exceeds the supported depth.");
+    this.name = "NativePayloadDepthError";
+  }
+}
+
 /**
  * A complete native speech-to-speech Realtime path. It owns its socket,
  * source append cadence, output canonicalisation and local playout fence; it
@@ -156,12 +200,11 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
   readonly #webSocketFactory: WebSocketFactory;
   readonly #endpoint: string;
   readonly #model: string;
-  readonly #voice: string;
   readonly #inputTranscriptionModel: string | null;
   readonly #noiseReduction: "near_field" | "far_field" | null;
   readonly #now: () => number;
   readonly #connectTimeoutMs: number;
-  readonly #responseTimeoutMs: number;
+  readonly #closeTimeoutMs: number;
   readonly #inputAppendBytes: number;
   readonly #active = new Map<string, ActiveTranslation>();
   readonly #playoutSequences = new GenerationPlayoutSequence();
@@ -169,13 +212,57 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
   constructor(options: NativeRealtimeTranslateAdapterOptions) {
     this.#apiKey = requireApiKey(options.apiKey);
     this.#webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
-    this.#endpoint = options.endpoint ?? DEFAULT_REALTIME_URL;
-    this.#model = options.model ?? "gpt-realtime";
-    this.#voice = options.voice ?? "marin";
+    const endpoint = options.endpoint ?? DEFAULT_REALTIME_URL;
+    let parsedEndpoint: URL;
+    try {
+      parsedEndpoint = new URL(endpoint);
+    } catch {
+      throw new OpenAIAdapterError(
+        "configuration_error",
+        "OpenAI native translation endpoint is not a valid WebSocket URL.",
+      );
+    }
+    const normalizedPath = parsedEndpoint.pathname;
+    if (
+      parsedEndpoint.protocol !== "wss:" ||
+      parsedEndpoint.hostname !== "api.openai.com" ||
+      parsedEndpoint.port.length > 0 ||
+      normalizedPath !== "/v1/realtime/translations" ||
+      parsedEndpoint.toString() !== DEFAULT_REALTIME_URL ||
+      parsedEndpoint.username.length > 0 ||
+      parsedEndpoint.password.length > 0 ||
+      parsedEndpoint.search.length > 0 ||
+      parsedEndpoint.hash.length > 0
+    ) {
+      throw new OpenAIAdapterError(
+        "configuration_error",
+        "OpenAI native translation requires the dedicated /v1/realtime/translations WebSocket endpoint.",
+      );
+    }
+    this.#endpoint = parsedEndpoint.toString();
+    const model = options.model ?? "gpt-realtime-translate";
+    if (model !== "gpt-realtime-translate") {
+      throw new OpenAIAdapterError(
+        "configuration_error",
+        "OpenAI native translation requires the gpt-realtime-translate model.",
+      );
+    }
+    this.#model = model;
     this.#inputTranscriptionModel =
       options.inputTranscriptionModel === undefined
-        ? "gpt-4o-mini-transcribe"
+        ? "gpt-realtime-whisper"
         : options.inputTranscriptionModel;
+    if (
+      this.#inputTranscriptionModel !== null &&
+      (this.#inputTranscriptionModel.trim().length === 0 ||
+        Buffer.byteLength(this.#inputTranscriptionModel, "utf8") >
+          MAX_NATIVE_PROVIDER_EVENT_ID_BYTES)
+    ) {
+      throw new OpenAIAdapterError(
+        "configuration_error",
+        "OpenAI native translation transcription model is invalid.",
+      );
+    }
     this.#noiseReduction = options.noiseReduction ?? null;
     this.#now = options.now ?? (() => performance.now());
     this.#connectTimeoutMs = resolveTimeoutMs(
@@ -183,10 +270,10 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       DEFAULT_CONNECT_TIMEOUT_MS,
       "OpenAI realtime connectTimeoutMs",
     );
-    this.#responseTimeoutMs = resolveTimeoutMs(
-      options.responseTimeoutMs,
-      DEFAULT_RESPONSE_TIMEOUT_MS,
-      "OpenAI realtime responseTimeoutMs",
+    this.#closeTimeoutMs = resolveTimeoutMs(
+      options.closeTimeoutMs,
+      DEFAULT_CLOSE_TIMEOUT_MS,
+      "OpenAI realtime closeTimeoutMs",
     );
     const inputAppendMs = resolveTimeoutMs(
       options.inputAppendMs,
@@ -204,32 +291,38 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       CANONICAL_AUDIO.bytesPerFrame;
   }
 
-  async prepare(context: LaneContext): Promise<void> {
-    assertBehaviorSupported(
-      context.behavior,
-      this.capabilities,
-      "OpenAI native Realtime",
-    );
-    assertGlossarySupported(
-      context,
-      this.capabilities,
-      "OpenAI native Realtime",
-    );
+  async prepare(context: LaneContext): Promise<TranslationPreparation> {
+    assertOpenAICapability(context, this.capabilities);
+    return OPENAI_LOCAL_ROUTE_PREPARATION;
   }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     const ref = request.context;
-    assertBehaviorSupported(
-      ref.behavior,
-      this.capabilities,
-      "OpenAI native Realtime",
-    );
-    assertGlossarySupported(ref, this.capabilities, "OpenAI native Realtime");
+    assertOpenAICapability(ref, this.capabilities);
     const behavior = ref.behavior;
     const maxBufferedAudioFrames = Math.max(
       1,
       Math.floor(behavior.maxBufferedAudioMs / CANONICAL_AUDIO.frameDurationMs),
     );
+    // Reserve the next append-sized window from the local ingress budget.
+    // Once a window is appended synchronously, the provider owns it; until
+    // then, the queued windows plus this partial window must fit the behavior
+    // budget exactly.
+    const continuousInputWindowFrames = Math.min(
+      this.#inputAppendBytes / CANONICAL_AUDIO.bytesPerFrame,
+      Math.max(1, maxBufferedAudioFrames - 1),
+    );
+    const continuousInputBacklogFrames =
+      maxBufferedAudioFrames - continuousInputWindowFrames;
+    if (
+      behavior.inputCommit === "continuous" &&
+      continuousInputBacklogFrames < 1
+    ) {
+      throw new OpenAIAdapterError(
+        "configuration_error",
+        "OpenAI realtime continuous behavior must reserve local backlog capacity after each input window.",
+      );
+    }
     const key = generationKey(ref);
     const previous = this.#active.get(key);
     if (previous !== undefined) {
@@ -243,6 +336,13 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       revision: number,
       finality: "provisional" | "final",
       emittedAtMs = this.#now(),
+      evidenceRef = adapterGeneratedEvidenceRef(
+        "openai-native",
+        ref,
+        segmentId,
+        revision,
+        finality,
+      ),
     ) => ({
       sessionId: ref.sessionId,
       lane: ref.lane,
@@ -251,18 +351,20 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       segmentId,
       revision,
       finality,
+      evidenceRef,
       emittedAtMs,
     });
     const errorEvent = (
       code: string,
       message: string,
       retryable: boolean,
+      evidenceRef?: string,
     ): TranslationErrorEvent => {
       const segmentId = "error-" + errorSequence.toString(10);
       errorSequence += 1;
       return {
         kind: "error",
-        ...eventBase(segmentId, 1, "final"),
+        ...eventBase(segmentId, 1, "final", undefined, evidenceRef),
         error: { code, message, retryable },
       };
     };
@@ -271,7 +373,11 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     try {
       socket = this.#webSocketFactory(
         appendModel(this.#endpoint, this.#model),
-        { headers: authorizationHeaders(this.#apiKey) },
+        {
+          headers: authorizationHeaders(this.#apiKey),
+          maxPayload: MAX_NATIVE_WIRE_PAYLOAD_BYTES,
+          perMessageDeflate: false,
+        },
       );
     } catch {
       yield errorEvent(
@@ -286,34 +392,31 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       maxBufferedAudioFrames,
     );
     const continuousInputWindows = behavior.inputCommit === "continuous"
-      ? new BoundedAudioWindowQueue<ContinuousInputWindow>(maxBufferedAudioFrames)
+      ? new BoundedAudioWindowQueue<ContinuousInputWindow>(
+        continuousInputBacklogFrames,
+      )
       : undefined;
     let lifecycle: "active" | "cancelled" | "failed" | "completed" = "active";
     let outputSuppressed = false;
-    let responseTimer: ReturnType<typeof setTimeout> | undefined;
     let sessionReady = false;
-    let inputEnded = false;
-    let inputBufferedBytes = 0;
-    let responseInFlight = false;
+    let sessionCloseSent = false;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
     let pendingOutputAudio = new Uint8Array(0);
+    let pendingOutputAudioProviderId: string | undefined;
+    let queuedNonAudioEvents = 0;
+    let queuedNonAudioBytes = 0;
     let inputStopRequested = false;
     let inputReturnRequested = false;
     let inputIterator: AsyncIterator<AudioFrame> | undefined;
     let wakeInputStop: (() => void) | undefined;
-    let wakeContinuousResponse: (() => void) | undefined;
     const inputStopped = new Promise<void>((resolve) => {
       wakeInputStop = resolve;
     });
 
-    const clearResponseDeadline = (): void => {
-      if (responseTimer === undefined) return;
-      clearTimeout(responseTimer);
-      responseTimer = undefined;
-    };
-    const finishContinuousResponse = (): void => {
-      const wake = wakeContinuousResponse;
-      wakeContinuousResponse = undefined;
-      wake?.();
+    const clearCloseDeadline = (): void => {
+      if (closeTimer === undefined) return;
+      clearTimeout(closeTimer);
+      closeTimer = undefined;
     };
     const returnInputIterator = (iterator: AsyncIterator<AudioFrame>): void => {
       if (inputIterator === iterator) inputIterator = undefined;
@@ -341,7 +444,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     const sendBestEffort = (event: unknown): void => {
       if (socket.readyState !== 1) return;
       try {
-        sendJson(socket, event);
+        sendNativeJson(socket, event);
       } catch {
         // A local cancellation fence is authoritative even if the socket died.
       }
@@ -351,12 +454,34 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       options: Readonly<{ readonly audio?: boolean; readonly holdback?: boolean }> = {},
     ): void => {
       if (lifecycle !== "active") return;
+      const isAudio = options.audio === true || event.kind === "audio";
+      let eventBytes = 0;
+      if (!isAudio) {
+        eventBytes = nativeEventBytes(event);
+        if (
+          eventBytes > MAX_NATIVE_QUEUED_NON_AUDIO_BYTES ||
+          queuedNonAudioEvents >= MAX_NATIVE_QUEUED_NON_AUDIO_EVENTS ||
+          queuedNonAudioBytes + eventBytes > MAX_NATIVE_QUEUED_NON_AUDIO_BYTES
+        ) {
+          fail(
+            "OPENAI_REALTIME_EVENT_QUEUE_LIMIT",
+            "The translation service returned too many queued events.",
+            true,
+          );
+          return;
+        }
+      }
       const offer = events.offer(event, {
-        audio: options.audio === true,
+        audio: isAudio,
         holdbackMs: options.holdback === true ? behavior.holdbackMs : 0,
       });
+      if (offer === "closed") return;
+      if (!isAudio) {
+        queuedNonAudioEvents += 1;
+        queuedNonAudioBytes += eventBytes;
+      }
       if (offer === "dropped_oldest") {
-        events.offer(
+        queueEvent(
           errorEvent(
             "OPENAI_REALTIME_PLAYOUT_QUEUE_TRIMMED",
             "The oldest queued translation audio was dropped to preserve the latency budget.",
@@ -365,22 +490,36 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         );
       }
     };
-    const queueError = (code: string, message: string, retryable: boolean): void => {
-      queueEvent(errorEvent(code, message, retryable));
+    const queueError = (
+      code: string,
+      message: string,
+      retryable: boolean,
+      evidenceRef?: string,
+    ): void => {
+      queueEvent(errorEvent(code, message, retryable, evidenceRef));
     };
     const transcriptStates = new Map<
       string,
       {
         readonly kind: "source_transcript" | "target_transcript";
         readonly segmentId: string;
+        readonly evidenceRef: string;
         text: string;
         revision: number;
         finalEmitted: boolean;
       }
     >();
+    // The dedicated translation route emits audio deltas independently of
+    // transcript revisions. Keep the latest emitted target transcript state
+    // so every audible frame can be correlated without deriving an identity
+    // from an audio event/sequence name.
+    let currentTargetSegmentId: string | undefined;
+    let currentTargetRevision: number | undefined;
+    let missingTargetAudioReported = false;
     const publishTranscript = (
       kind: "source_transcript" | "target_transcript",
       providerId: string,
+      evidenceRef: string,
       text: string,
       final: boolean,
     ): void => {
@@ -390,16 +529,31 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         state = {
           kind,
           segmentId: kind + "-" + providerId,
+          evidenceRef,
           text: "",
           revision: 0,
           finalEmitted: false,
         };
         transcriptStates.set(stateKey, state);
       }
-      state.text = final ? text : state.text + text;
+      const nextText = final ? text : state.text + text;
+      if (Buffer.byteLength(nextText, "utf8") > MAX_NATIVE_PROVIDER_EVENT_TEXT_BYTES) {
+        fail(
+          "OPENAI_REALTIME_INVALID_PAYLOAD",
+          "The translation service returned an oversized transcript.",
+          true,
+        );
+        return;
+      }
+      state.text = nextText;
       if (!final && behavior.transcriptPolicy === "final_only") return;
       state.revision += 1;
       if (final) state.finalEmitted = true;
+      if (kind === "target_transcript") {
+        currentTargetSegmentId = state.segmentId;
+        currentTargetRevision = state.revision;
+        missingTargetAudioReported = false;
+      }
       queueEvent(
         {
           kind: state.kind,
@@ -407,6 +561,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
             state.segmentId,
             state.revision,
             final ? "final" : "provisional",
+            undefined,
+            state.evidenceRef,
           ),
           text: state.text,
         },
@@ -418,22 +574,72 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         if (state.finalEmitted || state.text.length === 0) continue;
         state.revision += 1;
         state.finalEmitted = true;
+        if (state.kind === "target_transcript") {
+          currentTargetSegmentId = state.segmentId;
+          currentTargetRevision = state.revision;
+          missingTargetAudioReported = false;
+        }
         queueEvent(
           {
             kind: state.kind,
-            ...eventBase(state.segmentId, state.revision, "final"),
+            ...eventBase(
+              state.segmentId,
+              state.revision,
+              "final",
+              undefined,
+              state.evidenceRef,
+            ),
             text: state.text,
           },
           { holdback: true },
         );
       }
     };
-    const emitAudioFrame = (pcm16le: Uint8Array, emittedAtMs: number): void => {
+    const emitAudioFrame = (
+      pcm16le: Uint8Array,
+      emittedAtMs: number,
+      providerId?: string,
+      targetSegmentId?: string,
+      targetRevision?: number,
+    ): void => {
+      if (
+        targetSegmentId === undefined ||
+        targetSegmentId.trim().length === 0 ||
+        targetRevision === undefined ||
+        !Number.isSafeInteger(targetRevision) ||
+        targetRevision < 0
+      ) {
+        if (!missingTargetAudioReported) {
+          missingTargetAudioReported = true;
+          queueError(
+            "OPENAI_REALTIME_AUDIO_TARGET_UNKNOWN",
+            "The translation service returned audio before a target transcript segment was identified.",
+            true,
+          );
+        }
+        return;
+      }
       const outputSequence = this.#playoutSequences.next(ref);
+      const evidenceRef = providerId === undefined
+        ? undefined
+        : providerDerivedEvidenceRef(
+          "openai-native",
+          ref,
+          "output_audio",
+          providerId,
+          outputSequence.toString(10),
+        );
       queueEvent(
         {
           kind: "audio",
-          ...eventBase("audio-" + outputSequence.toString(10), 1, "final", emittedAtMs),
+          ...eventBase(
+            "audio-" + outputSequence.toString(10),
+            targetRevision,
+            "final",
+            emittedAtMs,
+            evidenceRef,
+          ),
+          targetSegmentId,
           playoutSequence: outputSequence,
           frame: createAudioFrame({
             sessionId: ref.sessionId,
@@ -447,20 +653,97 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         { audio: true, holdback: true },
       );
     };
-    const acceptOutputAudio = (audio: Uint8Array): void => {
+    let pendingOutputAudioTargetSegmentId: string | undefined;
+    let pendingOutputAudioTargetRevision: number | undefined;
+    const acceptOutputAudio = (
+      audio: Uint8Array,
+      providerId?: string,
+      targetSegmentId = currentTargetSegmentId,
+      targetRevision = currentTargetRevision,
+    ): void => {
+      if (
+        targetSegmentId === undefined ||
+        targetRevision === undefined
+      ) {
+        if (!missingTargetAudioReported) {
+          missingTargetAudioReported = true;
+          queueError(
+            "OPENAI_REALTIME_AUDIO_TARGET_UNKNOWN",
+            "The translation service returned audio before a target transcript segment was identified.",
+            true,
+          );
+        }
+        // Do not retain bytes that could later be misattributed to a target
+        // transcript arriving after this provider packet.
+        pendingOutputAudio = new Uint8Array(0);
+        pendingOutputAudioProviderId = undefined;
+        pendingOutputAudioTargetSegmentId = undefined;
+        pendingOutputAudioTargetRevision = undefined;
+        return;
+      }
+      if (
+        pendingOutputAudio.byteLength > 0 &&
+        (pendingOutputAudioTargetSegmentId !== targetSegmentId ||
+          pendingOutputAudioTargetRevision !== targetRevision)
+      ) {
+        // A target revision changed while a PCM fragment was buffered.  The
+        // fragment cannot be safely attributed across the revision boundary.
+        pendingOutputAudio = new Uint8Array(0);
+        pendingOutputAudioProviderId = undefined;
+        pendingOutputAudioTargetSegmentId = undefined;
+        pendingOutputAudioTargetRevision = undefined;
+        if (!missingTargetAudioReported) {
+          missingTargetAudioReported = true;
+          queueError(
+            "OPENAI_REALTIME_AUDIO_TARGET_UNKNOWN",
+            "The translation service returned audio across target transcript revisions.",
+            true,
+          );
+        }
+        return;
+      }
+      if (pendingOutputAudio.byteLength === 0) {
+        pendingOutputAudioTargetSegmentId = targetSegmentId;
+        pendingOutputAudioTargetRevision = targetRevision;
+      }
+      missingTargetAudioReported = false;
+      const frameProviderId = pendingOutputAudio.byteLength === 0 ||
+        pendingOutputAudioProviderId === providerId
+        ? providerId
+        : undefined;
       const combined = concatenateBytes(pendingOutputAudio, audio);
       let offset = 0;
       while (combined.byteLength - offset >= CANONICAL_AUDIO.bytesPerFrame) {
         emitAudioFrame(
           combined.slice(offset, offset + CANONICAL_AUDIO.bytesPerFrame),
           this.#now(),
+          frameProviderId,
+          pendingOutputAudioTargetSegmentId,
+          pendingOutputAudioTargetRevision,
         );
         offset += CANONICAL_AUDIO.bytesPerFrame;
       }
       pendingOutputAudio = combined.slice(offset);
+      pendingOutputAudioProviderId = pendingOutputAudio.byteLength === 0
+        ? undefined
+        : frameProviderId;
+      if (pendingOutputAudio.byteLength === 0) {
+        pendingOutputAudioTargetSegmentId = undefined;
+        pendingOutputAudioTargetRevision = undefined;
+      }
     };
     const finishOutputAudio = (): void => {
       if (pendingOutputAudio.byteLength === 0) return;
+      if (
+        currentTargetSegmentId === undefined ||
+        currentTargetRevision === undefined
+      ) {
+        pendingOutputAudio = new Uint8Array(0);
+        pendingOutputAudioProviderId = undefined;
+        pendingOutputAudioTargetSegmentId = undefined;
+        pendingOutputAudioTargetRevision = undefined;
+        return;
+      }
       if (pendingOutputAudio.byteLength % 2 !== 0) {
         queueError(
           "OPENAI_REALTIME_INVALID_AUDIO",
@@ -472,116 +755,114 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       if (pendingOutputAudio.byteLength === 0) return;
       const padded = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame);
       padded.set(pendingOutputAudio);
+      const targetSegmentId = pendingOutputAudioTargetSegmentId ?? currentTargetSegmentId;
+      const targetRevision = pendingOutputAudioTargetRevision ?? currentTargetRevision;
       pendingOutputAudio = new Uint8Array(0);
-      emitAudioFrame(padded, this.#now());
+      emitAudioFrame(
+        padded,
+        this.#now(),
+        pendingOutputAudioProviderId,
+        targetSegmentId,
+        targetRevision,
+      );
+      pendingOutputAudioProviderId = undefined;
+      pendingOutputAudioTargetSegmentId = undefined;
+      pendingOutputAudioTargetRevision = undefined;
     };
-    const completedEvent = (): TranslationEvent => ({
+    const completedEvent = (evidenceRef?: string): TranslationEvent => ({
       kind: "completed",
-      ...eventBase("completed", 1, "final"),
+      ...eventBase("completed", 1, "final", undefined, evidenceRef),
     });
-    const complete = (): void => {
+    const requestSessionClose = (): void => {
+      if (
+        lifecycle !== "active" ||
+        !sessionReady ||
+        sessionCloseSent
+      ) {
+        return;
+      }
+      sessionCloseSent = true;
+      try {
+        // Translation sessions flush pending audio and emit session.closed.
+        // Do not close the socket until that terminal event arrives.
+        sendNativeJson(socket, { type: "session.close" });
+        closeTimer = setTimeout(
+          () =>
+            fail(
+              "OPENAI_REALTIME_CLOSE_TIMEOUT",
+              "The translation service did not close the session in time.",
+              true,
+            ),
+          this.#closeTimeoutMs,
+        );
+      } catch {
+        fail(
+          "OPENAI_REALTIME_INPUT",
+          "The translation audio stream could not be closed.",
+          true,
+        );
+      }
+    };
+    const complete = (evidenceRef?: string): void => {
       if (lifecycle !== "active") return;
-      clearResponseDeadline();
+      clearCloseDeadline();
       stopInput();
-      finishContinuousResponse();
       finalizeTranscripts();
       finishOutputAudio();
       lifecycle = "completed";
-      events.closeAfterDrain(completedEvent());
+      events.closeAfterDrain(completedEvent(evidenceRef));
       closeSocket(socket);
     };
     const stop = (): void => {
       if (lifecycle !== "active") return;
       outputSuppressed = true;
       lifecycle = "cancelled";
-      clearResponseDeadline();
+      clearCloseDeadline();
       stopInput();
       continuousInputWindows?.end({ discardBuffered: true });
-      finishContinuousResponse();
       events.discard();
-      sendBestEffort({ type: "response.cancel" });
-      sendBestEffort({ type: "input_audio_buffer.clear" });
+      if (!sessionCloseSent) {
+        sessionCloseSent = true;
+        sendBestEffort({ type: "session.close" });
+      }
       closeSocket(socket);
     };
-    const fail = (code: string, message: string, retryable: boolean): void => {
+    const fail = (
+      code: string,
+      message: string,
+      retryable: boolean,
+      evidenceRef?: string,
+    ): void => {
       if (lifecycle !== "active") return;
-      clearResponseDeadline();
+      clearCloseDeadline();
       stopInput();
       continuousInputWindows?.end({ discardBuffered: true });
-      finishContinuousResponse();
       lifecycle = "failed";
-      events.discardWith(errorEvent(code, message, retryable));
+      events.discardWith(errorEvent(code, message, retryable, evidenceRef));
       closeSocket(socket);
     };
-    const startResponseIfReady = (): void => {
-      if (behavior.inputCommit === "continuous") return;
-      if (
-        lifecycle !== "active" ||
-        !sessionReady ||
-        responseInFlight ||
-        inputBufferedBytes === 0
-      ) {
-        return;
-      }
-      if (!inputEnded) return;
-
-      try {
-        sendJson(socket, { type: "input_audio_buffer.commit" });
-        sendJson(socket, { type: "response.create" });
-        inputBufferedBytes = 0;
-        responseInFlight = true;
-        responseTimer = setTimeout(
-          () =>
-            fail(
-              "OPENAI_REALTIME_RESPONSE_TIMEOUT",
-              "The translation service timed out while producing speech.",
-              true,
-            ),
-          this.#responseTimeoutMs,
-        );
-      } catch {
-        fail(
-          "OPENAI_REALTIME_INPUT",
-          "The translation audio stream could not be committed.",
-          true,
-        );
-      }
-    };
-    const startContinuousResponse = (
+    const appendContinuousWindow = (
       window: ContinuousInputWindow,
     ): Promise<void> | undefined => {
       if (
         lifecycle !== "active" ||
         !sessionReady ||
-        responseInFlight
+        sessionCloseSent
       ) {
         return undefined;
       }
-      const completed = new Promise<void>((resolve) => {
-        wakeContinuousResponse = resolve;
-      });
       try {
         appendInputWindow(socket, window.frames, this.#inputAppendBytes);
-        sendJson(socket, { type: "input_audio_buffer.commit" });
-        sendJson(socket, { type: "response.create" });
-        responseInFlight = true;
-        responseTimer = setTimeout(
-          () =>
-            fail(
-              "OPENAI_REALTIME_RESPONSE_TIMEOUT",
-              "The translation service timed out while producing speech.",
-              true,
-            ),
-          this.#responseTimeoutMs,
-        );
       } catch {
         fail(
           "OPENAI_REALTIME_INPUT",
-          "The translation audio stream could not be committed.",
+          "The translation audio stream could not be appended.",
           true,
         );
       }
-      return completed;
+      // The dedicated translation route has no response lifecycle. Once the
+      // append is handed to the socket, the bounded local window is released.
+      return Promise.resolve();
     };
 
     const active: ActiveTranslation = {
@@ -595,140 +876,212 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       stop();
     };
     request.signal.addEventListener("abort", onAbort, { once: true });
+    const providerEventEvidenceRef = (
+      providerEvent: Record<string, unknown>,
+      providerEventKind: string,
+    ): string | undefined => {
+      const providerId =
+        stringField(providerEvent, "event_id") ??
+        stringField(providerEvent, "item_id");
+      return providerId === undefined || providerId.trim().length === 0
+        ? undefined
+        : providerDerivedEvidenceRef(
+          "openai-native",
+          ref,
+          providerEventKind,
+          providerId,
+        );
+    };
+    const outputIterator = events[Symbol.asyncIterator]();
+    const nextOutputEvent = async (): Promise<IteratorResult<TranslationEvent>> => {
+      const next = await outputIterator.next();
+      if (!next.done && next.value.kind !== "audio") {
+        queuedNonAudioEvents = Math.max(0, queuedNonAudioEvents - 1);
+        queuedNonAudioBytes = Math.max(
+          0,
+          queuedNonAudioBytes - nativeEventBytes(next.value),
+        );
+      }
+      return next;
+    };
 
     socket.on("message", (data) => {
       if (lifecycle !== "active") return;
-      const providerEvent = parseJsonObject(data);
-      if (providerEvent === null) return;
-      const type = stringField(providerEvent, "type");
-
-      if (type === "response.output_audio.delta") {
-        const encoded = stringField(providerEvent, "delta");
-        if (encoded === undefined) {
-          queueError(
-            "OPENAI_REALTIME_INVALID_AUDIO",
-            "The translation service returned invalid audio.",
+      try {
+        const providerEvent = parseNativeProviderEvent(data);
+        if (providerEvent === null) return;
+        const type = stringField(providerEvent, "type");
+        if (type === undefined || type.length === 0) {
+          fail(
+            "OPENAI_REALTIME_INVALID_PAYLOAD",
+            "The translation service returned an invalid message.",
             true,
           );
           return;
         }
-        try {
-          acceptOutputAudio(decodeAudioDelta(encoded));
-        } catch {
-          queueError(
-            "OPENAI_REALTIME_INVALID_AUDIO",
-            "The translation service returned invalid audio.",
+
+        const providerEventId = stringField(providerEvent, "event_id") ??
+          stringField(providerEvent, "item_id");
+        if (
+          providerEventId !== undefined &&
+          Buffer.byteLength(providerEventId, "utf8") > MAX_NATIVE_PROVIDER_EVENT_ID_BYTES
+        ) {
+          fail(
+            "OPENAI_REALTIME_INVALID_PAYLOAD",
+            "The translation service returned an invalid event.",
             true,
           );
+          return;
         }
-        return;
-      }
 
-      if (
-        type === "conversation.item.input_audio_transcription.delta" ||
-        type === "conversation.item.input_audio_transcription.completed" ||
-        type === "response.output_audio_transcript.delta" ||
-        type === "response.output_audio_transcript.done"
-      ) {
-        const source = type.startsWith("conversation.item.");
-        const final = type.endsWith(".completed") || type.endsWith(".done");
-        const text = stringField(
-          providerEvent,
-          final ? "transcript" : "delta",
-        );
-        if (text !== undefined) {
-          const providerId =
-            stringField(providerEvent, "item_id") ??
-            stringField(providerEvent, "response_id") ??
-            (source ? "source" : "target");
-          publishTranscript(
-            source ? "source_transcript" : "target_transcript",
-            providerId,
-            text,
-            final,
-          );
-        }
-        return;
-      }
-
-      if (type === "response.done") {
-        const response = providerEvent.response;
-        const status =
-          response !== null && typeof response === "object"
-            ? stringField(response as Record<string, unknown>, "status")
-            : undefined;
-        if (status === undefined || status === "completed") {
-          clearResponseDeadline();
-          responseInFlight = false;
-          if (continuousInputWindows !== undefined) {
-            if (inputEnded && continuousInputWindows.size === 0) complete();
-            else finishContinuousResponse();
+        if (type === "session.output_audio.delta") {
+          const encoded = stringField(providerEvent, "delta");
+          const providerId = stringField(providerEvent, "event_id");
+          if (encoded === undefined) {
+            queueError(
+              "OPENAI_REALTIME_INVALID_AUDIO",
+              "The translation service returned invalid audio.",
+              true,
+              providerEventEvidenceRef(providerEvent, "invalid_output_audio"),
+            );
             return;
           }
-          startResponseIfReady();
-          if (inputEnded && inputBufferedBytes === 0 && !responseInFlight) {
-            complete();
+          try {
+            acceptOutputAudio(decodeAudioDelta(encoded), providerId);
+          } catch {
+            queueError(
+              "OPENAI_REALTIME_INVALID_AUDIO",
+              "The translation service returned invalid audio.",
+              true,
+              providerEventEvidenceRef(providerEvent, "invalid_output_audio"),
+            );
           }
-        } else {
+          return;
+        }
+
+        if (
+          type === "session.input_transcript.delta" ||
+          type === "session.input_transcript.done" ||
+          type === "session.input_transcript.final" ||
+          type === "session.output_transcript.delta" ||
+          type === "session.output_transcript.done" ||
+          type === "session.output_transcript.final"
+        ) {
+          const source = type === "session.input_transcript.delta" ||
+            type === "session.input_transcript.done" ||
+            type === "session.input_transcript.final";
+          const final = type.endsWith(".done") || type.endsWith(".final");
+          const text = final
+            ? stringField(providerEvent, "transcript") ??
+              stringField(providerEvent, "text") ??
+              stringField(providerEvent, "delta")
+            : stringField(providerEvent, "delta");
+          if (text !== undefined) {
+            if (Buffer.byteLength(text, "utf8") > MAX_NATIVE_PROVIDER_EVENT_TEXT_BYTES) {
+              fail(
+                "OPENAI_REALTIME_INVALID_PAYLOAD",
+                "The translation service returned an invalid transcript.",
+                true,
+                providerEventEvidenceRef(providerEvent, "invalid_transcript"),
+              );
+              return;
+            }
+            // Translation server event IDs identify individual deltas, not a
+            // transcript segment. Keep one stable state per direction so each
+            // revision contains the full accumulated text.
+            const providerId = source ? "source" : "target";
+            const providerEvidenceId = stringField(providerEvent, "event_id");
+            publishTranscript(
+              source ? "source_transcript" : "target_transcript",
+              providerId,
+              providerEvidenceId === undefined || providerEvidenceId.trim().length === 0
+                ? adapterGeneratedEvidenceRef(
+                  "openai-native",
+                  ref,
+                  providerId,
+                  1,
+                  final ? "final" : "provisional",
+                )
+                : providerDerivedEvidenceRef(
+                  "openai-native",
+                  ref,
+                  source ? "input_transcript" : "output_transcript",
+                  providerEvidenceId,
+                ),
+              text,
+              final,
+            );
+          }
+          return;
+        }
+
+        if (type === "session.closed") {
+          complete(providerEventEvidenceRef(providerEvent, "session_closed"));
+          return;
+        }
+
+        if (type === "error") {
           fail(
-            "OPENAI_REALTIME_RESPONSE",
-            "The translation service did not complete its response.",
+            "OPENAI_REALTIME_PROVIDER",
+            "The translation service reported an error.",
             true,
+            providerEventEvidenceRef(providerEvent, "provider_error"),
           );
         }
-        return;
-      }
-
-      if (type === "error") {
+      } catch (error: unknown) {
         fail(
-          "OPENAI_REALTIME_PROVIDER",
-          "The translation service reported an error.",
+          error instanceof NativePayloadTooLargeError
+            ? "OPENAI_REALTIME_PAYLOAD_TOO_LARGE"
+            : error instanceof NativePayloadDepthError
+              ? "OPENAI_REALTIME_INVALID_PAYLOAD"
+              : "OPENAI_REALTIME_INVALID_PAYLOAD",
+          error instanceof NativePayloadTooLargeError
+            ? "The translation service returned an oversized message."
+            : "The translation service returned an invalid message.",
           true,
         );
       }
     });
-    socket.on("error", () =>
-      fail(
-        "OPENAI_REALTIME_CONNECTION",
-        "The translation service connection failed.",
-        true,
-      ),
-    );
+    socket.on("error", () => {
+      try {
+        fail(
+          "OPENAI_REALTIME_CONNECTION",
+          "The translation service connection failed.",
+          true,
+        );
+      } catch {
+        closeSocket(socket);
+      }
+    });
     socket.on("close", () => {
       if (lifecycle !== "active") return;
-      fail(
-        "OPENAI_REALTIME_CONNECTION",
-        "The translation service connection closed unexpectedly.",
-        true,
-      );
+      try {
+        fail(
+          "OPENAI_REALTIME_CONNECTION",
+          "The translation service connection closed unexpectedly.",
+          true,
+        );
+      } catch {
+        closeSocket(socket);
+      }
     });
 
     try {
       await waitForOpen(socket, request.signal, this.#connectTimeoutMs);
-      sendJson(socket, {
+      sendNativeJson(socket, {
         type: "session.update",
         session: {
-          type: "realtime",
-          instructions: realtimeInstructions(
-            ref.sourceLanguage,
-            ref.targetLanguage,
-          ),
           audio: {
             input: {
-              format: { type: "audio/pcm", rate: 24_000 },
-              transcription:
-                this.#inputTranscriptionModel === null
-                  ? null
-                  : { model: this.#inputTranscriptionModel },
-              noise_reduction:
-                this.#noiseReduction === null
-                  ? null
-                  : { type: this.#noiseReduction },
-              turn_detection: null,
+              transcription: this.#inputTranscriptionModel === null
+                ? null
+                : { model: this.#inputTranscriptionModel },
+              noise_reduction: this.#noiseReduction === null
+                ? null
+                : { type: this.#noiseReduction },
             },
             output: {
-              format: { type: "audio/pcm", rate: 24_000 },
-              voice: this.#voice,
+              language: translationLanguage(ref.targetLanguage),
             },
           },
         },
@@ -739,18 +1092,34 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       if (continuousInputWindows !== undefined) {
         void (async (): Promise<void> => {
           try {
-            for await (const window of continuousInputWindows) {
-              if (lifecycle !== "active" || request.signal.aborted) return;
-              const responseCompleted = startContinuousResponse(window);
-              if (responseCompleted === undefined) return;
-              await responseCompleted;
+            const inputWindows = continuousInputWindows[Symbol.asyncIterator]();
+            while (true) {
+              let exhausted = false;
+              let appendCompleted: Promise<void> | undefined;
+              {
+                const nextWindow = await inputWindows.next();
+                if (nextWindow.done) {
+                  exhausted = true;
+                } else if (lifecycle !== "active" || request.signal.aborted) {
+                  return;
+                } else {
+                  // `appendInputWindow` synchronously hands this audio to the
+                  // provider. `nextWindow` goes out of scope before we await
+                  // another queue turn, so the sent window is not local
+                  // backlog.
+                  appendCompleted = appendContinuousWindow(nextWindow.value);
+                }
+              }
+              if (exhausted) break;
+              if (appendCompleted === undefined) return;
+              await appendCompleted;
               if (lifecycle !== "active" || request.signal.aborted) return;
             }
-            complete();
+            requestSessionClose();
           } catch {
             fail(
               "OPENAI_REALTIME_INPUT",
-              "The translation audio stream could not be committed.",
+              "The translation audio stream could not be appended.",
               true,
             );
           }
@@ -758,7 +1127,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         void this.#pumpContinuousInput(
           request,
           continuousInputWindows,
-          maxBufferedAudioFrames,
+          continuousInputWindowFrames,
           inputStopped,
           () => inputStopRequested,
           registerInputIterator,
@@ -770,9 +1139,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
               "Continuous source audio exceeded the local processing backlog and an older source window was dropped.",
               true,
             ),
-          () => {
-            inputEnded = true;
-          },
+          () => undefined,
         )
           .then(() => {
             if (request.signal.aborted) {
@@ -799,14 +1166,9 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
           registerInputIterator,
           releaseInputIterator,
           returnInputIterator,
-          (appendedBytes) => {
-            inputBufferedBytes += appendedBytes;
-            startResponseIfReady();
-          },
+          () => undefined,
           () => {
-            inputEnded = true;
-            startResponseIfReady();
-            if (inputBufferedBytes === 0 && !responseInFlight) complete();
+            requestSessionClose();
           },
         )
           .then(() => {
@@ -827,7 +1189,10 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
           });
       }
 
-      for await (const event of events) {
+      while (true) {
+        const next = await nextOutputEvent();
+        if (next.done) break;
+        const event = next.value;
         if (outputSuppressed || request.signal.aborted) break;
         yield event;
       }
@@ -844,7 +1209,10 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
             : "The translation service connection failed.",
           true,
         );
-        for await (const event of events) {
+        while (true) {
+          const next = await nextOutputEvent();
+          if (next.done) break;
+          const event = next.value;
           if (outputSuppressed || request.signal.aborted) break;
           yield event;
         }
@@ -968,8 +1336,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       }
       pendingFrames.splice(0);
       pendingBytes = 0;
-      sendJson(socket, {
-        type: "input_audio_buffer.append",
+      sendNativeJson(socket, {
+        type: "session.input_audio_buffer.append",
         audio: encodePcm16(audio),
       });
       onAppended(audio.byteLength);
@@ -1015,6 +1383,8 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
 export interface OpenAIControlledTranslationAdapterOptions {
   /** Required even when test ports are injected; live paths never fake a key. */
   readonly apiKey: string;
+  /** Immutable operational policy projected from the approved profile. */
+  readonly fallback: TranslationFallbackPolicy;
   readonly transcriber?: ControlledTranscriptionPort;
   readonly translator?: ControlledTextTranslationPort;
   readonly tts?: ControlledTtsPort;
@@ -1061,6 +1431,8 @@ export class OpenAIControlledTranslationAdapter implements TranslationPort {
       transcriber,
       translator,
       tts,
+      preparation: OPENAI_LOCAL_ROUTE_PREPARATION,
+      fallback: options.fallback,
       ...(options.minimumConfidence === undefined
         ? {}
         : { minimumConfidence: options.minimumConfidence }),
@@ -1069,30 +1441,17 @@ export class OpenAIControlledTranslationAdapter implements TranslationPort {
     this.#now = options.now ?? (() => performance.now());
   }
 
-  async prepare(context: LaneContext): Promise<void> {
-    assertBehaviorSupported(
-      context.behavior,
-      this.capabilities,
-      "OpenAI controlled translation",
-    );
-    assertGlossarySupported(
-      context,
-      this.capabilities,
-      "OpenAI controlled translation",
-    );
+  async prepare(context: LaneContext): Promise<TranslationPreparation> {
+    assertOpenAICapability(context, this.capabilities);
     if (context.behavior.mode === "accurate") {
       await this.#delegate.prepare(context);
     }
+    return OPENAI_LOCAL_ROUTE_PREPARATION;
   }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     const ref = request.context;
-    assertBehaviorSupported(
-      ref.behavior,
-      this.capabilities,
-      "OpenAI controlled translation",
-    );
-    assertGlossarySupported(ref, this.capabilities, "OpenAI controlled translation");
+    assertOpenAICapability(ref, this.capabilities);
     const behavior = ref.behavior;
     const key = generationKey(ref);
     const previous = this.#active.get(key);
@@ -1366,6 +1725,13 @@ export class OpenAIControlledTranslationAdapter implements TranslationPort {
       segmentId: "completed",
       revision: 1,
       finality: "final",
+      evidenceRef: adapterGeneratedEvidenceRef(
+        "openai-controlled",
+        ref,
+        "completed",
+        1,
+        "final",
+      ),
       emittedAtMs: this.#now(),
     };
   }
@@ -1386,18 +1752,30 @@ export class OpenAIControlledTranslationAdapter implements TranslationPort {
       segmentId: "error-" + sequence.toString(10),
       revision: 1,
       finality: "final",
+      evidenceRef: adapterGeneratedEvidenceRef(
+        "openai-controlled",
+        ref,
+        "error-" + sequence.toString(10),
+        1,
+        "final",
+      ),
       emittedAtMs: this.#now(),
       error: { code, message, retryable },
     };
   }
 }
 
-export interface OpenAITranslationAdapterFactoryOptions {
-  readonly provider: OpenAITranslationProvider;
-  readonly apiKey: string;
-  readonly native?: Omit<NativeRealtimeTranslateAdapterOptions, "apiKey">;
-  readonly controlled?: Omit<OpenAIControlledTranslationAdapterOptions, "apiKey">;
-}
+export type OpenAITranslationAdapterFactoryOptions =
+  | Readonly<{
+      readonly provider: "openai_native";
+      readonly apiKey: string;
+      readonly native?: Omit<NativeRealtimeTranslateAdapterOptions, "apiKey">;
+    }>
+  | Readonly<{
+      readonly provider: "openai_controlled";
+      readonly apiKey: string;
+      readonly controlled: Omit<OpenAIControlledTranslationAdapterOptions, "apiKey">;
+    }>;
 
 /**
  * Construct exactly one provider path after preflight has selected it. Missing
@@ -1448,6 +1826,44 @@ function generationKey(ref: GenerationRef): string {
   return ref.sessionId + "\u0000" + ref.lane + "\u0000" + ref.generation.toString(10);
 }
 
+function adapterGeneratedEvidenceRef(
+  adapter: "openai-native" | "openai-controlled",
+  ref: LaneContext,
+  segmentId: string,
+  revision: number,
+  finality: "provisional" | "final",
+): string {
+  return createOpaqueEvidenceRef(adapter + ":adapter", [
+    "adapter",
+    ref.sessionId,
+    ref.lane,
+    ref.generation.toString(10),
+    ref.turnId,
+    segmentId,
+    revision.toString(10),
+    finality,
+  ]);
+}
+
+function providerDerivedEvidenceRef(
+  adapter: "openai-native" | "openai-controlled",
+  ref: LaneContext,
+  providerEventKind: string,
+  providerId: string,
+  ...parts: readonly string[]
+): string {
+  return createOpaqueEvidenceRef(adapter + ":provider", [
+    "provider",
+    ref.sessionId,
+    ref.lane,
+    ref.generation.toString(10),
+    ref.turnId,
+    providerEventKind,
+    providerId,
+    ...parts,
+  ]);
+}
+
 function controlledStageContext(
   ref: LaneContext,
   segmentIndex: number | undefined,
@@ -1486,17 +1902,31 @@ function remapControlledEvent(
   const segmentId = segmentIndex === undefined
     ? eventSegmentId
     : "segment-" + segmentIndex.toString(10) + ":" + eventSegmentId;
+  const evidenceRef = event.evidenceRef.trim().length === 0
+    ? adapterGeneratedEvidenceRef(
+      "openai-controlled",
+      ref,
+      segmentId,
+      event.revision,
+      event.finality,
+    )
+    : event.evidenceRef;
   if (event.kind !== "audio") {
     return {
       ...event,
       turnId: ref.turnId,
       segmentId,
+      evidenceRef,
     };
   }
   return {
     ...event,
     turnId: ref.turnId,
     segmentId,
+    evidenceRef,
+    targetSegmentId: segmentIndex === undefined
+      ? event.targetSegmentId
+      : "segment-" + segmentIndex.toString(10) + ":" + event.targetSegmentId,
     playoutSequence,
     frame: createAudioFrame({
       sessionId: ref.sessionId,
@@ -1509,93 +1939,175 @@ function remapControlledEvent(
   };
 }
 
-function assertBehaviorSupported(
-  behavior: TranslationBehavior,
-  capabilities: TranslationCapabilities,
-  label: string,
-): void {
-  const mode = capabilities.supportedModes.find(
-    (candidate) =>
-      candidate.mode === behavior.mode &&
-      candidate.behaviorVersion === behavior.version,
-  );
-  if (mode === undefined) {
-    const accurateUnavailable =
-      capabilities.providerId === "openai_native" && behavior.mode === "accurate";
-    throw new OpenAIAdapterError(
-      "configuration_error",
-      accurateUnavailable
-        ? "OpenAI native Realtime accurate mode is experimental and unavailable until benchmark parity is established."
-        : label + " does not support " + behavior.mode + " behavior version " +
-          behavior.version.toString(10) + ".",
-    );
-  }
-  if (
-    behavior.requirements.revisions &&
-    !capabilities.supportsProvisionalRevisions
-  ) {
-    throw new OpenAIAdapterError(
-      "configuration_error",
-      label + " cannot provide required provisional revisions.",
-    );
-  }
-  if (behavior.requirements.cancellation && !capabilities.supportsCancellation) {
-    throw new OpenAIAdapterError(
-      "configuration_error",
-      label + " cannot provide required cancellation.",
-    );
-  }
-  if (
-    behavior.requirements.deterministicGlossary &&
-    (!capabilities.supportsDeterministicGlossary || !mode.deterministicGlossary)
-  ) {
-    throw new OpenAIAdapterError(
-      "configuration_error",
-      label + " cannot provide deterministic glossary authorization.",
-    );
-  }
-  if (!capabilities.supportsFinality) {
-    throw new OpenAIAdapterError(
-      "configuration_error",
-      label + " cannot provide finality markers.",
-    );
-  }
-}
-
-/**
- * A compiled glossary is a product guarantee, not a best-effort prompting
- * hint.  Reject it at the provider edge unless the selected capability can
- * authorize deterministic terminology for that behavior.
- */
-function assertGlossarySupported(
+function assertOpenAICapability(
   context: LaneContext,
   capabilities: TranslationCapabilities,
-  label: string,
 ): void {
-  if (context.glossary === undefined) return;
-  const mode = capabilities.supportedModes.find(
-    (candidate) =>
-      candidate.mode === context.behavior.mode &&
-      candidate.behaviorVersion === context.behavior.version,
-  );
-  if (
-    !capabilities.supportsDeterministicGlossary ||
-    mode?.deterministicGlossary !== true
-  ) {
+  try {
+    assertTranslationBehaviorCapability(
+      capabilities,
+      context.behavior,
+      { glossaryRequested: context.glossary !== undefined },
+    );
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
     throw new OpenAIAdapterError(
       "configuration_error",
-      label + " cannot authorize a deterministic glossary for this mode.",
+      error.message,
     );
   }
 }
 
-function realtimeInstructions(sourceLanguage: string, targetLanguage: string): string {
-  return [
-    "You are a real-time speech-to-speech interpreter.",
-    "Translate spoken " + sourceLanguage + " into " + targetLanguage + ".",
-    "Output only the translation, preserving names, numbers, product identifiers, and technical terms exactly.",
-    "Do not answer questions, add commentary, or repeat the source language.",
-  ].join(" ");
+/** The translation endpoint accepts a base ISO-639-1 output language code. */
+function translationLanguage(language: string): string {
+  const normalized = language.normalize("NFKC").trim().toLowerCase();
+  const [base] = normalized.split(/[-_]/u);
+  return base === undefined || base.length === 0 ? normalized : base;
+}
+
+function nativeEventBytes(event: TranslationEvent): number {
+  try {
+    const serialized = JSON.stringify(event);
+    return serialized === undefined
+      ? MAX_NATIVE_QUEUED_NON_AUDIO_BYTES + 1
+      : Buffer.byteLength(serialized, "utf8");
+  } catch {
+    return MAX_NATIVE_QUEUED_NON_AUDIO_BYTES + 1;
+  }
+}
+
+function sendNativeJson(socket: WebSocketLike, event: unknown): void {
+  let payload: string;
+  try {
+    payload = JSON.stringify(event);
+  } catch {
+    throw new OpenAIAdapterError(
+      "connection_failed",
+      "The OpenAI realtime connection could not send data.",
+    );
+  }
+  const payloadBytes = Buffer.byteLength(payload, "utf8");
+  const bufferedAmount = socket.bufferedAmount ?? 0;
+  if (
+    !Number.isFinite(bufferedAmount) ||
+    bufferedAmount < 0 ||
+    payloadBytes > MAX_NATIVE_WIRE_PAYLOAD_BYTES ||
+    bufferedAmount + payloadBytes > MAX_NATIVE_OUTBOUND_BUFFERED_BYTES
+  ) {
+    throw new OpenAIAdapterError(
+      "connection_failed",
+      "The OpenAI realtime outbound buffer limit was exceeded.",
+    );
+  }
+  try {
+    socket.send(payload);
+  } catch {
+    throw new OpenAIAdapterError(
+      "connection_failed",
+      "The OpenAI realtime connection could not send data.",
+    );
+  }
+}
+
+function parseNativeProviderEvent(raw: unknown): Record<string, unknown> | null {
+  let current = raw;
+  for (let depth = 0; depth < MAX_NATIVE_PARSE_VALUE_DEPTH; depth += 1) {
+    if (typeof current === "string") {
+      if (Buffer.byteLength(current, "utf8") > MAX_NATIVE_WIRE_PAYLOAD_BYTES) {
+        throw new NativePayloadTooLargeError();
+      }
+      assertNativeJsonNesting(current);
+      try {
+        current = JSON.parse(current) as unknown;
+      } catch {
+        throw new Error("Invalid OpenAI native translation payload.");
+      }
+      continue;
+    }
+    if (current instanceof Uint8Array) {
+      if (current.byteLength > MAX_NATIVE_WIRE_PAYLOAD_BYTES) {
+        throw new NativePayloadTooLargeError();
+      }
+      current = Buffer.from(current).toString("utf8");
+      continue;
+    }
+    if (current instanceof ArrayBuffer) {
+      if (current.byteLength > MAX_NATIVE_WIRE_PAYLOAD_BYTES) {
+        throw new NativePayloadTooLargeError();
+      }
+      current = Buffer.from(current).toString("utf8");
+      continue;
+    }
+    if (Array.isArray(current)) {
+      let byteLength = 0;
+      for (const chunk of current) {
+        if (!(chunk instanceof Uint8Array)) {
+          throw new Error("Invalid OpenAI native translation payload.");
+        }
+        if (chunk.byteLength > MAX_NATIVE_WIRE_PAYLOAD_BYTES - byteLength) {
+          throw new NativePayloadTooLargeError();
+        }
+        byteLength += chunk.byteLength;
+      }
+      const joined = new Uint8Array(byteLength);
+      let offset = 0;
+      for (const chunk of current) {
+        joined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      current = joined;
+      continue;
+    }
+    if (isRecord(current) && "data" in current && Object.keys(current).length === 1) {
+      current = current.data;
+      continue;
+    }
+    if (!isRecord(current)) {
+      throw new Error("Invalid OpenAI native translation payload.");
+    }
+    try {
+      const serialized = JSON.stringify(current);
+      if (
+        serialized !== undefined &&
+        Buffer.byteLength(serialized, "utf8") > MAX_NATIVE_WIRE_PAYLOAD_BYTES
+      ) {
+        throw new NativePayloadTooLargeError();
+      }
+    } catch (error: unknown) {
+      if (error instanceof NativePayloadTooLargeError) throw error;
+      throw new NativePayloadDepthError();
+    }
+    return current;
+  }
+  throw new NativePayloadDepthError();
+}
+
+function assertNativeJsonNesting(value: string): void {
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (const character of value) {
+    if (quoted) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        quoted = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      quoted = true;
+    } else if (character === "{" || character === "[") {
+      depth += 1;
+      if (depth > MAX_NATIVE_JSON_NESTING) {
+        throw new NativePayloadDepthError();
+      }
+    } else if (character === "}" || character === "]") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
 }
 
 function decodeAudioDelta(encoded: string): Uint8Array {
@@ -1638,7 +2150,7 @@ function appendInputWindow(
 ): void {
   const pendingFrames: Uint8Array[] = [];
   let pendingBytes = 0;
-  const flushPending = (): void => {
+    const flushPending = (): void => {
     if (pendingBytes === 0) return;
     const audio = new Uint8Array(pendingBytes);
     let offset = 0;
@@ -1646,12 +2158,12 @@ function appendInputWindow(
       audio.set(pending, offset);
       offset += pending.byteLength;
     }
-    pendingFrames.splice(0);
-    pendingBytes = 0;
-    sendJson(socket, {
-      type: "input_audio_buffer.append",
-      audio: encodePcm16(audio),
-    });
+      pendingFrames.splice(0);
+      pendingBytes = 0;
+      sendNativeJson(socket, {
+        type: "session.input_audio_buffer.append",
+        audio: encodePcm16(audio),
+      });
   };
   for (const frame of frames) {
     pendingFrames.push(frame.pcm16le);

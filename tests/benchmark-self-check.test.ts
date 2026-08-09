@@ -20,6 +20,11 @@ describe("terminology mechanism self-check", () => {
     assert.equal(clockReads, 72, "all 36 timings must be measured, never recycled");
     assert.equal(report.glossaryOverheadMs.minimum, 0.25);
     assert.equal(report.glossaryOverheadMs.maximum, 0.25);
-    assert.equal(report.limitations.some((value) => value.includes("No STT")), true);
+    assert.equal(report.limitations.some((value) =>
+      value === "Provider acceptance remains NOT_RUN: no STT, translation, TTS, or Palabra execution was run."
+    ), true);
+    assert.equal(report.limitations.some((value) =>
+      value === "Product acceptance remains NOT_RUN: no acoustic latency, human review, or product go/no-go validation was run."
+    ), true);
   });
 });

@@ -10,11 +10,6 @@ export interface TranslationBehavior {
   readonly holdbackMs: number;
   readonly maxBufferedAudioMs: number;
   readonly interruption: 'cut_destination';
-  readonly requirements: Readonly<{
-    revisions: boolean;
-    cancellation: boolean;
-    deterministicGlossary: boolean;
-  }>;
 }
 
 const behaviors: Readonly<Record<TranslationMode, TranslationBehavior>> = {
@@ -26,7 +21,6 @@ const behaviors: Readonly<Record<TranslationMode, TranslationBehavior>> = {
     holdbackMs: 0,
     maxBufferedAudioMs: 800,
     interruption: 'cut_destination',
-    requirements: { revisions: true, cancellation: true, deterministicGlossary: false },
   },
   balanced: {
     version: 1,
@@ -36,7 +30,6 @@ const behaviors: Readonly<Record<TranslationMode, TranslationBehavior>> = {
     holdbackMs: 250,
     maxBufferedAudioMs: 1600,
     interruption: 'cut_destination',
-    requirements: { revisions: false, cancellation: true, deterministicGlossary: false },
   },
   accurate: {
     version: 1,
@@ -46,7 +39,6 @@ const behaviors: Readonly<Record<TranslationMode, TranslationBehavior>> = {
     holdbackMs: 700,
     maxBufferedAudioMs: 2400,
     interruption: 'cut_destination',
-    requirements: { revisions: false, cancellation: true, deterministicGlossary: false },
   },
 };
 

@@ -1,0 +1,230 @@
+{
+  "schemaVersion": 1,
+  "kind": "approved_session_processing_profile",
+  "id": "manufacturing-poc",
+  "version": "2026-08-09",
+  "sha256": "48ccc7bd514c92c11d6d6e448fb714daf720b87891536d96efacc239e8948294",
+  "operationScope": "poc",
+  "translation": {
+    "provider": "openai_controlled",
+    "allowedModes": [
+      "fast",
+      "balanced",
+      "accurate"
+    ],
+    "defaultMode": "balanced",
+    "behaviorVersion": 1
+  },
+  "services": [
+    {
+      "id": "openai-realtime-transcription",
+      "role": "transcription",
+      "provider": "openai",
+      "category": "managed_transcription",
+      "dataCategories": [
+        "canonical_audio",
+        "source_language",
+        "source_terms",
+        "aliases"
+      ],
+      "endpoint": {
+        "origin": "https://api.openai.com",
+        "pathTemplate": "/v1/realtime"
+      },
+      "model": {
+        "kind": "named",
+        "value": "gpt-live-transcribe"
+      },
+      "voice": {
+        "kind": "not_applicable"
+      },
+      "region": {
+        "status": "unverified",
+        "reason": "OpenAI processing region has not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "trainingUse": {
+        "status": "unverified",
+        "reason": "OpenAI training-use terms have not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "serviceRetention": {
+        "status": "unverified",
+        "reason": "OpenAI service-retention terms have not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "dpa": {
+        "status": "unverified",
+        "reason": "OpenAI DPA coverage has not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      }
+    },
+    {
+      "id": "openai-text-translation",
+      "role": "text_translation",
+      "provider": "openai",
+      "category": "managed_text_translation",
+      "dataCategories": [
+        "source_transcript",
+        "source_language",
+        "target_language",
+        "opaque_placeholders"
+      ],
+      "endpoint": {
+        "origin": "https://api.openai.com",
+        "pathTemplate": "/v1/responses"
+      },
+      "model": {
+        "kind": "named",
+        "value": "gpt-4.1-mini"
+      },
+      "voice": {
+        "kind": "not_applicable"
+      },
+      "region": {
+        "status": "unverified",
+        "reason": "OpenAI processing region has not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "trainingUse": {
+        "status": "unverified",
+        "reason": "OpenAI training-use terms have not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "serviceRetention": {
+        "status": "unverified",
+        "reason": "OpenAI service-retention terms have not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "dpa": {
+        "status": "unverified",
+        "reason": "OpenAI DPA coverage has not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      }
+    },
+    {
+      "id": "openai-tts",
+      "role": "tts",
+      "provider": "openai",
+      "category": "managed_tts",
+      "dataCategories": [
+        "authorized_target_text"
+      ],
+      "endpoint": {
+        "origin": "https://api.openai.com",
+        "pathTemplate": "/v1/audio/speech"
+      },
+      "model": {
+        "kind": "named",
+        "value": "gpt-4o-mini-tts"
+      },
+      "voice": {
+        "kind": "named",
+        "value": "alloy"
+      },
+      "region": {
+        "status": "unverified",
+        "reason": "OpenAI processing region has not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "trainingUse": {
+        "status": "unverified",
+        "reason": "OpenAI training-use terms have not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "serviceRetention": {
+        "status": "unverified",
+        "reason": "OpenAI service-retention terms have not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      },
+      "dpa": {
+        "status": "unverified",
+        "reason": "OpenAI DPA coverage has not been independently verified for this repository-owned reference POC.",
+        "acceptanceImpact": "NOT_RUN"
+      }
+    }
+  ],
+  "glossaryEgress": {
+    "harnessPinnedGlossary": "local_pinned",
+    "stages": [
+      {
+        "role": "transcription",
+        "fields": [
+          "source_terms",
+          "aliases"
+        ]
+      },
+      {
+        "role": "text_translation",
+        "fields": [
+          "opaque_placeholders"
+        ]
+      },
+      {
+        "role": "tts",
+        "fields": [
+          "authorized_target_text"
+        ]
+      }
+    ],
+    "providerAccountGlossary": {
+      "status": "unverified",
+      "reason": "OpenAI account-level glossary state has not been independently verified for this repository-owned reference POC.",
+      "acceptanceImpact": "NOT_RUN"
+    }
+  },
+  "fallback": {
+    "kind": "none",
+    "approval": {
+      "id": "fast-translation-reference-poc-v1",
+      "revision": "2026-08-09",
+      "sha256": "1279fe30435468c499b67f854976c69eeda423105e681396b00cfe1373f130d9",
+      "approvedBy": "fast-translation-reference-configuration",
+      "approvedAtUtc": "2026-08-09T00:00:00.000Z"
+    }
+  },
+  "evidence": {
+    "storage": "local_encrypted_file",
+    "encryption": "aes_256_gcm",
+    "tracks": [
+      "source_a",
+      "source_b",
+      "playout_to_a",
+      "playout_to_b"
+    ],
+    "providerEvents": "final_only",
+    "provisionalEvents": "live_only",
+    "browserEvidenceRefs": "redacted",
+    "plaintextExport": "explicit_owner_acknowledgement",
+    "minimumFreeBytes": "67108864"
+  },
+  "retentionPolicy": {
+    "policyRef": {
+      "id": "fast-translation-reference-poc-v1",
+      "revision": "2026-08-09",
+      "sha256": "1279fe30435468c499b67f854976c69eeda423105e681396b00cfe1373f130d9",
+      "approvedBy": "fast-translation-reference-configuration",
+      "approvedAtUtc": "2026-08-09T00:00:00.000Z"
+    },
+    "mode": "scheduled_delete",
+    "defaultDays": 14,
+    "maximumDays": 30,
+    "verificationMaximumHours": 24
+  },
+  "consentPolicy": {
+    "id": "fast-translation-reference-poc-v1",
+    "revision": "2026-08-09",
+    "sha256": "1279fe30435468c499b67f854976c69eeda423105e681396b00cfe1373f130d9",
+    "approvedBy": "fast-translation-reference-configuration",
+    "approvedAtUtc": "2026-08-09T00:00:00.000Z",
+    "noticeVersion": "fast-translation-reference-poc-v1",
+    "recordingRequired": true,
+    "processingRequired": true,
+    "withdrawalTerminatesSession": true
+  },
+  "approval": {
+    "approvalId": "fast-translation-reference-poc-v1",
+    "approvedBy": "fast-translation-reference-configuration",
+    "approvedAtUtc": "2026-08-09T00:00:00.000Z"
+  }
+}

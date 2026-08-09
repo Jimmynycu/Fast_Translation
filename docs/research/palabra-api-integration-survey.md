@@ -6,7 +6,18 @@
 
 ## 結論
 
-目前 canonical path 是 server-side API key → direct WebSocket（server）或 POST streaming session → publisher JWT + LiveKit WebRTC（browser/mobile）。API key 不得放進 browser/mobile。單一 task/session 描述一條 input track，可有多個 target output；產品頁的 two-way 是 **Vendor claim**，protocol 沒有 duplex 欄位，真正雙向應建兩個 legs（**Inference**）。[Authentication](https://docs.palabra.ai/docs/auth) [Session management](https://docs.palabra.ai/docs/streaming_api/session) [Multi-language](https://docs.palabra.ai/docs/streaming_api/multi_language_translation)\n\n本案整合決策：server 端一律用 WebSocket `Authorization` header（不用 query token）；啟動時預熱兩個持久 lane sessions，各方向一條，以維持可預測的首句延遲；術語使用 account-level enabled/matching glossaries，不把本地 pinned glossary 當成 Palabra 的保證。
+> **Current repository cutover (2026-08-09).** This is provider research, not
+> deployment configuration. The runtime selects Palabra only through a
+> hash-pinned approved processing profile; prewarm occurs automatically after
+> consent/connect/preflight/arm and before `ready`, with truthful readiness
+> rather than a vendor-acceptance claim. Each profile service has a
+> manifest-bound ordered `dataCategories` egress list. Any unverified selected
+> `trainingUse` or `serviceRetention` makes the profile `synthetic_only` and
+> blocks human session creation. The checked-in `manufacturing-poc` sample has
+> that status. Fallback is only `none` or approved same-route
+> `same_route_fail_open`, never automatic cross-provider substitution.
+
+目前 canonical path 是 server-side API key → direct WebSocket（server）或 POST streaming session → publisher JWT + LiveKit WebRTC（browser/mobile）。API key 不得放進 browser/mobile。單一 task/session 描述一條 input track，可有多個 target output；產品頁的 two-way 是 **Vendor claim**，protocol 沒有 duplex 欄位，真正雙向應建兩個 legs（**Inference**）。[Authentication](https://docs.palabra.ai/docs/auth) [Session management](https://docs.palabra.ai/docs/streaming_api/session) [Multi-language](https://docs.palabra.ai/docs/streaming_api/multi_language_translation)
 
 WS input 支援 pcm_s16le、opus、wav，16–48 kHz、1/2 channels；output 支援 pcm_s16le 或 zlib_pcm_s16le，固定 24 kHz mono。約 320 ms 一塊、real-time pace。控制與事件均為同一 JSON envelope。[Publishing/receiving audio](https://docs.palabra.ai/docs/streaming_api/publishing_and_receiving_audio) [Management API](https://docs.palabra.ai/docs/streaming_api/management) **Official**
 
@@ -112,6 +123,21 @@ Wire error 是 envelope message_type=error；欄位是 data.code、data.desc，�
 **可依賴（Official／Public source）**：Bearer API key；WebRTC publisher JWT；direct WS；JSON envelope；set_task/pause/flush/end；WS formats/rate/channels；24 kHz mono output；320 ms pacing；partial/final event names 與 stable IDs；glossary kinds/allow-id controls；rate limits 與 error codes。
 
 **不可假設（Not public／Vendor claim）**：固定 WebRTC codec/rate；同 session full duplex；partial 不 revision；flush 能消除已播放聲音；重連後 replay/context resume；glossary precedence/accuracy；固定 latency、<1 s、SLA、zero retention 或永久 region availability。
+
+### 7.1 Implemented POC sealed-evidence review boundary
+
+This repository's sealed-evidence review is not a Palabra API capability or
+assurance. Deployment assigns separate data-owner and bilingual-reviewer
+identities, then freezes them into each session's review grant. Only a bearer
+matching that role and identity may use the audited metadata
+`POST /api/sessions/:sessionId/evidence/review`, bounded 20 ms-aligned 24 kHz
+mono WAV `POST /api/sessions/:sessionId/evidence/review/audio-window`, or the audited sealed
+retention summary. The review responses are `Cache-Control: no-store` and never
+contain an archive path/ID, raw manifest, or evidence reference. A detached,
+content-free authenticated audit chain remains after evidence deletion; it is a
+durable record of authorization disclosure, not proof that data was consumed.
+This does not change the checked-in profile's synthetic-only/`NOT_RUN` external
+assurances or the mandatory owner-led encrypted-master-glossary closeout.
 
 ## 8. 建議最小 adapter contract
 

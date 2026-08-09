@@ -4,7 +4,7 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import type { Side } from "../core/types.js";
+import type { EvidenceReviewGrant, Side } from "../core/types.js";
 
 const PARTICIPANT_TOKEN_CONTEXT = "fast-translation/participant-access/v1";
 const MINIMUM_SECRET_BYTES = 32;
@@ -14,14 +14,32 @@ export type EventAccessScope =
   | Readonly<{ kind: "operator" }>
   | Readonly<{ kind: "participant"; side: Side }>;
 
+export type EvidenceManagementAccessScope =
+  | Readonly<{ kind: "retention_owner"; actorId: string }>
+  | Readonly<{ kind: "evidence_reviewer"; actorId: string }>;
+
+export interface EvidenceManagementCredential {
+  readonly id: string;
+  readonly token: string;
+}
+
 export interface ServerAccessControl {
   acceptsOperatorAuthorization(authorization: string | undefined): boolean;
+  evidenceReviewGrant(): EvidenceReviewGrant;
   issueParticipantAccess(sessionId: string, side: Side): string;
   resolveEventAccess(
     access: string | undefined,
     sessionId: string,
   ): EventAccessScope | undefined;
+  resolveEvidenceManagementAuthorization(
+    authorization: string | undefined,
+  ): EvidenceManagementAccessScope | undefined;
   acceptsEventAccess(access: string | undefined, sessionId: string): boolean;
+  acceptsParticipantAuthorization(
+    authorization: string | undefined,
+    sessionId: string,
+    side: Side,
+  ): boolean;
   acceptsMediaAccess(
     access: string | undefined,
     sessionId: string,
@@ -31,6 +49,8 @@ export interface ServerAccessControl {
 
 export interface ServerAccessControlOptions {
   readonly operatorToken: string;
+  readonly retentionOwner: EvidenceManagementCredential;
+  readonly evidenceReviewer: EvidenceManagementCredential;
   readonly participantSigningKey?: Uint8Array;
 }
 
@@ -38,11 +58,35 @@ export function createServerAccessControl(
   options: ServerAccessControlOptions,
 ): ServerAccessControl {
   if (
+    typeof options.operatorToken !== "string" ||
     options.operatorToken.length < MINIMUM_SECRET_BYTES ||
-    options.operatorToken.length > MAXIMUM_PRESENTED_TOKEN_LENGTH
+    options.operatorToken.length > MAXIMUM_PRESENTED_TOKEN_LENGTH ||
+    /\s/u.test(options.operatorToken)
   ) {
-    throw new RangeError("operatorToken must contain between 32 and 512 characters");
+    throw new RangeError("operatorToken must contain 32-512 non-whitespace characters");
   }
+  const retentionOwner = validateEvidenceManagementCredential(
+    options.retentionOwner,
+    "retentionOwner",
+  );
+  const evidenceReviewer = validateEvidenceManagementCredential(
+    options.evidenceReviewer,
+    "evidenceReviewer",
+  );
+  if (
+    options.operatorToken === retentionOwner.token ||
+    options.operatorToken === evidenceReviewer.token ||
+    retentionOwner.token === evidenceReviewer.token
+  ) {
+    throw new RangeError("operator, retention owner, and evidence reviewer tokens must be distinct");
+  }
+  if (retentionOwner.id === evidenceReviewer.id) {
+    throw new RangeError("retention owner and evidence reviewer identities must be distinct");
+  }
+  const evidenceReviewGrant = Object.freeze({
+    dataOwnerId: retentionOwner.id,
+    bilingualReviewerId: evidenceReviewer.id,
+  });
   const participantSigningKey = Buffer.from(
     options.participantSigningKey ?? randomBytes(MINIMUM_SECRET_BYTES),
   );
@@ -78,19 +122,69 @@ export function createServerAccessControl(
     return undefined;
   };
 
+  const resolveEvidenceManagementAuthorization = (
+    authorization: string | undefined,
+  ): EvidenceManagementAccessScope | undefined => {
+    const token = bearerToken(authorization);
+    if (secureTokenEquals(token, retentionOwner.token)) {
+      return Object.freeze({ kind: "retention_owner" as const, actorId: retentionOwner.id });
+    }
+    if (secureTokenEquals(token, evidenceReviewer.token)) {
+      return Object.freeze({ kind: "evidence_reviewer" as const, actorId: evidenceReviewer.id });
+    }
+    return undefined;
+  };
+
   return Object.freeze({
     acceptsOperatorAuthorization(authorization: string | undefined) {
       return acceptsOperatorToken(bearerToken(authorization));
     },
+    evidenceReviewGrant() {
+      return evidenceReviewGrant;
+    },
     issueParticipantAccess: participantToken,
     resolveEventAccess,
+    resolveEvidenceManagementAuthorization,
     acceptsEventAccess(access: string | undefined, sessionId: string) {
       return resolveEventAccess(access, sessionId) !== undefined;
+    },
+    acceptsParticipantAuthorization(
+      authorization: string | undefined,
+      sessionId: string,
+      side: Side,
+    ) {
+      return secureTokenEquals(bearerToken(authorization), participantToken(sessionId, side));
     },
     acceptsMediaAccess(access: string | undefined, sessionId: string, side: Side) {
       return secureTokenEquals(access, participantToken(sessionId, side));
     },
   });
+}
+
+function validateEvidenceManagementCredential(
+  credential: EvidenceManagementCredential | undefined,
+  name: string,
+): EvidenceManagementCredential {
+  const id = typeof credential?.id === "string"
+    ? credential.id.normalize("NFC").trim()
+    : undefined;
+  if (
+    credential === undefined ||
+    id === undefined ||
+    id.length === 0 ||
+    id.length > 128
+  ) {
+    throw new RangeError(`${name}.id must contain 1-128 characters after NFC normalization`);
+  }
+  if (
+    typeof credential.token !== "string" ||
+    credential.token.length < MINIMUM_SECRET_BYTES ||
+    credential.token.length > MAXIMUM_PRESENTED_TOKEN_LENGTH ||
+    /\s/u.test(credential.token)
+  ) {
+    throw new RangeError(`${name}.token must contain 32-512 non-whitespace characters`);
+  }
+  return Object.freeze({ id, token: credential.token });
 }
 
 export function withAccessFragment(url: URL, access: string): URL {

@@ -3,6 +3,8 @@ import { CANONICAL_AUDIO, type AudioFrame } from "../../core/audio.js";
 import type {
   GenerationRef,
   Lane,
+  TranslationFallbackPolicy,
+  TranslationPreparation,
   TranslationPort,
 } from "../../core/types.js";
 import {
@@ -17,6 +19,14 @@ import {
 } from "./glossary-controlled.js";
 
 export const LOCAL_EVAL_PCM_CONTRACT = CANONICAL_AUDIO;
+
+const FIXTURE_LOCAL_PREPARATION: TranslationPreparation = Object.freeze({
+  readiness: "fixture_local",
+  remoteConnection: "not_applicable",
+});
+const NO_SOURCE_SUBSTITUTION: TranslationFallbackPolicy = Object.freeze({
+  kind: "none",
+});
 
 export type LocalEvalTranslationMode = "preserve" | "drop_placeholders";
 
@@ -52,6 +62,9 @@ export function createLocalEvalTranslationAdapter(
     transcriber: new TranscriptFixtureAdapter(transcriptByLane, confidence, now),
     translator: new TranslationFixtureAdapter(translationMode),
     tts: new PcmFixtureAdapter(options.audioFixture),
+    preparation: FIXTURE_LOCAL_PREPARATION,
+    fallback: NO_SOURCE_SUBSTITUTION,
+    evidenceRefSource: "local_eval",
     ...(options.minimumConfidence === undefined
       ? {}
       : { minimumConfidence: options.minimumConfidence }),

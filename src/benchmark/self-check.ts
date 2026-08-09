@@ -90,7 +90,8 @@ export function runMechanismSelfCheck(
     glossaryOverheadMs: summarizeLatencies(timings),
     limitations: Object.freeze([
       "Candidate terms are provisional and require customer Glossary Owner approval.",
-      "No STT, text translation, TTS, acoustic latency, Palabra, or human review was run.",
+      "Provider acceptance remains NOT_RUN: no STT, translation, TTS, or Palabra execution was run.",
+      "Product acceptance remains NOT_RUN: no acoustic latency, human review, or product go/no-go validation was run.",
       "Run live discovery and the frozen 24-case formal corpus before any product go/no-go claim.",
     ]),
   });

@@ -4,9 +4,11 @@ import { test } from "node:test";
 import { CANONICAL_AUDIO, createAudioFrame, type AudioFrame } from "../src/core/audio.js";
 import { compileGlossary } from "../src/core/glossary.js";
 import { resolveTranslationBehavior } from "../src/core/translation-behavior.js";
+import { isSelectableTranslationMode } from "../src/core/translation-capabilities.js";
 import type {
   GenerationRef,
   LaneContext,
+  TranslationFallbackPolicy,
   TranslationEvent,
 } from "../src/core/types.js";
 import {
@@ -15,7 +17,6 @@ import {
   type ControlledTranscriptionRequest,
 } from "../src/adapters/translation/glossary-controlled.js";
 import {
-  LocalPlayoutQueue,
   OpenAIAdapterError,
   type WebSocketConnectOptions,
   type WebSocketLike,
@@ -28,10 +29,13 @@ import {
   OPENAI_NATIVE_TRANSLATION_CAPABILITIES,
 } from "../src/adapters/openai/native-realtime-translate.js";
 
+const NO_SOURCE_SUBSTITUTION: TranslationFallbackPolicy = Object.freeze({ kind: "none" });
+
 type SocketEvent = "open" | "message" | "close" | "error";
 
 class FakeWebSocket implements WebSocketLike {
   readyState = 0;
+  bufferedAmount = 0;
   readonly sent: string[] = [];
   readonly closes: Array<{ code?: number; reason?: string }> = [];
   readonly #listeners: Record<SocketEvent, Array<(data: unknown) => void>> = {
@@ -79,9 +83,17 @@ class FakeWebSocket implements WebSocketLike {
     }
   }
 
+  emitRaw(data: string): void {
+    for (const listener of this.#listeners.message) listener(data);
+  }
+
   emitClose(): void {
     this.readyState = 3;
     for (const listener of this.#listeners.close) listener(undefined);
+  }
+
+  emitError(): void {
+    for (const listener of this.#listeners.error) listener(undefined);
   }
 }
 
@@ -221,6 +233,13 @@ async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   return values;
 }
 
+function assertEvidenceRefs(events: readonly TranslationEvent[]): void {
+  assert.equal(
+    events.every((event) => event.evidenceRef.trim().length > 0),
+    true,
+  );
+}
+
 async function waitUntil(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -229,26 +248,38 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   throw new Error("condition was not reached");
 }
 
-async function delay(milliseconds: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
-}
-
 function sentEvents(socket: FakeWebSocket): Array<Record<string, unknown>> {
   return socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>);
 }
 
 test("OpenAI capability metadata is honest and unavailable credentials do not create a live adapter", async () => {
   assert.deepEqual(
-    OPENAI_NATIVE_TRANSLATION_CAPABILITIES.supportedModes.map((mode) => mode.mode),
-    ["fast", "balanced"],
+    OPENAI_NATIVE_TRANSLATION_CAPABILITIES.modes.map(
+      (mode) => [mode.mode, mode.state],
+    ),
+    [
+      ["fast", "native"],
+      ["balanced", "locally_controlled"],
+      ["accurate", "experimental"],
+    ],
   );
   assert.equal(
-    OPENAI_NATIVE_TRANSLATION_CAPABILITIES.supportedModes[1]?.degradation,
-    "Balanced uses adapter-local holdback; it is not a model-quality claim.",
+    isSelectableTranslationMode(OPENAI_NATIVE_TRANSLATION_CAPABILITIES.modes[2]!),
+    false,
+  );
+  assert.equal(
+    OPENAI_NATIVE_TRANSLATION_CAPABILITIES.modes[2]?.reason?.trim().length !== 0,
+    true,
   );
   assert.deepEqual(
-    OPENAI_CONTROLLED_TRANSLATION_CAPABILITIES.supportedModes.map((mode) => mode.mode),
-    ["fast", "balanced", "accurate"],
+    OPENAI_CONTROLLED_TRANSLATION_CAPABILITIES.modes.map(
+      (mode) => [mode.mode, mode.state],
+    ),
+    [
+      ["fast", "locally_controlled"],
+      ["balanced", "locally_controlled"],
+      ["accurate", "locally_controlled"],
+    ],
   );
   assert.equal(
     OPENAI_CONTROLLED_TRANSLATION_CAPABILITIES.supportsDeterministicGlossary,
@@ -264,8 +295,46 @@ test("OpenAI capability metadata is honest and unavailable credentials do not cr
     (error: unknown) =>
       error instanceof OpenAIAdapterError && error.code === "configuration_error",
   );
+  assert.throws(
+    () =>
+      new NativeRealtimeTranslateAdapter({
+        apiKey: "test-key",
+        endpoint: "wss://api.openai.com/v1/realtime",
+        model: "gpt-realtime",
+      }),
+    (error: unknown) =>
+      error instanceof OpenAIAdapterError &&
+      error.code === "configuration_error" &&
+      error.message.includes("dedicated /v1/realtime/translations"),
+  );
+  assert.throws(
+    () =>
+      new NativeRealtimeTranslateAdapter({
+        apiKey: "test-key",
+        endpoint: "wss://proxy.example/v1/realtime/translations",
+      }),
+    (error: unknown) =>
+      error instanceof OpenAIAdapterError &&
+      error.code === "configuration_error" &&
+      error.message.includes("dedicated /v1/realtime/translations"),
+  );
 
-  const adapter = new NativeRealtimeTranslateAdapter({ apiKey: "test-key" });
+  let nativeConnects = 0;
+  const adapter = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    webSocketFactory: () => {
+      nativeConnects += 1;
+      return new FakeWebSocket();
+    },
+  });
+  assert.deepEqual(
+    await adapter.prepare(context("fast")),
+    {
+      readiness: "local_route_validated",
+      remoteConnection: "deferred_until_first_turn",
+    },
+  );
+  assert.equal(nativeConnects, 0);
   await assert.rejects(
     adapter.prepare(context("accurate")),
     (error: unknown) =>
@@ -274,7 +343,7 @@ test("OpenAI capability metadata is honest and unavailable credentials do not cr
   );
 });
 
-test("native Realtime uses 200 ms appends and emits normalized revisions and playout sequence", async () => {
+test("native translation uses the dedicated wire and drains on session.closed", async () => {
   const socket = new FakeWebSocket();
   let openedUrl = "";
   let connectOptions: WebSocketConnectOptions | undefined;
@@ -296,57 +365,86 @@ test("native Realtime uses 200 ms appends and emits normalized revisions and pla
   );
 
   await waitUntil(() => openedUrl.length > 0);
-  assert.equal(openedUrl, "wss://api.openai.com/v1/realtime?model=gpt-realtime");
+  assert.equal(
+    openedUrl,
+    "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate",
+  );
   assert.equal(connectOptions?.headers.Authorization, "Bearer test-key");
+  assert.equal(connectOptions?.maxPayload, 512 * 1024);
+  assert.equal(connectOptions?.perMessageDeflate, false);
   socket.emitOpen();
   await waitUntil(() =>
-    sentEvents(socket).some((event) => event.type === "response.create"),
+    sentEvents(socket).some(
+      (event) => event.type === "session.input_audio_buffer.append",
+    ),
   );
 
   const outgoing = sentEvents(socket);
+  const types = outgoing.map((event) => event.type);
+  assert.equal(types.includes("response.create"), false);
+  assert.equal(types.includes("response.cancel"), false);
+  assert.equal(types.includes("input_audio_buffer.commit"), false);
+  assert.equal(types.includes("input_audio_buffer.clear"), false);
+  assert.deepEqual(
+    outgoing.find((event) => event.type === "session.update"),
+    {
+      type: "session.update",
+      session: {
+        audio: {
+          input: {
+            transcription: { model: "gpt-realtime-whisper" },
+            noise_reduction: null,
+          },
+          output: { language: "zh" },
+        },
+      },
+    },
+  );
   const appends = outgoing.filter(
-    (event) => event.type === "input_audio_buffer.append",
+    (event) => event.type === "session.input_audio_buffer.append",
   );
   assert.equal(appends.length, 1);
   assert.equal(
     Buffer.from(String(appends[0]?.audio), "base64").byteLength,
     CANONICAL_AUDIO.bytesPerFrame * 10,
   );
-  assert.equal(outgoing.some((event) => event.type === "input_audio_buffer.commit"), true);
+  assert.equal(
+    outgoing.some((event) => event.type === "session.close"),
+    true,
+  );
 
   socket.emitMessage({
-    type: "conversation.item.input_audio_transcription.delta",
-    item_id: "source-1",
+    type: "session.input_transcript.delta",
+    event_id: "input-delta-1",
     delta: "hello",
   });
   socket.emitMessage({
-    type: "conversation.item.input_audio_transcription.completed",
-    item_id: "source-1",
+    type: "session.input_transcript.done",
+    event_id: "input-final-1",
     transcript: "hello",
   });
   socket.emitMessage({
-    type: "response.output_audio_transcript.delta",
-    response_id: "response-1",
+    type: "session.output_transcript.delta",
+    event_id: "output-delta-1",
     delta: "\u4f60",
   });
   socket.emitMessage({
-    type: "response.output_audio_transcript.done",
-    response_id: "response-1",
+    type: "session.output_transcript.final",
+    event_id: "output-final-1",
     transcript: "\u4f60\u597d",
   });
   const providerAudio = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame * 2);
   providerAudio[0] = 9;
   providerAudio[CANONICAL_AUDIO.bytesPerFrame] = 8;
   socket.emitMessage({
-    type: "response.output_audio.delta",
+    type: "session.output_audio.delta",
+    event_id: "audio-1",
     delta: Buffer.from(providerAudio).toString("base64"),
   });
-  socket.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
+  socket.emitMessage({ type: "session.closed", event_id: "closed-1" });
 
   const output = await outputPromise;
+  assertEvidenceRefs(output);
   assert.deepEqual(
     output.map((event) => event.kind),
     [
@@ -387,10 +485,14 @@ test("native Realtime uses 200 ms appends and emits normalized revisions and pla
   );
   assert.deepEqual(audio.map((event) => event.playoutSequence), [0, 1]);
   assert.deepEqual(audio.map((event) => event.frame.pcm16le[0]), [9, 8]);
-  assert.ok(output.every((event) => event.turnId === "turn-1"));
+  assert.ok(target[0] !== undefined);
+  assert.ok(audio.every((event) => event.targetSegmentId === target[0]?.segmentId));
+  assert.ok(audio.every((event) => event.revision === target.at(-1)?.revision));
+  assert.equal(target.at(-1)?.revision, 2);
+  assert.equal(output.at(-1)?.kind, "completed");
 });
 
-test("native Fast creates a bounded rolling response before its source iterator closes", async () => {
+test("native translation appends continuously without a response lifecycle", async () => {
   const socket = new FakeWebSocket();
   let connected = false;
   const adapter = new NativeRealtimeTranslateAdapter({
@@ -400,7 +502,7 @@ test("native Fast creates a bounded rolling response before its source iterator 
       return socket;
     },
   });
-  const source = heldFrames(80, 11);
+  const source = heldFrames(40, 11);
   const generation = context("fast", 11);
   const outputPromise = collect(
     adapter.translate({
@@ -413,45 +515,30 @@ test("native Fast creates a bounded rolling response before its source iterator 
   await waitUntil(() => connected);
   socket.emitOpen();
   await waitUntil(() =>
+    sentEvents(socket).filter(
+      (event) => event.type === "session.input_audio_buffer.append",
+    ).length === 4,
+  );
+  assert.equal(
     sentEvents(socket).some((event) => event.type === "response.create"),
+    false,
   );
-  await waitUntil(() =>
-    sentEvents(socket).filter((event) => event.type === "input_audio_buffer.append").length === 4,
+  assert.equal(
+    sentEvents(socket).some((event) => event.type === "input_audio_buffer.commit"),
+    false,
   );
-
   assert.equal(source.ended(), false);
-  const outgoing = sentEvents(socket);
-  assert.equal(
-    outgoing.filter((event) => event.type === "input_audio_buffer.append").length,
-    4,
-  );
-  assert.equal(
-    outgoing.filter((event) => event.type === "input_audio_buffer.commit").length,
-    1,
-  );
-  assert.equal(
-    outgoing.filter((event) => event.type === "response.create").length,
-    1,
-  );
-
-  socket.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
-  await waitUntil(() =>
-    sentEvents(socket).filter((event) => event.type === "response.create").length === 2,
-  );
-  assert.equal(
-    sentEvents(socket).filter((event) => event.type === "input_audio_buffer.append").length,
-    8,
-  );
 
   await adapter.cancel(generation);
   source.release();
   assert.deepEqual(await outputPromise, []);
+  assert.equal(
+    sentEvents(socket).filter((event) => event.type === "session.close").length,
+    1,
+  );
 });
 
-test("native Fast bounds delayed continuous ingress, surfaces trims, and resumes with the newest window", async () => {
+test("native translation drops audio until an emitted target transcript identifies its segment", async () => {
   const socket = new FakeWebSocket();
   let connected = false;
   const adapter = new NativeRealtimeTranslateAdapter({
@@ -461,198 +548,33 @@ test("native Fast bounds delayed continuous ingress, surfaces trims, and resumes
       return socket;
     },
   });
-  const source = burstFrames(160, 16);
   const outputPromise = collect(
     adapter.translate({
-      frames: source.frames,
-      context: context("fast", 16),
+      frames: frames(2, 34),
+      context: context("fast", 34),
       signal: new AbortController().signal,
     }),
   );
-
   await waitUntil(() => connected);
   socket.emitOpen();
-  await waitUntil(() =>
-    sentEvents(socket).filter((event) => event.type === "response.create").length === 1,
-  );
-  await waitUntil(source.ended);
-  assert.equal(
-    sentEvents(socket).filter((event) => event.type === "input_audio_buffer.append").length,
-    4,
-  );
-  assert.deepEqual(
-    sentEvents(socket)
-      .filter((event) => event.type === "input_audio_buffer.append")
-      .map((event) => Buffer.from(String(event.audio), "base64")[0]),
-    [1, 11, 21, 31],
-  );
-
+  await waitUntil(() => sentEvents(socket).some((event) => event.type === "session.update"));
   socket.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
-  await waitUntil(() =>
-    sentEvents(socket).filter((event) => event.type === "response.create").length === 2,
-  );
-  assert.deepEqual(
-    sentEvents(socket)
-      .filter((event) => event.type === "input_audio_buffer.append")
-      .map((event) => Buffer.from(String(event.audio), "base64")[0]),
-    [1, 11, 21, 31, 121, 131, 141, 151],
-  );
-
-  socket.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
-  const output = await outputPromise;
-  assert.equal(output.at(-1)?.kind, "completed");
-  assert.deepEqual(
-    output
-      .filter((event): event is Extract<TranslationEvent, { kind: "error" }> =>
-        event.kind === "error",
-      )
-      .map((event) => event.error.code),
-    [
-      "OPENAI_REALTIME_INPUT_QUEUE_TRIMMED",
-      "OPENAI_REALTIME_INPUT_QUEUE_TRIMMED",
-    ],
-  );
-});
-
-test("native playout sequence continues across completed turns in one generation", async () => {
-  const sockets = [new FakeWebSocket(), new FakeWebSocket()];
-  let socketIndex = 0;
-  const adapter = new NativeRealtimeTranslateAdapter({
-    apiKey: "test-key",
-    webSocketFactory: () => {
-      const socket = sockets[socketIndex];
-      socketIndex += 1;
-      if (socket === undefined) throw new Error("unexpected connection");
-      return socket;
-    },
-  });
-  const firstContext = context("fast", 13);
-  const secondContext: LaneContext = {
-    ...context("fast", 13),
-    turnId: "turn-13-second",
-  };
-
-  const firstOutput = collect(
-    adapter.translate({
-      frames: frames(1, 13),
-      context: firstContext,
-      signal: new AbortController().signal,
-    }),
-  );
-  await waitUntil(() => socketIndex === 1);
-  sockets[0]?.emitOpen();
-  await waitUntil(() =>
-    sentEvents(sockets[0]!).some((event) => event.type === "response.create"),
-  );
-  sockets[0]?.emitMessage({
-    type: "response.output_audio.delta",
-    delta: Buffer.alloc(CANONICAL_AUDIO.bytesPerFrame, 1).toString("base64"),
-  });
-  sockets[0]?.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
-
-  const secondOutput = collect(
-    adapter.translate({
-      frames: frames(1, 13),
-      context: secondContext,
-      signal: new AbortController().signal,
-    }),
-  );
-  await waitUntil(() => socketIndex === 2);
-  sockets[1]?.emitOpen();
-  await waitUntil(() =>
-    sentEvents(sockets[1]!).some((event) => event.type === "response.create"),
-  );
-  sockets[1]?.emitMessage({
-    type: "response.output_audio.delta",
-    delta: Buffer.alloc(CANONICAL_AUDIO.bytesPerFrame, 2).toString("base64"),
-  });
-  sockets[1]?.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
-
-  const audioSequences = (await Promise.all([firstOutput, secondOutput]))
-    .flatMap((output) => output)
-    .filter((event): event is Extract<TranslationEvent, { kind: "audio" }> =>
-      event.kind === "audio",
-    )
-    .map((event) => [event.playoutSequence, event.frame.sequence]);
-  assert.deepEqual(audioSequences, [[0, 0], [1, 1]]);
-});
-
-test("native Balanced locally holds output and suppresses provisional transcript revisions", async () => {
-  const socket = new FakeWebSocket();
-  let connected = false;
-  const adapter = new NativeRealtimeTranslateAdapter({
-    apiKey: "test-key",
-    webSocketFactory: () => {
-      connected = true;
-      return socket;
-    },
-  });
-  const iterator = adapter.translate({
-    frames: frames(10, 2),
-    context: context("balanced", 2),
-    signal: new AbortController().signal,
-  })[Symbol.asyncIterator]();
-  const firstEvent = iterator.next();
-  await waitUntil(() => connected);
-  socket.emitOpen();
-  await waitUntil(() =>
-    sentEvents(socket).some((event) => event.type === "response.create"),
-  );
-  const startedAtMs = Date.now();
-  socket.emitMessage({
-    type: "conversation.item.input_audio_transcription.delta",
-    item_id: "source-2",
-    delta: "delayed",
-  });
-  socket.emitMessage({
-    type: "response.output_audio.delta",
+    type: "session.output_audio.delta",
+    event_id: "audio-before-target",
     delta: Buffer.alloc(CANONICAL_AUDIO.bytesPerFrame, 7).toString("base64"),
   });
-  socket.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
+  socket.emitMessage({ type: "session.closed", event_id: "closed-before-target" });
 
-  const early = await Promise.race([
-    firstEvent.then(() => "event" as const),
-    delay(80).then(() => "waiting" as const),
-  ]);
-  assert.equal(early, "waiting");
-  const first = await firstEvent;
-  assert.equal(first.done, false);
-  assert.ok(Date.now() - startedAtMs >= 200);
-  const output: TranslationEvent[] = [first.value];
-  while (true) {
-    const next = await iterator.next();
-    if (next.done) break;
-    output.push(next.value);
-  }
-  assert.equal(output.some((event) => event.finality === "provisional"), false);
-  assert.equal(output.some((event) => event.kind === "source_transcript"), true);
-  assert.equal(output.some((event) => event.kind === "audio"), true);
+  const output = await outputPromise;
+  assert.equal(output.some((event) => event.kind === "audio"), false);
+  assert.deepEqual(
+    output.filter((event): event is Extract<TranslationEvent, { kind: "error" }> => event.kind === "error")
+      .map((event) => event.error.code),
+    ["OPENAI_REALTIME_AUDIO_TARGET_UNKNOWN"],
+  );
 });
 
-test("adapter-local playout queue is bounded and retains the newest audio before terminal completion", async () => {
-  const queue = new LocalPlayoutQueue<string>(1);
-  assert.equal(queue.offer("old", { audio: true, holdbackMs: 20 }), "accepted");
-  assert.equal(queue.offer("new", { audio: true, holdbackMs: 20 }), "dropped_oldest");
-  queue.closeAfterDrain("completed");
-  assert.deepEqual(await collect(queue), ["new", "completed"]);
-});
-
-test("native cancellation fences delayed and late provider output", async () => {
+test("native cancellation uses the translation close primitive and fences late output", async () => {
   const socket = new FakeWebSocket();
   let connected = false;
   const adapter = new NativeRealtimeTranslateAdapter({
@@ -673,29 +595,168 @@ test("native cancellation fences delayed and late provider output", async () => 
   await waitUntil(() => connected);
   socket.emitOpen();
   await waitUntil(() =>
-    sentEvents(socket).some((event) => event.type === "response.create"),
+    sentEvents(socket).some(
+      (event) => event.type === "session.input_audio_buffer.append",
+    ),
   );
-  socket.emitMessage({
-    type: "response.output_audio.delta",
-    delta: Buffer.alloc(CANONICAL_AUDIO.bytesPerFrame, 3).toString("base64"),
-  });
   await adapter.cancel(generation);
   socket.emitMessage({
-    type: "response.output_audio.delta",
+    type: "session.output_audio.delta",
+    event_id: "late-audio",
     delta: Buffer.alloc(CANONICAL_AUDIO.bytesPerFrame, 4).toString("base64"),
   });
-  socket.emitMessage({
-    type: "response.done",
-    response: { status: "completed" },
-  });
+  socket.emitMessage({ type: "session.closed", event_id: "late-close" });
 
   assert.deepEqual(await outputPromise, []);
-  await delay(280);
-  assert.deepEqual(await outputPromise, []);
-  assert.equal(
-    sentEvents(socket).some((event) => event.type === "response.cancel"),
-    true,
+  const types = sentEvents(socket).map((event) => event.type);
+  assert.equal(types.includes("session.close"), true);
+  assert.equal(types.includes("response.cancel"), false);
+  assert.equal(types.includes("input_audio_buffer.clear"), false);
+});
+
+test("native translation bounds provider payloads, nesting, and outbound buffering", async () => {
+  const cases: Array<{
+    readonly name: string;
+    readonly emit: (socket: FakeWebSocket) => void;
+    readonly expectedCode: string;
+  }> = [
+    {
+      name: "oversized payload",
+      emit: (socket) => socket.emitRaw("x".repeat(512 * 1024 + 1)),
+      expectedCode: "OPENAI_REALTIME_PAYLOAD_TOO_LARGE",
+    },
+    {
+      name: "nested payload",
+      emit: (socket) => {
+        let nested = JSON.stringify({ type: "session.closed" });
+        for (let index = 0; index < 10; index += 1) {
+          nested = JSON.stringify({ data: nested });
+        }
+        socket.emitRaw(nested);
+      },
+      expectedCode: "OPENAI_REALTIME_INVALID_PAYLOAD",
+    },
+    {
+      name: "malformed JSON",
+      emit: (socket) => socket.emitRaw("{"),
+      expectedCode: "OPENAI_REALTIME_INVALID_PAYLOAD",
+    },
+    {
+      name: "oversized provider id",
+      emit: (socket) => socket.emitMessage({
+        type: "session.output_transcript.delta",
+        event_id: "e".repeat(300),
+        delta: "hello",
+      }),
+      expectedCode: "OPENAI_REALTIME_INVALID_PAYLOAD",
+    },
+  ];
+  for (const testCase of cases) {
+    const socket = new FakeWebSocket();
+    let connected = false;
+    const adapter = new NativeRealtimeTranslateAdapter({
+      apiKey: "test-key",
+      webSocketFactory: () => {
+        connected = true;
+        return socket;
+      },
+    });
+    const source = heldFrames(1, 30);
+    const outputPromise = collect(
+      adapter.translate({
+        frames: source.frames,
+        context: context("fast", 30),
+        signal: new AbortController().signal,
+      }),
+    );
+    await waitUntil(() => connected);
+    socket.emitOpen();
+    await waitUntil(() => sentEvents(socket).some((event) => event.type === "session.update"));
+    socket.emitRaw(JSON.stringify({ type: "session.input_transcript.delta", delta: "warmup" }));
+    testCase.emit(socket);
+    source.release();
+    const output = await outputPromise;
+    const errors = output.filter(
+      (event): event is Extract<TranslationEvent, { kind: "error" }> =>
+        event.kind === "error",
+    );
+    assert.equal(errors.length, 1, testCase.name);
+    assert.equal(errors[0]?.error.code, testCase.expectedCode, testCase.name);
+    assert.equal(errors[0]?.error.message.includes("provider"), false);
+  }
+
+  const socket = new FakeWebSocket();
+  socket.bufferedAmount = 512 * 1024;
+  let connected = false;
+  const adapter = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    webSocketFactory: () => {
+      connected = true;
+      return socket;
+    },
+  });
+  const outputPromise = collect(
+    adapter.translate({
+      frames: frames(1, 31),
+      context: context("fast", 31),
+      signal: new AbortController().signal,
+    }),
   );
+  await waitUntil(() => connected);
+  socket.emitOpen();
+  const output = await outputPromise;
+  const errors = output.filter(
+    (event): event is Extract<TranslationEvent, { kind: "error" }> =>
+      event.kind === "error",
+  );
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0]?.error.code, "OPENAI_REALTIME_CONNECTION");
+});
+
+test("native provider and socket failures are static, lane-local terminal errors", async () => {
+  for (const failure of ["provider", "socket"] as const) {
+    const socket = new FakeWebSocket();
+    let connected = false;
+    const adapter = new NativeRealtimeTranslateAdapter({
+      apiKey: "test-key",
+      webSocketFactory: () => {
+        connected = true;
+        return socket;
+      },
+    });
+    const outputPromise = collect(
+      adapter.translate({
+        frames: frames(1, failure === "provider" ? 32 : 33),
+        context: context("fast", failure === "provider" ? 32 : 33),
+        signal: new AbortController().signal,
+      }),
+    );
+    await waitUntil(() => connected);
+    socket.emitOpen();
+    await waitUntil(() => sentEvents(socket).some((event) => event.type === "session.update"));
+    if (failure === "provider") {
+      socket.emitMessage({
+        type: "error",
+        error: { message: "provider secret /internal/provider/path" },
+      });
+    } else {
+      socket.emitError();
+    }
+    const output = await outputPromise;
+    const errors = output.filter(
+      (event): event is Extract<TranslationEvent, { kind: "error" }> =>
+        event.kind === "error",
+    );
+    assert.equal(errors.length, 1);
+    assert.equal(
+      errors[0]?.error.code,
+      failure === "provider"
+        ? "OPENAI_REALTIME_PROVIDER"
+        : "OPENAI_REALTIME_CONNECTION",
+    );
+    assert.equal(errors[0]?.error.message.includes("secret"), false);
+    assert.equal(errors[0]?.error.message.includes("/internal"), false);
+  }
 });
 
 test("native Realtime rejects a glossary in prepare and translate because it cannot authorize it", async () => {
@@ -743,13 +804,21 @@ test("controlled OpenAI path supports all modes and preserves the pinned turn ac
   const transcriber = new StubTranscriber();
   const adapter = new OpenAIControlledTranslationAdapter({
     apiKey: "test-key",
+    fallback: NO_SOURCE_SUBSTITUTION,
     transcriber,
     translator: { translate: async ({ text }) => text + "-translated" },
     tts: new StubTts(),
   });
-  await adapter.prepare(context("fast", 4));
-  await adapter.prepare(context("balanced", 4));
-  await adapter.prepare(context("accurate", 4));
+  const preparations = [
+    await adapter.prepare(context("fast", 4)),
+    await adapter.prepare(context("balanced", 4)),
+    await adapter.prepare(context("accurate", 4)),
+  ];
+  assert.deepEqual(preparations, [
+    { readiness: "local_route_validated", remoteConnection: "deferred_until_first_turn" },
+    { readiness: "local_route_validated", remoteConnection: "deferred_until_first_turn" },
+    { readiness: "local_route_validated", remoteConnection: "deferred_until_first_turn" },
+  ]);
 
   const fastOutput = await collect(
     adapter.translate({
@@ -765,9 +834,20 @@ test("controlled OpenAI path supports all modes and preserves the pinned turn ac
       signal: new AbortController().signal,
     }),
   );
+  const accurateOutput = await collect(
+    adapter.translate({
+      frames: frames(2, 6),
+      context: context("accurate", 6),
+      signal: new AbortController().signal,
+    }),
+  );
+  assertEvidenceRefs(fastOutput);
+  assertEvidenceRefs(balancedOutput);
+  assertEvidenceRefs(accurateOutput);
   assert.deepEqual(transcriber.turnIds, [
     "turn-4\u0000openai-window-0",
     "turn-5\u0000openai-window-0",
+    "turn-6",
   ]);
   assert.equal(
     fastOutput.every((event) => event.turnId === "turn-4"),
@@ -789,11 +869,74 @@ test("controlled OpenAI path supports all modes and preserves the pinned turn ac
   );
   assert.equal(balancedOutput.some((event) => event.kind === "audio"), true);
   assert.equal(balancedOutput.at(-1)?.kind, "completed");
+  assert.equal(
+    accurateOutput.every((event) => event.turnId === "turn-6"),
+    true,
+  );
+  assert.equal(accurateOutput.some((event) => event.kind === "audio"), true);
+  assert.equal(accurateOutput.at(-1)?.kind, "completed");
+});
+
+test("controlled OpenAI wrapper fails closed on translator errors with a bound glossary", async () => {
+  const glossary = compileGlossary({
+    id: "product-terms",
+    version: "1",
+    sourceLanguage: "en",
+    targetLanguage: "zh-TW",
+    entries: [
+      {
+        id: "hello",
+        source: "hello",
+        aliases: [],
+        targetExact: "\u4f60\u597d",
+      },
+    ],
+  });
+  for (const fallback of ["none", "same_route_fail_open"] as const) {
+    const tts = new TrackingTts();
+    const adapter = new OpenAIControlledTranslationAdapter({
+      apiKey: "test-key",
+      fallback: { kind: fallback },
+      transcriber: new StubTranscriber(),
+      translator: {
+        translate: async () => {
+          throw new Error("provider secret and /internal/path");
+        },
+      },
+      tts,
+    });
+    const requestContext: LaneContext = {
+      ...context("accurate", fallback === "none" ? 21 : 22),
+      glossary,
+    };
+    const output = await collect(
+      adapter.translate({
+        frames: frames(1, requestContext.generation),
+        context: requestContext,
+        signal: new AbortController().signal,
+      }),
+    );
+    assertEvidenceRefs(output);
+    assert.equal(output.some((event) => event.kind === "source_transcript"), true);
+    assert.equal(output.some((event) => event.kind === "target_transcript"), false);
+    assert.equal(output.some((event) => event.kind === "audio"), false);
+    assert.equal(tts.calls, 0);
+    const errors = output.filter(
+      (event): event is Extract<TranslationEvent, { kind: "error" }> =>
+        event.kind === "error",
+    );
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0]?.error.message.includes("provider secret"), false);
+    assert.equal(errors[0]?.error.message.includes("/internal/path"), false);
+    assert.equal(output.every((event) => event.turnId === requestContext.turnId), true);
+    assert.equal(output.at(-1)?.kind, "completed");
+  }
 });
 
 test("controlled playout sequence continues across completed turns in one generation", async () => {
   const adapter = new OpenAIControlledTranslationAdapter({
     apiKey: "test-key",
+    fallback: NO_SOURCE_SUBSTITUTION,
     transcriber: new StubTranscriber(),
     translator: { translate: async ({ text }) => text + "-translated" },
     tts: new StubTts(),
@@ -825,6 +968,7 @@ test("controlled continuous capture drains a second window while the first windo
   const transcriber = new BlockingTranscriber();
   const adapter = new OpenAIControlledTranslationAdapter({
     apiKey: "test-key",
+    fallback: NO_SOURCE_SUBSTITUTION,
     transcriber,
     translator: { translate: async ({ text }) => text + "-translated" },
     tts: new StubTts(),
@@ -863,6 +1007,7 @@ test("controlled cancellation wakes blocked continuous ingress and its source it
   const transcriber = new BlockingTranscriber();
   const adapter = new OpenAIControlledTranslationAdapter({
     apiKey: "test-key",
+    fallback: NO_SOURCE_SUBSTITUTION,
     transcriber,
     translator: { translate: async ({ text }) => text + "-translated" },
     tts: new StubTts(),
@@ -978,6 +1123,16 @@ class StubTts implements ControlledTtsPort {
   readonly outputFormat = CANONICAL_AUDIO;
 
   async *synthesize(): AsyncIterable<Uint8Array> {
+    yield new Uint8Array(CANONICAL_AUDIO.bytesPerFrame);
+  }
+}
+
+class TrackingTts implements ControlledTtsPort {
+  readonly outputFormat = CANONICAL_AUDIO;
+  calls = 0;
+
+  async *synthesize(): AsyncIterable<Uint8Array> {
+    this.calls += 1;
     yield new Uint8Array(CANONICAL_AUDIO.bytesPerFrame);
   }
 }

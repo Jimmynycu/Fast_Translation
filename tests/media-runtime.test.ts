@@ -5,7 +5,17 @@ import { FakeTelephonyMediaPort } from "../src/adapters/media/fake-telephony.js"
 import { createMediaRuntime } from "../src/media-runtime.js";
 import { createServerAccessControl } from "../src/server/access.js";
 
-const access = createServerAccessControl({ operatorToken: "o".repeat(32) });
+const access = createServerAccessControl({
+  operatorToken: "o".repeat(32),
+  retentionOwner: {
+    id: "media-test-owner",
+    token: "r".repeat(32),
+  },
+  evidenceReviewer: {
+    id: "media-test-reviewer",
+    token: "v".repeat(32),
+  },
+});
 
 describe("media runtime composition", () => {
   it("builds browser pairing with side-bound HTTPS participant grants", async () => {

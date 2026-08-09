@@ -71,7 +71,7 @@ export interface ExecutableRun {
 }
 
 export interface ExecutableBenchmarkManifest {
-  readonly schemaVersion: 3;
+  readonly schemaVersion: 7;
   readonly suiteId: string;
   readonly seed: string;
   readonly fixtures: readonly ExecutableFixture[];
@@ -79,7 +79,8 @@ export interface ExecutableBenchmarkManifest {
   readonly arms: readonly ArmFreeze[];
   readonly evidence: Readonly<{
     readonly requiredEvents: readonly string[];
-    readonly output: "jsonl_plus_four_track_audio";
+    /** Keyless runs retain only summary JSONL, never exported raw events or audio. */
+    readonly output: "run_results_jsonl_without_event_or_audio_export";
     readonly clock: "harness_monotonic";
     readonly schemaSha256: string;
   }>;
@@ -99,8 +100,9 @@ export interface ExecutableBenchmarkManifest {
     readonly targetExact: "all_bound_committed_terms";
     readonly zeroOpenRegression: true;
     readonly alertsClear: true;
-    readonly latencyEvidence: "all_local_latency_samples";
-    readonly normalizedEventEvidence: "revisions_finality_audio_sequence";
+    readonly latencyEvidence: "not_run_without_acoustic_capture";
+    readonly bargeInEvidence: "not_run_without_acoustic_capture";
+    readonly normalizedEventEvidence: "not_run_without_exported_events_and_four_track_audio";
     readonly noRuntimeHotSwap: true;
     readonly gatesSha256: string;
   }>;
@@ -259,7 +261,7 @@ const ARM_INPUTS: Readonly<Record<BenchmarkArm, Readonly<{
     adapterVersion: "gpt-realtime-translate-contract-v1",
     provider: "openai_native",
     mode: "balanced",
-    config: { transport: "webrtc", model: "gpt-realtime-translate" },
+    config: { transport: "dedicated_websocket", model: "gpt-realtime-translate" },
   },
   GLOSSARY_CONTROLLED: {
     adapterId: "central-harness-controlled",
@@ -303,7 +305,7 @@ const evidenceBody = {
     "playout_clear",
     "recording_closed",
   ],
-  output: "jsonl_plus_four_track_audio" as const,
+  output: "run_results_jsonl_without_event_or_audio_export" as const,
   clock: "harness_monotonic" as const,
 };
 const evidence = deepFreeze({ ...evidenceBody, schemaSha256: sha256(evidenceBody) });
@@ -326,8 +328,9 @@ const gatesBody = {
   targetExact: "all_bound_committed_terms" as const,
   zeroOpenRegression: true as const,
   alertsClear: true as const,
-  latencyEvidence: "all_local_latency_samples" as const,
-  normalizedEventEvidence: "revisions_finality_audio_sequence" as const,
+  latencyEvidence: "not_run_without_acoustic_capture" as const,
+  bargeInEvidence: "not_run_without_acoustic_capture" as const,
+  normalizedEventEvidence: "not_run_without_exported_events_and_four_track_audio" as const,
   noRuntimeHotSwap: true as const,
 };
 const gates = deepFreeze({ ...gatesBody, gatesSha256: sha256(gatesBody) });
@@ -453,9 +456,9 @@ function executableRuns(): readonly ExecutableRun[] {
 
 export function createExecutableBenchmarkManifest(): ExecutableBenchmarkManifest {
   const body = {
-    schemaVersion: 3 as const,
-    suiteId: "fast-translation-normalized-contract-v3",
-    seed: "fast-translation-fixed-seed-v3",
+    schemaVersion: 7 as const,
+    suiteId: "fast-translation-normalized-contract-v7",
+    seed: "fast-translation-fixed-seed-v7",
     fixtures: deepFreeze([...discoveryFixtures, ...formalFixtures, ...latencyFixtures]),
     schedules: deepFreeze([...interruptionSchedules, soakSchedule]),
     arms: deepFreeze([...arms]),
@@ -479,6 +482,9 @@ export function validateExecutableBenchmarkManifest(
   manifest: ExecutableBenchmarkManifest = EXECUTABLE_BENCHMARK_MANIFEST,
 ): void {
   const { manifestSha256, ...body } = manifest;
+  if (manifest.schemaVersion !== 7) {
+    throw new Error("Unsupported executable benchmark manifest schema version");
+  }
   requireHash(manifestSha256, sha256(body), "manifest");
   const canonicalFixtureById = new Map(
     [...discoveryFixtures, ...formalFixtures, ...latencyFixtures].map(

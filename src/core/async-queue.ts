@@ -67,6 +67,27 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
     return dropped ? "dropped_oldest" : "accepted";
   }
 
+  offerPriority(
+    value: T,
+    isEvictable: (candidate: T) => boolean,
+  ): "accepted" | "evicted" | "full" | "closed" {
+    if (this.#closed) return "closed";
+    const waiter = this.#waiters.shift();
+    if (waiter !== undefined) {
+      waiter.resolve({ value, done: false });
+      return "accepted";
+    }
+    if (this.#values.length < this.#capacity) {
+      this.#values.push(value);
+      return "accepted";
+    }
+    const evictIndex = this.#values.findIndex(isEvictable);
+    if (evictIndex < 0) return "full";
+    this.#values.splice(evictIndex, 1);
+    this.#values.push(value);
+    return "evicted";
+  }
+
   close(error?: unknown): boolean {
     if (this.#closed) return false;
     this.#closed = true;

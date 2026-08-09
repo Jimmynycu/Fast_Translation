@@ -3,32 +3,58 @@ import type {
   GenerationRef,
   LaneContext,
   TranslationCapabilities,
-  TranslationCompletedEvent,
   TranslationEvent,
+  TranslationPreparation,
   TranslationPort,
   TranslationRequest,
-  TranslationTranscriptEvent,
 } from "../../core/types.js";
+import { GenerationPlayoutSequence } from "../../core/playout-sequence.js";
+import { assertTranslationBehaviorCapability } from "../../core/translation-capabilities.js";
+import {
+  attachTranslationEvidenceRef,
+  type DraftTranslationEvent,
+} from "./evidence-ref.js";
 
 /**
  * This is an injection-only capability descriptor. The public provider-id
  * union intentionally has no test-only member, so the fake uses the configured
  * controlled-provider identity when a test needs to provide capabilities to a
- * relay. Composition never constructs this adapter from TRANSLATION_PROVIDER.
+ * relay. Production composition is pinned to an approved processing profile;
+ * this deterministic adapter is only injected by explicit local fixtures.
  */
 export const DETERMINISTIC_TRANSLATION_CAPABILITIES: TranslationCapabilities =
   Object.freeze({
     providerId: "openai_controlled",
-    supportedModes: Object.freeze([
-      Object.freeze({ mode: "fast" as const, behaviorVersion: 1 as const, deterministicGlossary: true }),
-      Object.freeze({ mode: "balanced" as const, behaviorVersion: 1 as const, deterministicGlossary: true }),
-      Object.freeze({ mode: "accurate" as const, behaviorVersion: 1 as const, deterministicGlossary: true }),
+    modes: Object.freeze([
+      Object.freeze({
+        mode: "fast" as const,
+        behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
+        deterministicGlossary: false,
+      }),
+      Object.freeze({
+        mode: "balanced" as const,
+        behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
+        deterministicGlossary: false,
+      }),
+      Object.freeze({
+        mode: "accurate" as const,
+        behaviorVersion: 1 as const,
+        state: "locally_controlled" as const,
+        deterministicGlossary: false,
+      }),
     ]),
     supportsProvisionalRevisions: true,
     supportsFinality: true,
     supportsCancellation: true,
-    supportsDeterministicGlossary: true,
+    supportsDeterministicGlossary: false,
   });
+
+const FIXTURE_LOCAL_PREPARATION: TranslationPreparation = Object.freeze({
+  readiness: "fixture_local",
+  remoteConnection: "not_applicable",
+});
 
 export interface DeterministicTranslationAdapterOptions {
   readonly now?: () => number;
@@ -45,28 +71,32 @@ export class DeterministicTranslationAdapter implements TranslationPort {
   readonly capabilities = DETERMINISTIC_TRANSLATION_CAPABILITIES;
   readonly #now: () => number;
   readonly #cancelled = new Set<string>();
-  readonly #nextPlayoutSequence = new Map<string, number>();
+  readonly #playoutSequences = new GenerationPlayoutSequence();
 
   constructor(options: DeterministicTranslationAdapterOptions = {}) {
     this.#now = options.now ?? (() => performance.now());
   }
 
-  async prepare(context: LaneContext): Promise<void> {
+  async prepare(context: LaneContext): Promise<TranslationPreparation> {
     assertUsableContext(context);
+    return FIXTURE_LOCAL_PREPARATION;
   }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
     const { context } = request;
     assertUsableContext(context);
     const key = generationKey(context);
-    let playoutSequence = this.#nextPlayoutSequence.get(key) ?? 0;
+    let evidenceOrdinal = 0;
+    const withEvidenceRef = (event: DraftTranslationEvent): TranslationEvent =>
+      attachTranslationEvidenceRef("deterministic", evidenceOrdinal++, event);
+    let playoutSequence = 0;
     let transcriptsEmitted = false;
     const buffered = [];
 
     for await (const frame of request.frames) {
       if (isCancelled(this.#cancelled, key, request.signal)) {
-        this.#nextPlayoutSequence.delete(key);
-        yield completed(context, playoutSequence, this.#now());
+        this.#playoutSequences.clear(context);
+        yield withEvidenceRef(completed(context, playoutSequence, this.#now()));
         return;
       }
       if (context.behavior.inputCommit === "speech_end") {
@@ -76,58 +106,56 @@ export class DeterministicTranslationAdapter implements TranslationPort {
       for (const event of eventsForFrame(
         context,
         frame,
-        playoutSequence,
+        this.#playoutSequences.next(context),
         transcriptsEmitted,
         this.#now(),
       )) {
         if (isCancelled(this.#cancelled, key, request.signal)) {
-          this.#nextPlayoutSequence.delete(key);
-          yield completed(context, playoutSequence, this.#now());
+          this.#playoutSequences.clear(context);
+          yield withEvidenceRef(completed(context, playoutSequence, this.#now()));
           return;
         }
         if (event.kind === "audio") {
           playoutSequence = event.playoutSequence + 1;
-          this.#nextPlayoutSequence.set(key, playoutSequence);
         }
-        yield event;
+        yield withEvidenceRef(event);
       }
       transcriptsEmitted = true;
     }
 
     for (const frame of buffered) {
       if (isCancelled(this.#cancelled, key, request.signal)) {
-        this.#nextPlayoutSequence.delete(key);
-        yield completed(context, playoutSequence, this.#now());
+        this.#playoutSequences.clear(context);
+        yield withEvidenceRef(completed(context, playoutSequence, this.#now()));
         return;
       }
       for (const event of eventsForFrame(
         context,
         frame,
-        playoutSequence,
+        this.#playoutSequences.next(context),
         transcriptsEmitted,
         this.#now(),
       )) {
         if (isCancelled(this.#cancelled, key, request.signal)) {
-          this.#nextPlayoutSequence.delete(key);
-          yield completed(context, playoutSequence, this.#now());
+          this.#playoutSequences.clear(context);
+          yield withEvidenceRef(completed(context, playoutSequence, this.#now()));
           return;
         }
         if (event.kind === "audio") {
           playoutSequence = event.playoutSequence + 1;
-          this.#nextPlayoutSequence.set(key, playoutSequence);
         }
-        yield event;
+        yield withEvidenceRef(event);
       }
       transcriptsEmitted = true;
     }
 
-    yield completed(context, playoutSequence, this.#now());
+    yield withEvidenceRef(completed(context, playoutSequence, this.#now()));
   }
 
   async cancel(generation: GenerationRef): Promise<void> {
     const key = generationKey(generation);
     this.#cancelled.add(key);
-    this.#nextPlayoutSequence.delete(key);
+    this.#playoutSequences.clear(generation);
   }
 
   async closeSession(sessionId: string): Promise<void> {
@@ -135,9 +163,7 @@ export class DeterministicTranslationAdapter implements TranslationPort {
     for (const key of this.#cancelled) {
       if (key.startsWith(prefix)) this.#cancelled.delete(key);
     }
-    for (const key of this.#nextPlayoutSequence.keys()) {
-      if (key.startsWith(prefix)) this.#nextPlayoutSequence.delete(key);
-    }
+    this.#playoutSequences.clearSession(sessionId);
   }
 }
 
@@ -145,13 +171,11 @@ function assertUsableContext(context: LaneContext): void {
   if (context.turnId.trim() === "") {
     throw new TypeError("Deterministic translation requires a non-empty turnId");
   }
-  if (!DETERMINISTIC_TRANSLATION_CAPABILITIES.supportedModes.some(
-    (capability) =>
-      capability.mode === context.behavior.mode &&
-      capability.behaviorVersion === context.behavior.version,
-  )) {
-    throw new TypeError("Unsupported deterministic translation behavior");
-  }
+  assertTranslationBehaviorCapability(
+    DETERMINISTIC_TRANSLATION_CAPABILITIES,
+    context.behavior,
+    { glossaryRequested: context.glossary !== undefined },
+  );
 }
 
 function isCancelled(
@@ -168,19 +192,26 @@ function* eventsForFrame(
   playoutSequence: number,
   transcriptsEmitted: boolean,
   emittedAtMs: number,
-): Iterable<TranslationEvent> {
+): Iterable<DraftTranslationEvent> {
   if (!transcriptsEmitted) {
     yield* transcriptEvents(context, emittedAtMs);
   }
+  const targetRevision = context.behavior.transcriptPolicy === "provisional_revisions"
+    ? 1
+    : 0;
   yield {
     ...eventBase(
       context,
       context.turnId + ":audio:" + playoutSequence,
-      0,
+      targetRevision,
       "final",
       emittedAtMs,
     ),
     kind: "audio",
+    // The deterministic fixture has one target transcript segment per turn;
+    // keep the audio correlation explicit instead of asking downstream code
+    // to infer it from the audio segment name.
+    targetSegmentId: context.turnId + ":target_transcript",
     frame,
     playoutSequence,
   };
@@ -189,7 +220,7 @@ function* eventsForFrame(
 function* transcriptEvents(
   context: LaneContext,
   emittedAtMs: number,
-): Iterable<TranslationTranscriptEvent> {
+): Iterable<DraftTranslationEvent> {
   for (const kind of ["source_transcript", "target_transcript"] as const) {
     const transcript = "[deterministic " + context.behavior.mode + " " +
       (kind === "source_transcript" ? "source" : "target") + " " + context.lane + "]";
@@ -219,7 +250,7 @@ function completed(
   context: LaneContext,
   revision: number,
   emittedAtMs: number,
-): TranslationCompletedEvent {
+): DraftTranslationEvent {
   return {
     ...eventBase(
       context,

@@ -102,6 +102,7 @@ async function runLocal(): Promise<void> {
     passCount: execution.results.filter((result) => result.outcome === "PASS").length,
     notRunCount: execution.results.filter((result) => result.outcome === "NOT_RUN").length,
     failCount: execution.results.filter((result) => result.outcome === "FAIL").length,
+    invalidRunCount: execution.results.filter((result) => result.outcome === "INVALID_RUN").length,
   });
 }
 
@@ -186,11 +187,11 @@ async function releaseGate(): Promise<void> {
 
 
 async function discover(): Promise<void> {
+  const model = requiredArgument("--model").trim();
   const apiKey = process.env.OPENAI_API_KEY;
   if (apiKey === undefined || apiKey.trim().length === 0) {
     throw new Error("OPENAI_API_KEY is required for live baseline discovery");
   }
-  const model = process.env.OPENAI_TEXT_MODEL ?? "gpt-5.4-mini";
   const translator = new OpenAITextTranslator({
     apiKey,
     model,

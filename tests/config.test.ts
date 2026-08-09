@@ -1,199 +1,395 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ZodError } from "zod";
+import { homedir } from "node:os";
+import { dirname, join, parse, resolve } from "node:path";
 import { loadConfig } from "../src/config.js";
 
-const validKey = Buffer.alloc(32, 7).toString("base64");
+const rootKey = Buffer.alloc(32, 7).toString("base64");
+
+function deploymentEnvironment(
+  overrides: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  return {
+    HOST: "127.0.0.1",
+    PROCESSING_PROFILE_PATH: "profiles/poc.json",
+    PROCESSING_PROFILE_SHA256: "a".repeat(64),
+    DEPLOYMENT_BUILD_SHA256: "b".repeat(64),
+    OPERATOR_TOKEN: "operator-" + "o".repeat(32),
+    RETENTION_OWNER_ID: "retention-owner",
+    RETENTION_OWNER_TOKEN: "owner-" + "a".repeat(32),
+    EVIDENCE_REVIEWER_ID: "evidence-reviewer",
+    EVIDENCE_REVIEWER_TOKEN: "reviewer-" + "b".repeat(32),
+    EVIDENCE_ARCHIVE_DIRECTORY: "data/evidence/archive",
+    EVIDENCE_KEY_DIRECTORY: "data/evidence/keys",
+    EVIDENCE_EXPORT_DIRECTORY: "data/evidence/exports",
+    EVIDENCE_RECEIPT_DIRECTORY: "data/evidence/receipts",
+    EVIDENCE_ROOT_KEY_BASE64: rootKey,
+    ...overrides,
+  };
+}
+
+const glossaryEvidenceDirectoryOverlapCases = [
+  ["archive", "EVIDENCE_ARCHIVE_DIRECTORY"],
+  ["key", "EVIDENCE_KEY_DIRECTORY"],
+  ["export", "EVIDENCE_EXPORT_DIRECTORY"],
+  ["receipt", "EVIDENCE_RECEIPT_DIRECTORY"],
+] as const;
 
 describe("loadConfig", () => {
-  it("loads the selected provider and its default session mode", () => {
+  it("loads the pinned processing-profile reference and separately scoped deployment controls", () => {
     const config = loadConfig(
-      {
-        TRANSLATION_PROVIDER: "palabra",
-        TRANSLATION_MODE: "accurate",
+      deploymentEnvironment({
+        MEDIA_PROFILE: "fake_telephony",
+        OPENAI_API_KEY: "openai-test-key",
         PALABRA_API_KEY: "palabra-test-key",
-        EVIDENCE_PROFILE: "in_memory",
-      },
+      }),
       "C:/workspace",
     );
 
     assert.equal(config.port, 4207);
-    assert.equal(config.translationProvider, "palabra");
-    assert.equal(config.translationMode, "accurate");
-    assert.equal(config.translationBehavior.mode, "accurate");
-    assert.equal(config.translationBehavior.version, 1);
-    assert.equal(config.palabraApiKey, "palabra-test-key");
-    assert.equal(config.openaiApiKey, undefined);
-    assert.equal("translationProfile" in config, false);
-    assert.match(config.operatorToken, /^[A-Za-z0-9_-]{43}$/u);
-  });
-
-  it("defaults to the balanced OpenAI controlled provider", () => {
-    const config = loadConfig({
-      OPENAI_API_KEY: "openai-test-key",
-      EVIDENCE_PROFILE: "in_memory",
-    });
-
-    assert.equal(config.translationProvider, "openai_controlled");
-    assert.equal(config.translationMode, "balanced");
-  });
-
-  it("requires only the selected provider's server-side key", () => {
-    assert.throws(
-      () => loadConfig({
-        TRANSLATION_PROVIDER: "palabra",
-        EVIDENCE_PROFILE: "in_memory",
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof ZodError);
-        assert.match(error.message, /PALABRA_API_KEY/u);
-        return true;
-      },
-    );
-
-    assert.throws(
-      () => loadConfig({
-        TRANSLATION_PROVIDER: "openai_native",
-        EVIDENCE_PROFILE: "in_memory",
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof ZodError);
-        assert.match(error.message, /OPENAI_API_KEY/u);
-        return true;
-      },
-    );
-
-    const config = loadConfig({
-      TRANSLATION_PROVIDER: "palabra",
-      PALABRA_API_KEY: "palabra-test-key",
-      EVIDENCE_PROFILE: "in_memory",
-    });
-    assert.equal(config.openaiApiKey, undefined);
-  });
-
-  it("admits only the approved provider and mode values", () => {
-    assert.throws(
-      () => loadConfig({
-        TRANSLATION_PROVIDER: "deterministic_test",
-        EVIDENCE_PROFILE: "in_memory",
-      }),
-      /Invalid option/u,
-    );
-    assert.throws(
-      () => loadConfig({
-        TRANSLATION_PROVIDER: "openai_controlled",
-        TRANSLATION_MODE: "instant",
-        OPENAI_API_KEY: "openai-test-key",
-        EVIDENCE_PROFILE: "in_memory",
-      }),
-      /Invalid option/u,
-    );
-  });
-
-  it("keeps media selection independent from translation provider selection", () => {
-    const config = loadConfig({
-      TRANSLATION_PROVIDER: "openai_native",
-      TRANSLATION_MODE: "fast",
-      OPENAI_API_KEY: "openai-test-key",
-      MEDIA_PROFILE: "fake_telephony",
-      EVIDENCE_PROFILE: "in_memory",
-    });
-
     assert.equal(config.mediaProfile, "fake_telephony");
-    assert.equal(config.translationProvider, "openai_native");
-    assert.equal(config.translationMode, "fast");
+    assert.match(config.processingProfile.path, /workspace[\\/]profiles[\\/]poc\.json$/u);
+    assert.equal(config.processingProfile.expectedSha256, "a".repeat(64));
+    assert.equal(config.deploymentBuildSha256, "b".repeat(64));
+    assert.equal(config.openaiApiKey, "openai-test-key");
+    assert.equal(config.palabraApiKey, "palabra-test-key");
+    assert.equal(config.retentionOwner.id, "retention-owner");
+    assert.equal(config.evidenceReviewer.id, "evidence-reviewer");
+    assert.equal(config.evidence.rootKey.equals(Buffer.alloc(32, 7)), true);
+    assert.equal(config.strictSecurityAncestors, true);
+    assert.match(config.evidence.archiveDirectory, /workspace[\\/]data[\\/]evidence[\\/]archive$/u);
+    assert.match(config.evidence.keyDirectory, /workspace[\\/]data[\\/]evidence[\\/]keys$/u);
+    assert.match(config.evidence.exportDirectory, /workspace[\\/]data[\\/]evidence[\\/]exports$/u);
+    assert.match(config.evidence.receiptDirectory, /workspace[\\/]data[\\/]evidence[\\/]receipts$/u);
+    assert.equal("translationProvider" in config, false);
+    assert.equal("translationMode" in config, false);
+    assert.equal("openaiRealtimeModel" in config, false);
+    assert.equal("evidenceKey" in config, false);
   });
 
-  it("validates Palabra input chunk pacing", () => {
-    const config = loadConfig({
-      TRANSLATION_PROVIDER: "palabra",
-      PALABRA_API_KEY: "palabra-test-key",
-      PALABRA_INPUT_CHUNK_MS: "280",
-      EVIDENCE_PROFILE: "in_memory",
-    });
-    assert.equal(config.palabraInputChunkMs, 280);
-    assert.throws(
-      () => loadConfig({
-        TRANSLATION_PROVIDER: "palabra",
-        PALABRA_API_KEY: "palabra-test-key",
-        PALABRA_INPUT_CHUNK_MS: "21",
-        EVIDENCE_PROFILE: "in_memory",
-      }),
-      /multiple of 20/u,
-    );
-  });
+  it("allows plaintext public URLs only for exact local loopback hosts", () => {
+    for (const publicBaseUrl of [
+      "http://localhost:4207",
+      "http://127.0.0.1:4207",
+      "http://[::1]:4207",
+    ]) {
+      const config = loadConfig(deploymentEnvironment({ PUBLIC_BASE_URL: publicBaseUrl }));
+      assert.equal(config.publicBaseUrl.protocol, "http:");
+      assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(config.publicBaseUrl.hostname));
+    }
 
-  it("accepts a strong configured operator token and rejects weak values", () => {
-    const operatorToken = "operator-" + "x".repeat(32);
-    const config = loadConfig({
-      OPERATOR_TOKEN: operatorToken,
-      OPENAI_API_KEY: "openai-test-key",
-      EVIDENCE_PROFILE: "in_memory",
-    });
-
-    assert.equal(config.operatorToken, operatorToken);
-    assert.throws(
-      () => loadConfig({
-        OPERATOR_TOKEN: "too-short",
-        OPENAI_API_KEY: "openai-test-key",
-        EVIDENCE_PROFILE: "in_memory",
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof ZodError);
-        assert.match(error.message, /32/u);
-        return true;
-      },
-    );
-  });
-
-  it("requires a 32-byte evidence key for encrypted recording", () => {
-    assert.throws(
-      () => loadConfig({
-        OPENAI_API_KEY: "openai-test-key",
-        EVIDENCE_PROFILE: "encrypted_local",
-        EVIDENCE_KEY_BASE64: Buffer.alloc(16).toString("base64"),
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof ZodError);
-        assert.match(error.message, /exactly 32 bytes/u);
-        return true;
-      },
-    );
-  });
-
-  it("decodes the evidence key without exposing it in other config fields", () => {
-    const config = loadConfig({
-      OPENAI_API_KEY: "openai-test-key",
-      EVIDENCE_PROFILE: "encrypted_local",
-      EVIDENCE_KEY_BASE64: validKey,
-    });
-
-    assert.equal(config.evidenceKey?.byteLength, 32);
-    assert.equal(config.evidenceKey?.equals(Buffer.alloc(32, 7)), true);
-  });
-
-  it("requires the TLS certificate and key as a pair", () => {
-    assert.throws(
-      () => loadConfig({
-        OPENAI_API_KEY: "openai-test-key",
-        EVIDENCE_PROFILE: "in_memory",
-        TLS_CERT_PATH: "cert.pem",
-      }),
-      /TLS_CERT_PATH and TLS_KEY_PATH/u,
-    );
-  });
-
-  it("resolves optional TLS files for a secure two-phone LAN demo", () => {
-    const config = loadConfig(
-      {
-        OPENAI_API_KEY: "openai-test-key",
-        EVIDENCE_PROFILE: "in_memory",
+    const remoteConfig = loadConfig(
+      deploymentEnvironment({
+        PUBLIC_BASE_URL: "https://relay.example.test:4207",
+        HOST: "0.0.0.0",
+        SECURITY_DATA_DIRECTORY: "C:/fast-translation-security",
+        EVIDENCE_ARCHIVE_DIRECTORY: "C:/fast-translation-security/evidence/archive",
+        EVIDENCE_KEY_DIRECTORY: "C:/fast-translation-security/evidence/keys",
+        EVIDENCE_EXPORT_DIRECTORY: "C:/fast-translation-security/evidence/exports",
+        EVIDENCE_RECEIPT_DIRECTORY: "C:/fast-translation-security/evidence/receipts",
+        GLOSSARY_DIRECTORY: "C:/fast-translation-security/glossaries",
         TLS_CERT_PATH: "certs/lan.pem",
         TLS_KEY_PATH: "certs/lan-key.pem",
+      }),
+      "C:/workspace",
+    );
+    assert.equal(remoteConfig.publicBaseUrl.protocol, "https:");
+    assert.equal(remoteConfig.strictSecurityAncestors, true);
+  });
+
+  it("allows an explicit insecure data-boundary opt-out only for loopback HTTP", () => {
+    const config = loadConfig(
+      deploymentEnvironment({ ALLOW_INSECURE_LOOPBACK_DATA_BOUNDARY: "true" }),
+      "C:/workspace",
+    );
+    assert.equal(config.strictSecurityAncestors, false);
+
+    assert.throws(
+      () => loadConfig({
+        ...deploymentEnvironment({
+          PUBLIC_BASE_URL: "https://relay.example.test:4207",
+          ALLOW_INSECURE_LOOPBACK_DATA_BOUNDARY: "true",
+          SECURITY_DATA_DIRECTORY: "C:/fast-translation-security",
+          EVIDENCE_ARCHIVE_DIRECTORY: "C:/fast-translation-security/evidence/archive",
+          EVIDENCE_KEY_DIRECTORY: "C:/fast-translation-security/evidence/keys",
+          EVIDENCE_EXPORT_DIRECTORY: "C:/fast-translation-security/evidence/exports",
+          EVIDENCE_RECEIPT_DIRECTORY: "C:/fast-translation-security/evidence/receipts",
+          GLOSSARY_DIRECTORY: "C:/fast-translation-security/glossaries",
+          TLS_CERT_PATH: "certs/lan.pem",
+          TLS_KEY_PATH: "certs/lan-key.pem",
+        }),
+      }, "C:/workspace"),
+      /ALLOW_INSECURE_LOOPBACK_DATA_BOUNDARY.*loopback HTTP/u,
+    );
+  });
+
+  it("requires plaintext HTTP to bind only to an exact numeric loopback address", () => {
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ HOST: undefined })),
+      /HOST.*exact numeric loopback/u,
+    );
+    for (const host of ["0.0.0.0", "::", "192.0.2.10", "localhost"]) {
+      assert.throws(
+        () => loadConfig(deploymentEnvironment({ HOST: host })),
+        /HOST.*exact numeric loopback/u,
+      );
+    }
+    for (const host of ["127.0.0.1", "::1", "[::1]"]) {
+      const config = loadConfig(deploymentEnvironment({ HOST: host }));
+      assert.equal(config.host, host);
+    }
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({
+        HOST: "0.0.0.0",
+        ALLOW_INSECURE_LOOPBACK_DATA_BOUNDARY: "true",
+      })),
+      /HOST.*exact numeric loopback/u,
+    );
+  });
+
+  it("rejects public URLs that could send participant grants over an unsafe transport", () => {
+    for (const publicBaseUrl of [
+      "http://relay.example.test:4207",
+      "http://192.0.2.10:4207",
+      "http://127.1:4207",
+      "ftp://relay.example.test:4207",
+      "https://participant:grant@relay.example.test:4207",
+      "https://relay.example.test:4207/#access=participant-grant",
+      "https://relay.example.test:4207/#",
+    ]) {
+      assert.throws(
+        () => loadConfig(deploymentEnvironment({ PUBLIC_BASE_URL: publicBaseUrl })),
+        /PUBLIC_BASE_URL/u,
+      );
+    }
+  });
+
+  it("requires the deployment-pinned profile, role credentials, and encrypted evidence controls", () => {
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ PROCESSING_PROFILE_PATH: undefined })),
+      /PROCESSING_PROFILE_PATH/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ PROCESSING_PROFILE_SHA256: undefined })),
+      /PROCESSING_PROFILE_SHA256/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ DEPLOYMENT_BUILD_SHA256: undefined })),
+      /DEPLOYMENT_BUILD_SHA256/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ RETENTION_OWNER_TOKEN: undefined })),
+      /RETENTION_OWNER_TOKEN/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_ARCHIVE_DIRECTORY: undefined })),
+      /EVIDENCE_ARCHIVE_DIRECTORY/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_ROOT_KEY_BASE64: undefined })),
+      /EVIDENCE_ROOT_KEY_BASE64/u,
+    );
+  });
+
+  it("rejects a non-canonical profile hash and root key", () => {
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ PROCESSING_PROFILE_SHA256: "A".repeat(64) })),
+      /PROCESSING_PROFILE_SHA256/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ DEPLOYMENT_BUILD_SHA256: "B".repeat(64) })),
+      /DEPLOYMENT_BUILD_SHA256/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_ROOT_KEY_BASE64: rootKey.slice(0, -1) + "!" })),
+      /EVIDENCE_ROOT_KEY_BASE64/u,
+    );
+  });
+
+  it("keeps owner, reviewer, and operator secrets distinct and evidence directories disjoint", () => {
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_REVIEWER_TOKEN: "owner-" + "a".repeat(32) })),
+      /must be distinct/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ RETENTION_OWNER_TOKEN: "operator-" + "o".repeat(32) })),
+      /must be distinct/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_REVIEWER_ID: "retention-owner" })),
+      /must be distinct/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_KEY_DIRECTORY: "data/evidence/archive/keys" })),
+      /must be distinct and non-nested/u,
+    );
+  });
+
+  it("accepts five distinct roots beneath the dedicated data parent, including absolute deployment paths", () => {
+    const cwd = "C:/workspace";
+    const dataParent = resolve(cwd, "data");
+    const config = loadConfig(
+      deploymentEnvironment({
+        EVIDENCE_ARCHIVE_DIRECTORY: join(dataParent, "managed", "archive"),
+        EVIDENCE_KEY_DIRECTORY: join(dataParent, "managed", "keys"),
+        EVIDENCE_EXPORT_DIRECTORY: join(dataParent, "managed", "exports"),
+        EVIDENCE_RECEIPT_DIRECTORY: join(dataParent, "managed", "receipts"),
+        GLOSSARY_DIRECTORY: join(dataParent, "managed", "glossaries"),
+      }),
+      cwd,
+    );
+
+    assert.match(config.evidence.archiveDirectory, /workspace[\\/]data[\\/]managed[\\/]archive$/u);
+    assert.match(config.glossaryDirectory, /workspace[\\/]data[\\/]managed[\\/]glossaries$/u);
+  });
+
+  it("rejects a security root that overlaps the resolved web static root", () => {
+    assert.throws(
+      () => loadConfig(
+        deploymentEnvironment({
+          SECURITY_DATA_DIRECTORY: "C:/workspace",
+          EVIDENCE_ARCHIVE_DIRECTORY: "C:/workspace/web/evidence",
+        }),
+        "C:/workspace",
+      ),
+      /web static root/u,
+    );
+  });
+
+  for (const [name, directory] of [
+    ["C filesystem root", parse("C:/workspace").root],
+    ["D filesystem root", parse("D:/workspace").root],
+    ["deployment cwd", "C:/workspace"],
+    ["cwd ancestor", dirname("C:/workspace")],
+    ["user home", homedir()],
+    ["dedicated data parent", resolve("C:/workspace", "data")],
+  ] as const) {
+    it(`rejects a ${name} as a recursive security root`, () => {
+      assert.throws(
+        () => loadConfig(
+          deploymentEnvironment({ EVIDENCE_ARCHIVE_DIRECTORY: directory }),
+          "C:/workspace",
+        ),
+        /security (?:data|root)|filesystem root|strict descendant|deployment cwd/u,
+      );
+    });
+  }
+
+  for (const [evidenceRootName, evidenceDirectoryVariable] of glossaryEvidenceDirectoryOverlapCases) {
+    const evidenceRoot = `data/security-roots/${evidenceRootName}`;
+    const overlapCases = [
+      {
+        name: "equals",
+        evidenceDirectory: evidenceRoot,
+        glossaryDirectory: evidenceRoot,
       },
+      {
+        name: "contains",
+        evidenceDirectory: `${evidenceRoot}/evidence`,
+        glossaryDirectory: evidenceRoot,
+      },
+      {
+        name: "is contained by",
+        evidenceDirectory: evidenceRoot,
+        glossaryDirectory: `${evidenceRoot}/glossary`,
+      },
+    ] as const;
+
+    for (const overlapCase of overlapCases) {
+      it(`rejects a glossary directory that ${overlapCase.name} the ${evidenceRootName} evidence root`, () => {
+        assert.throws(
+          () => loadConfig(
+            deploymentEnvironment({
+              [evidenceDirectoryVariable]: overlapCase.evidenceDirectory,
+              GLOSSARY_DIRECTORY: overlapCase.glossaryDirectory,
+            }),
+            "C:/workspace",
+          ),
+          /Glossary directory must be a distinct and non-nested security root/u,
+        );
+      });
+    }
+  }
+
+  it("rejects obsolete environment routes rather than silently retaining compatibility", () => {
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ TRANSLATION_PROFILE: "controlled_poc" })),
+      /TRANSLATION_PROFILE/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ TRANSLATION_PROVIDER: "palabra" })),
+      /TRANSLATION_PROVIDER/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ OPENAI_TTS_VOICE: "marin" })),
+      /OPENAI_TTS_VOICE/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_DIRECTORY: "data/evidence" })),
+      /EVIDENCE_DIRECTORY/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_KEY_BASE64: rootKey })),
+      /EVIDENCE_KEY_BASE64/u,
+    );
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ EVIDENCE_MIN_FREE_BYTES: "1073741824" })),
+      /EVIDENCE_MIN_FREE_BYTES/u,
+    );
+  });
+
+  it("requires the TLS certificate and key together and resolves both from the deployment cwd", () => {
+    assert.throws(
+      () => loadConfig(deploymentEnvironment({ TLS_CERT_PATH: "certs/lan.pem" })),
+      /TLS_CERT_PATH and TLS_KEY_PATH/u,
+    );
+
+    const config = loadConfig(
+      deploymentEnvironment({
+        TLS_CERT_PATH: "certs/lan.pem",
+        TLS_KEY_PATH: "certs/lan-key.pem",
+      }),
       "C:/workspace",
     );
     assert.match(config.tlsCertPath ?? "", /workspace[\\/]certs[\\/]lan\.pem$/u);
     assert.match(config.tlsKeyPath ?? "", /workspace[\\/]certs[\\/]lan-key\.pem$/u);
+  });
+
+  it("requires TLS files for remote HTTPS and keeps them outside the web static root", () => {
+    assert.throws(
+      () => loadConfig(
+        deploymentEnvironment({ PUBLIC_BASE_URL: "https://relay.example.test:4207" }),
+        "C:/workspace",
+      ),
+      /TLS_CERT_PATH and TLS_KEY_PATH.*required.*HTTPS/u,
+    );
+    assert.throws(
+      () => loadConfig(
+        deploymentEnvironment({
+          PUBLIC_BASE_URL: "https://relay.example.test:4207",
+          TLS_CERT_PATH: "certs/server-cert.pem",
+          TLS_KEY_PATH: "certs/server-key.pem",
+        }),
+        "C:/workspace",
+      ),
+      /SECURITY_DATA_DIRECTORY.*absolute.*outside.*cwd/u,
+    );
+    assert.throws(
+      () => loadConfig(
+        deploymentEnvironment({
+          PUBLIC_BASE_URL: "https://relay.example.test:4207",
+          SECURITY_DATA_DIRECTORY: "C:/fast-translation-security",
+          EVIDENCE_ARCHIVE_DIRECTORY: "C:/fast-translation-security/evidence/archive",
+          EVIDENCE_KEY_DIRECTORY: "C:/fast-translation-security/evidence/keys",
+          EVIDENCE_EXPORT_DIRECTORY: "C:/fast-translation-security/evidence/exports",
+          EVIDENCE_RECEIPT_DIRECTORY: "C:/fast-translation-security/evidence/receipts",
+          GLOSSARY_DIRECTORY: "C:/fast-translation-security/glossaries",
+          TLS_CERT_PATH: "web/server-cert.pem",
+          TLS_KEY_PATH: "certs/server-key.pem",
+        }),
+        "C:/workspace",
+      ),
+      /web static root/u,
+    );
   });
 });

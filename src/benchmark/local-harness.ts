@@ -1,5 +1,6 @@
 import { CANONICAL_AUDIO, createAudioFrame, destinationForLane, laneFromSource } from "../core/audio.js";
 import { AsyncQueue } from "../core/async-queue.js";
+import { compileGlossaryPair, type CompiledGlossary } from "../core/glossary.js";
 import { ModularGuardedDuplexRelay } from "../core/relay.js";
 import {
   resolveTranslationBehavior,
@@ -10,6 +11,7 @@ import {
 import type {
   AudioFrame,
   EvidenceAudioTrack,
+  EvidenceFinalization,
   EvidencePort,
   EvidenceRecord,
   GenerationRef,
@@ -27,10 +29,21 @@ import type {
   Side,
   TranslationEvent,
   TranslationCapabilities,
+  TranslationPreparation,
   TranslationPort,
   TranslationRequest,
 } from "../core/types.js";
+import { InMemoryEvidenceStore } from "../adapters/evidence/in-memory.js";
 import { createLocalEvalTranslationAdapter } from "../adapters/translation/local-eval.js";
+import { createOpaqueEvidenceRef } from "../adapters/translation/evidence-ref.js";
+import {
+  validateEvidenceFinalization,
+  type EvidenceFinalizationExpectation,
+} from "../core/evidence-lifecycle.js";
+import {
+  createSyntheticPocProcessingManifest,
+  createSyntheticPocProcessingProfile,
+} from "../local-eval/synthetic-poc-processing-manifest.js";
 import type { HealingProfile } from "./healing.js";
 import type { ExecutableFixture, ExecutableRun, ExecutableSchedule } from "./executable-manifest.js";
 import type { BenchmarkObservation } from "./runner.js";
@@ -54,11 +67,22 @@ export type LocalHarnessExecutor = (
   input: LocalHarnessExecutionInput,
 ) => Promise<BenchmarkObservation>;
 
+export class TerminalEvidenceIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TerminalEvidenceIntegrityError";
+  }
+}
+
 /**
  * Sparse positions per direction across the virtual ten-minute timeline.
  * These are the only PCM frames sent to the local relay for this fixture.
  */
 const VIRTUAL_SOAK_SAMPLES_PER_LANE = 30;
+const LOCAL_FIXTURE_PREPARATION: TranslationPreparation = Object.freeze({
+  readiness: "fixture_local",
+  remoteConnection: "not_applicable",
+});
 
 class MonotonicHarnessClock {
   #value = 1_000;
@@ -187,9 +211,7 @@ class HarnessMedia implements MediaPort {
   }
 }
 
-class HarnessEvidence implements EvidencePort {
-  readonly #captureAudio: boolean;
-  readonly records: EvidenceRecord[] = [];
+class HarnessEvidence extends InMemoryEvidenceStore<EvidenceRecord> implements EvidencePort {
   readonly audioCounts: Record<EvidenceAudioTrack, number> = {
     source_a: 0,
     source_b: 0,
@@ -200,11 +222,8 @@ class HarnessEvidence implements EvidencePort {
   readonly alertCodes: string[] = [];
   timelineOrderViolation = false;
 
-  constructor(captureAudio = true) {
-    this.#captureAudio = captureAudio;
-  }
-
-  record(record: EvidenceRecord): boolean {
+  override async persist(record: EvidenceRecord): Promise<void> {
+    await super.persist(record);
     if (record.type === "audio") {
       this.audioCounts[record.track] += 1;
       const previous = this.#lastTimeline[record.track];
@@ -212,20 +231,15 @@ class HarnessEvidence implements EvidencePort {
         this.timelineOrderViolation = true;
       }
       this.#lastTimeline[record.track] = record.timelineAtMonoMs;
-      if (this.#captureAudio) this.records.push(structuredClone(record));
-      return true;
+      return;
     }
-    if (record.event.type === "alert") {
+    if (record.type === "session_event" && record.event.type === "alert") {
       this.alertCodes.push(record.event.alert.code);
     }
-    this.records.push(structuredClone(record));
-    return true;
   }
 
-  async close(_sessionId: string): Promise<void> {}
-
   events(): readonly SessionEvent[] {
-    return this.records.flatMap((record) =>
+    return this.records().flatMap((record) =>
       record.type === "session_event" ? [record.event] : []
     );
   }
@@ -233,7 +247,7 @@ class HarnessEvidence implements EvidencePort {
   audio(
     track: EvidenceAudioTrack,
   ): readonly Extract<EvidenceRecord, { type: "audio" }>[] {
-    return this.records.filter(
+    return this.records().filter(
       (record): record is Extract<EvidenceRecord, { type: "audio" }> =>
         record.type === "audio" && record.track === track,
     );
@@ -243,21 +257,69 @@ class HarnessEvidence implements EvidencePort {
 class StreamingEchoTranslation implements TranslationPort {
   readonly capabilities: TranslationCapabilities = Object.freeze({
     providerId: "openai_controlled",
-    supportedModes: Object.freeze([
-      Object.freeze({ mode: "fast", behaviorVersion: 1, deterministicGlossary: true }),
-      Object.freeze({ mode: "accurate", behaviorVersion: 1, deterministicGlossary: true }),
+    modes: Object.freeze([
+      Object.freeze({
+        mode: "fast",
+        behaviorVersion: 1,
+        state: "locally_controlled",
+        deterministicGlossary: false,
+      }),
+      Object.freeze({
+        mode: "balanced",
+        behaviorVersion: 1,
+        state: "locally_controlled",
+        deterministicGlossary: false,
+      }),
+      Object.freeze({
+        mode: "accurate",
+        behaviorVersion: 1,
+        state: "locally_controlled",
+        deterministicGlossary: false,
+      }),
     ]),
     supportsProvisionalRevisions: true,
     supportsFinality: true,
     supportsCancellation: true,
-    supportsDeterministicGlossary: true,
+    supportsDeterministicGlossary: false,
   });
 
-  async prepare(_context: import("../core/types.js").LaneContext): Promise<void> {}
+  async prepare(
+    _context: import("../core/types.js").LaneContext,
+  ): Promise<TranslationPreparation> {
+    return LOCAL_FIXTURE_PREPARATION;
+  }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
+    const targetSegmentId = request.context.turnId + ":target_transcript";
+    const targetRevision = 0;
+    // Emit the owning target transcript first, then carry its exact identity
+    // and revision on every audio event; audio names are never parsed for
+    // correlation.
+    let targetTranscriptEmitted = false;
     for await (const frame of request.frames) {
       if (request.signal.aborted) return;
+      if (!targetTranscriptEmitted) {
+        targetTranscriptEmitted = true;
+        yield {
+          kind: "target_transcript",
+          sessionId: request.context.sessionId,
+          lane: request.context.lane,
+          generation: request.context.generation,
+          turnId: request.context.turnId,
+          segmentId: targetSegmentId,
+          revision: targetRevision,
+          finality: "final",
+          evidenceRef: createOpaqueEvidenceRef("benchmark_local_harness", [
+            request.context.sessionId,
+            request.context.lane,
+            request.context.generation,
+            request.context.turnId,
+            "target_transcript",
+          ]),
+          emittedAtMs: frame.capturedAtMs,
+          text: "[local echo target]",
+        };
+      }
       yield {
         kind: "audio",
         sessionId: request.context.sessionId,
@@ -265,8 +327,16 @@ class StreamingEchoTranslation implements TranslationPort {
         generation: request.context.generation,
         turnId: request.context.turnId,
         segmentId: "echo-audio-" + frame.sequence,
-        revision: 0,
+        revision: targetRevision,
         finality: "final",
+        targetSegmentId,
+        evidenceRef: createOpaqueEvidenceRef("benchmark_local_harness", [
+          request.context.sessionId,
+          request.context.lane,
+          request.context.generation,
+          request.context.turnId,
+          frame.sequence,
+        ]),
         emittedAtMs: frame.capturedAtMs,
         playoutSequence: frame.sequence,
         frame: createAudioFrame({
@@ -284,14 +354,55 @@ class StreamingEchoTranslation implements TranslationPort {
 
 }
 
+class ObservedTranslation implements TranslationPort {
+  readonly capabilities: TranslationCapabilities;
+  readonly #delegate: TranslationPort;
+  readonly #evidenceRefs: string[] = [];
+
+  constructor(delegate: TranslationPort) {
+    this.#delegate = delegate;
+    this.capabilities = delegate.capabilities;
+  }
+
+  async prepare(
+    context: import("../core/types.js").LaneContext,
+  ): Promise<TranslationPreparation> {
+    await this.#delegate.prepare(context);
+    return LOCAL_FIXTURE_PREPARATION;
+  }
+
+  async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
+    for await (const event of this.#delegate.translate(request)) {
+      this.#evidenceRefs.push(event.evidenceRef);
+      yield event;
+    }
+  }
+
+  async cancel(generation: GenerationRef): Promise<void> {
+    await this.#delegate.cancel(generation);
+  }
+
+  async closeSession(sessionId: string): Promise<void> {
+    await this.#delegate.closeSession(sessionId);
+  }
+
+  evidenceRefs(): readonly string[] {
+    return Object.freeze([...this.#evidenceRefs]);
+  }
+}
+
 
 
 interface RunningHarness {
   readonly relay: ModularGuardedDuplexRelay;
   readonly media: HarnessMedia;
   readonly evidence: HarnessEvidence;
+  readonly translation: ObservedTranslation;
   readonly clock: MonotonicHarnessClock;
   readonly sessionId: string;
+  /** Runtime glossary entries keyed by lane; ids are opaque compiled ids. */
+  readonly compiledGlossaries?: Readonly<Record<Lane, CompiledGlossary>>;
+  readonly evidenceFinalizationExpectation: EvidenceFinalizationExpectation;
 }
 
 function approvedGlossary(profile: HealingProfile, profileHash: string): GlossarySpec {
@@ -349,11 +460,14 @@ async function startHarness(input: Readonly<{
       : { captureFrames: input.captureAudio }),
     ...(input.holdFirst === undefined ? {} : { holdFirst: input.holdFirst }),
   });
-  const evidence = new HarnessEvidence(input.captureAudio ?? true);
+  const evidence = new HarnessEvidence();
+  const translation = new ObservedTranslation(input.translation);
+  const processingProfile = createSyntheticPocProcessingProfile();
   const relay = new ModularGuardedDuplexRelay({
     media,
-    translation: input.translation,
+    translation,
     evidence,
+    processingProfile,
     now: clock.now,
     createSessionId: () => "benchmark-local-session",
     endpointGrant: (_sessionId, side) => ({
@@ -363,14 +477,60 @@ async function startHarness(input: Readonly<{
       qrDataUrl: "local-qr",
     }),
   });
+  const glossary = input.translation.capabilities.supportsDeterministicGlossary &&
+      input.translation.capabilities.modes.some((capability) =>
+        capability.mode === input.mode && capability.deterministicGlossary)
+    ? approvedGlossary(input.approvedProfile, input.approvedProfileHash)
+    : undefined;
+  const compiledGlossaryPair = glossary === undefined
+    ? undefined
+    : compileGlossaryPair(glossary);
+  const processingManifest = createSyntheticPocProcessingManifest({
+    mode: input.mode,
+    ...(glossary === undefined ? {} : { glossary }),
+  });
   const snapshot = await relay.open({
     sideA: { language: "en-US" },
     sideB: { language: "zh-TW" },
     provider: input.provider,
     mode: input.mode,
-    glossary: approvedGlossary(input.approvedProfile, input.approvedProfileHash),
+    processingManifest,
+    evidenceReviewGrant: {
+      dataOwnerId: "test-data-owner",
+      bilingualReviewerId: "test-bilingual-reviewer",
+    },
+    ...(glossary === undefined ? {} : { glossary }),
     maxQueueFrames: input.maxQueueFrames ?? 64,
   });
+  for (const side of ["A", "B"] as const) {
+    await relay.command(snapshot.sessionId, {
+      type: "participant_consent",
+      commandId: "benchmark-consent-" + side,
+      side,
+      consentId: "benchmark-consent-id-" + side,
+      consentPolicyRef: processingManifest.consentPolicyRef,
+      recording: true,
+      processing: true,
+    });
+  }
+  const connectedSides = new Set<Side>();
+  const connectionAbortController = new AbortController();
+  const connectionIterator = relay.events(
+    snapshot.sessionId,
+    0,
+    connectionAbortController.signal,
+  )[Symbol.asyncIterator]();
+  const waitForConnections = (async (): Promise<void> => {
+    while (true) {
+      const result = await connectionIterator.next();
+      if (result.done) return;
+      const event = result.value;
+      if (event.type !== "participant_state" || !event.connected) continue;
+      connectedSides.add(event.side);
+      if (connectedSides.size === 2) return;
+    }
+  })();
+  void waitForConnections.catch(() => undefined);
   for (const side of ["A", "B"] as const) {
     media.push({
       type: "participant_state",
@@ -380,6 +540,33 @@ async function startHarness(input: Readonly<{
       connected: true,
     });
   }
+  try {
+    await waitUntil(
+      () => connectedSides.size === 2,
+      "local Harness participants did not connect",
+    );
+    await waitForConnections;
+  } finally {
+    connectionAbortController.abort();
+    void Promise.resolve()
+      .then(() => connectionIterator.return?.())
+      .catch(() => undefined);
+  }
+  for (const side of ["A", "B"] as const) {
+    media.push({
+      type: "participant_readiness",
+      sessionId: snapshot.sessionId,
+      side,
+      timestampMonoMs: clock.now(),
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+      source: "participant_browser_self_report",
+    });
+  }
+  await relay.command(snapshot.sessionId, {
+    type: "arm_recorder",
+    commandId: "benchmark-arm-recorder",
+  });
   await waitUntil(
     () => relay.snapshot(snapshot.sessionId).status === "ready",
     "local Harness participants did not become ready",
@@ -392,21 +579,88 @@ async function startHarness(input: Readonly<{
     () => relay.snapshot(snapshot.sessionId).status === "active",
     "local Harness did not become active",
   );
+  const evidenceFinalizationExpectation: EvidenceFinalizationExpectation = Object.freeze({
+    sessionId: snapshot.sessionId,
+    processingManifestSha256: snapshot.spec.processingManifest.manifestSha256,
+    retentionPolicy: snapshot.spec.processingManifest.retentionPolicy,
+  });
   return Object.freeze({
     relay,
     media,
     evidence,
+    translation,
     clock,
     sessionId: snapshot.sessionId,
+    ...(compiledGlossaryPair === undefined
+      ? {}
+      : {
+          compiledGlossaries: Object.freeze({
+            A_TO_B: compiledGlossaryPair.forward,
+            B_TO_A: compiledGlossaryPair.reverse,
+          }),
+        }),
+    evidenceFinalizationExpectation,
   });
 }
 
-async function endHarness(harness: RunningHarness): Promise<void> {
+async function endHarness(harness: RunningHarness): Promise<EvidenceFinalization> {
   await harness.relay.command(harness.sessionId, {
     type: "end",
     commandId: "benchmark-end",
     reason: "local benchmark run complete",
   });
+  const finalization = harness.relay.snapshot(harness.sessionId).evidenceFinalization;
+  if (finalization === undefined) {
+    throw new TerminalEvidenceIntegrityError(
+      "local Harness did not produce evidence finalization",
+    );
+  }
+  try {
+    validateEvidenceFinalization(finalization, harness.evidenceFinalizationExpectation);
+  } catch (error: unknown) {
+    throw new TerminalEvidenceIntegrityError(
+      error instanceof Error
+        ? `local Harness produced invalid evidence finalization: ${error.message}`
+        : "local Harness produced invalid evidence finalization",
+    );
+  }
+  if (finalization.status !== "sealed") {
+    throw new TerminalEvidenceIntegrityError(
+      "local Harness evidence finalization did not seal",
+    );
+  }
+  return finalization;
+}
+
+async function withHarnessEnd<T>(
+  harness: RunningHarness,
+  operation: (end: () => Promise<EvidenceFinalization>) => Promise<T>,
+): Promise<T> {
+  let endPromise: Promise<EvidenceFinalization> | undefined;
+  const end = (): Promise<EvidenceFinalization> => {
+    endPromise ??= endHarness(harness);
+    return endPromise;
+  };
+  let primaryFailed = false;
+  let primaryError: unknown;
+  try {
+    return await operation(end);
+  } catch (error: unknown) {
+    primaryFailed = true;
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await end();
+    } catch (cleanupError: unknown) {
+      if (!primaryFailed) throw cleanupError;
+      if (cleanupError === primaryError) throw primaryError;
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        "local Harness operation and cleanup both failed",
+      );
+    }
+  }
 }
 
 function pushSpeech(
@@ -476,21 +730,36 @@ function eventForLane(
   return events.findLast((event) => event.type === type && event.lane === lane);
 }
 
+async function liveRelayJournal(harness: RunningHarness): Promise<readonly SessionEvent[]> {
+  const cursor = harness.relay.snapshot(harness.sessionId).eventCursor;
+  const events: SessionEvent[] = [];
+  for await (const event of harness.relay.events(harness.sessionId)) {
+    events.push(event);
+    if (event.cursor >= cursor) break;
+  }
+  return Object.freeze(events);
+}
+
 function playoutTrack(lane: Lane): EvidenceAudioTrack {
   return destinationForLane(lane) === "A" ? "playout_to_a" : "playout_to_b";
 }
 
 function sourceTextsForEntries(
-  profile: HealingProfile,
+  compiledGlossaries: Readonly<Record<Lane, CompiledGlossary>> | undefined,
   entryIds: readonly string[],
   lane: Lane,
 ): readonly string[] {
+  if (entryIds.length === 0) return Object.freeze([]);
+  const compiledGlossary = compiledGlossaries?.[lane];
+  if (compiledGlossary === undefined) {
+    throw new Error("bound glossary entries are unavailable");
+  }
   return Object.freeze(entryIds.map((entryId) => {
-    const entry = profile.glossary.find((candidate) => candidate.id === entryId);
+    const entry = compiledGlossary.entries.find((candidate) => candidate.id === entryId);
     if (entry === undefined) {
-      throw new Error("unknown bound glossary entry " + entryId);
+      throw new Error("unknown bound glossary entry");
     }
-    return lane === "A_TO_B" ? entry.source : entry.targetExact;
+    return entry.source;
   }));
 }
 
@@ -532,6 +801,7 @@ async function runFixtureObservation(
   if (fixture.scenario === "discovery") {
     throw new Error(input.run.runId + " cannot execute a discovery fixture locally");
   }
+  const scenario = fixture.scenario;
   const lane: Lane = fixture.direction;
   const sourceSide: Side = lane === "A_TO_B" ? "A" : "B";
   const targetSide = destinationForLane(lane);
@@ -552,7 +822,7 @@ async function runFixtureObservation(
     approvedProfileHash: input.approvedProfileHash,
     ...(input.mediaMode === undefined ? {} : { mediaMode: input.mediaMode }),
   });
-  try {
+  return withHarnessEnd(harness, async (endHarnessOnce) => {
     const speechOnset = pushSpeech(harness, sourceSide, "speech_started");
     pushFrame(harness, sourceSide, 0);
     pushSpeech(harness, sourceSide, "speech_ended");
@@ -569,11 +839,14 @@ async function runFixtureObservation(
       input.run.runId + " did not traverse the local MediaPort",
     );
 
-    const events = harness.evidence.events();
-    const target = eventForLane(events, lane, "target_transcript");
-    const source = eventForLane(events, lane, "source_transcript");
-    const bound = eventForLane(events, lane, "glossary_bound");
-    const authorized = eventForLane(events, lane, "glossary_authorized");
+    const durableEvents = harness.evidence.events();
+    // Provisional bindings stay live-only; final transcript and authorization
+    // evidence must remain durable before contributing to the release result.
+    const liveEvents = await liveRelayJournal(harness);
+    const target = eventForLane(durableEvents, lane, "target_transcript");
+    const source = eventForLane(durableEvents, lane, "source_transcript");
+    const bound = eventForLane(liveEvents, lane, "glossary_bound");
+    const authorized = eventForLane(durableEvents, lane, "glossary_authorized");
     const playout = harness.evidence.audio(playoutTrack(lane));
     const playoutSequenceContiguous = consecutivePlayoutSequence(playout);
     const alerts = Object.freeze([...harness.evidence.alertCodes]);
@@ -583,7 +856,7 @@ async function runFixtureObservation(
     );
     const entryIds = bound?.entryIds ?? [];
     const matchedSourceTexts = sourceTextsForEntries(
-      input.approvedProfile,
+      harness.compiledGlossaries,
       entryIds,
       lane,
     );
@@ -608,10 +881,11 @@ async function runFixtureObservation(
     }
 
     if (input.run.stage === "formal_terminology") {
+      const evidenceFinalization = await endHarnessOnce();
       return Object.freeze({
         kind: "formal_terminology",
         fixtureId: fixture.fixtureId,
-        scenario: fixture.scenario,
+        scenario,
         actualTargetText,
         targetExactSatisfied,
         termBound: bound !== undefined,
@@ -627,6 +901,9 @@ async function runFixtureObservation(
           targetFinal: target?.final === true,
           playoutSequenceContiguous,
         }),
+        translationEvidenceRefs: harness.translation.evidenceRefs(),
+        evidenceFinalization,
+        evidenceFinalizationExpectation: harness.evidenceFinalizationExpectation,
         alerts,
         elapsedMs: Math.max(0, performance.now() - startedAt),
       });
@@ -634,17 +911,18 @@ async function runFixtureObservation(
     if (input.run.stage !== "latency") {
       throw new Error(input.run.runId + " has a fixture for the wrong stage");
     }
-    if (fixture.scenario !== "protected" && fixture.scenario !== "ordinary") {
+    if (scenario !== "protected" && scenario !== "ordinary") {
       throw new Error(input.run.runId + " has an invalid latency scenario");
     }
     const firstPlayoutAt = playout[0]?.timelineAtMonoMs;
     if (source === undefined || firstPlayoutAt === undefined) {
       throw new Error(input.run.runId + " has incomplete local timing evidence");
     }
+    const evidenceFinalization = await endHarnessOnce();
     return Object.freeze({
       kind: "latency",
       fixtureId: fixture.fixtureId,
-      scenario: fixture.scenario,
+      scenario,
       measurementScope: "local_processing_not_acoustic",
       targetExactSatisfied,
       bindingCount: entryIds.length,
@@ -659,6 +937,9 @@ async function runFixtureObservation(
         targetFinal: target?.final === true,
         playoutSequenceContiguous,
       }),
+      translationEvidenceRefs: harness.translation.evidenceRefs(),
+      evidenceFinalization,
+      evidenceFinalizationExpectation: harness.evidenceFinalizationExpectation,
       alerts,
       metricsMs: Object.freeze({
         speechToAligned: Math.max(0, firstPlayoutAt - speechOnset),
@@ -668,9 +949,7 @@ async function runFixtureObservation(
           : Math.max(0, authorized.timestampMonoMs - bound.timestampMonoMs),
       }),
     });
-  } finally {
-    await endHarness(harness);
-  }
+  });
 }
 
 async function runInterruptionObservation(
@@ -699,7 +978,7 @@ async function runInterruptionObservation(
     holdFirst: true,
     ...(input.mediaMode === undefined ? {} : { mediaMode: input.mediaMode }),
   });
-  try {
+  return withHarnessEnd(harness, async (endHarnessOnce) => {
     pushSpeech(harness, firstSide, "speech_started");
     pushFrame(harness, firstSide, 0);
     pushSpeech(harness, firstSide, "speech_ended");
@@ -753,6 +1032,7 @@ async function runInterruptionObservation(
     const validOutputResumed = harness.evidence
       .audio(resumedTrack)
       .some((record) => record.frame.lane === resumedLane);
+    const evidenceFinalization = await endHarnessOnce();
     return Object.freeze({
       kind: "interruption",
       scheduleId: schedule.scheduleId,
@@ -765,11 +1045,12 @@ async function runInterruptionObservation(
       clearLatencyMs: clear === undefined
         ? Number.POSITIVE_INFINITY
         : Math.max(0, clear.clearedAtMonoMs - interruptionAt),
+      translationEvidenceRefs: harness.translation.evidenceRefs(),
+      evidenceFinalization,
+      evidenceFinalizationExpectation: harness.evidenceFinalizationExpectation,
       alerts: Object.freeze([...harness.evidence.alertCodes]),
     });
-  } finally {
-    await endHarness(harness);
-  }
+  });
 }
 
 async function runSoakObservation(
@@ -796,7 +1077,7 @@ async function runSoakObservation(
     maxQueueFrames: 64,
     ...(input.mediaMode === undefined ? {} : { mediaMode: input.mediaMode }),
   });
-  try {
+  return withHarnessEnd(harness, async (endHarnessOnce) => {
     // Fast mode accepts frames continuously. Speech lifecycle events would invoke
     // the barge-in fence and turn this sampled duplex fixture into an interruption
     // run; the dedicated interruption schedules cover that behavior separately.
@@ -822,6 +1103,7 @@ async function runSoakObservation(
     const trimmed = harness.evidence.alertCodes.some((code) =>
       code === "source_queue_trimmed" || code === "playout_queue_trimmed"
     );
+    const evidenceFinalization = await endHarnessOnce();
     return Object.freeze({
       kind: "continuous_duplex",
       scheduleId: schedule.scheduleId,
@@ -837,11 +1119,12 @@ async function runSoakObservation(
       queuePressureDetected: trimmed || unacknowledgedSampleFrames !== 0 ||
         harness.evidence.timelineOrderViolation,
       checksum: harness.media.playbackChecksum,
+      translationEvidenceRefs: harness.translation.evidenceRefs(),
+      evidenceFinalization,
+      evidenceFinalizationExpectation: harness.evidenceFinalizationExpectation,
       alerts: Object.freeze([...harness.evidence.alertCodes]),
     });
-  } finally {
-    await endHarness(harness);
-  }
+  });
 }
 
 export async function runLocalHarnessObservation(

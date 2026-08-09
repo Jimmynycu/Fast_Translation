@@ -1,5 +1,4 @@
 import WebSocket from "ws";
-import type { GenerationRef } from "../../core/types.js";
 
 export type OpenAIAdapterErrorCode =
   | "aborted"
@@ -31,6 +30,8 @@ export type FetchLike = (
 
 export interface WebSocketLike {
   readonly readyState: number;
+  /** Bytes queued by the WebSocket implementation for outbound writes. */
+  readonly bufferedAmount?: number;
   send(data: string): void;
   close(code?: number, reason?: string): void;
   on(event: "open", listener: () => void): unknown;
@@ -41,6 +42,9 @@ export interface WebSocketLike {
 
 export interface WebSocketConnectOptions {
   readonly headers: Readonly<Record<string, string>>;
+  /** Optional ws transport hardening requested by a provider adapter. */
+  readonly maxPayload?: number;
+  readonly perMessageDeflate?: boolean;
 }
 
 export type WebSocketFactory = (
@@ -49,7 +53,13 @@ export type WebSocketFactory = (
 ) => WebSocketLike;
 
 export const defaultWebSocketFactory: WebSocketFactory = (url, options) =>
-  new WebSocket(url, { headers: options.headers }) as WebSocketLike;
+  new WebSocket(url, {
+    headers: options.headers,
+    ...(options.maxPayload === undefined ? {} : { maxPayload: options.maxPayload }),
+    ...(options.perMessageDeflate === undefined
+      ? {}
+      : { perMessageDeflate: options.perMessageDeflate }),
+  }) as WebSocketLike;
 
 export function requireApiKey(apiKey: string): string {
   if (apiKey.trim().length === 0) {
@@ -505,38 +515,6 @@ export class LocalPlayoutQueue<T> implements AsyncIterable<T> {
       }
     }
   }
-}
-
-/**
- * Relay fences playout by lane and generation rather than by turn. Keep the
- * monotonic counter at that same scope so a provider session can translate
- * several turns without causing the destination worklet to reject later
- * audio as stale.
- */
-export class GenerationPlayoutSequence {
-  readonly #nextByGeneration = new Map<string, number>();
-
-  next(ref: GenerationRef): number {
-    const key = generationSequenceKey(ref);
-    const sequence = this.#nextByGeneration.get(key) ?? 0;
-    this.#nextByGeneration.set(key, sequence + 1);
-    return sequence;
-  }
-
-  clear(ref: GenerationRef): void {
-    this.#nextByGeneration.delete(generationSequenceKey(ref));
-  }
-
-  clearSession(sessionId: string): void {
-    const prefix = sessionId + "\u0000";
-    for (const key of this.#nextByGeneration.keys()) {
-      if (key.startsWith(prefix)) this.#nextByGeneration.delete(key);
-    }
-  }
-}
-
-function generationSequenceKey(ref: GenerationRef): string {
-  return ref.sessionId + "\u0000" + ref.lane + "\u0000" + ref.generation.toString(10);
 }
 
 export type BoundedWindowOffer = "accepted" | "dropped_oldest" | "closed";

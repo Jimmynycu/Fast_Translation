@@ -8,6 +8,7 @@ import type {
   LaneContext,
   TranslationEvent,
   TranslationMode,
+  TranslationPort,
   TranslationTranscriptEvent,
 } from "../src/core/types.js";
 
@@ -52,15 +53,27 @@ function isTranscript(
 }
 
 test("deterministic translation fixture honors every behavior contract", async () => {
-  const adapter = new DeterministicTranslationAdapter({ now: () => 12 });
+  const adapter: TranslationPort = new DeterministicTranslationAdapter({ now: () => 12 });
   assert.deepEqual(
-    adapter.capabilities.supportedModes.map((capability) => capability.mode),
-    ["fast", "balanced", "accurate"],
+    adapter.capabilities.modes.map((capability) => ({
+      mode: capability.mode,
+      state: capability.state,
+      deterministicGlossary: capability.deterministicGlossary,
+    })),
+    [
+      { mode: "fast", state: "locally_controlled", deterministicGlossary: false },
+      { mode: "balanced", state: "locally_controlled", deterministicGlossary: false },
+      { mode: "accurate", state: "locally_controlled", deterministicGlossary: false },
+    ],
   );
+  assert.equal(adapter.capabilities.supportsDeterministicGlossary, false);
 
   for (const [index, mode] of (["fast", "balanced", "accurate"] as const).entries()) {
     const laneContext = context(mode, index + 3);
-    await adapter.prepare(laneContext);
+    assert.deepEqual(
+      await adapter.prepare(laneContext),
+      { readiness: "fixture_local", remoteConnection: "not_applicable" },
+    );
     const events = await collect(adapter.translate({
       context: laneContext,
       frames: frames(laneContext),
@@ -79,6 +92,10 @@ test("deterministic translation fixture honors every behavior contract", async (
 
     assert.ok(events.every((event) => event.turnId === laneContext.turnId));
     assert.deepEqual(audio.map((event) => event.playoutSequence), [0, 1]);
+    assert.ok(audio.every(
+      (event) => event.targetSegmentId === laneContext.turnId + ":target_transcript",
+    ));
+    assert.ok(audio.every((event) => event.revision === target.at(-1)?.revision));
     assert.ok(audio.every((event) => event.finality === "final"));
     assert.equal(completed?.kind, "completed");
     assert.equal(completed?.segmentId, laneContext.turnId + ":completed");
@@ -104,6 +121,30 @@ test("deterministic translation fixture honors every behavior contract", async (
       }
     }
   }
+});
+
+test("deterministic TranslationPort emits stable, opaque, unambiguous evidence references", async () => {
+  const laneContext = context("fast", 12);
+  const firstAdapter: TranslationPort = new DeterministicTranslationAdapter({ now: () => 12 });
+  const secondAdapter: TranslationPort = new DeterministicTranslationAdapter({ now: () => 12 });
+  const first = await collect(firstAdapter.translate({
+    context: laneContext,
+    frames: frames(laneContext),
+    signal: new AbortController().signal,
+  }));
+  const second = await collect(secondAdapter.translate({
+    context: laneContext,
+    frames: frames(laneContext),
+    signal: new AbortController().signal,
+  }));
+  const refs = first.map((event) => event.evidenceRef);
+
+  assert.ok(refs.length > 0);
+  assert.ok(refs.every((ref) => /^deterministic:v1:sha256:[a-f0-9]{64}$/u.test(ref)));
+  assert.equal(new Set(refs).size, refs.length);
+  assert.equal(refs.some((ref) => ref.includes(laneContext.sessionId)), false);
+  assert.equal(refs.some((ref) => ref.includes(laneContext.turnId)), false);
+  assert.deepEqual(refs, second.map((event) => event.evidenceRef));
 });
 
 test("deterministic playout sequence spans back-to-back turns in one generation", async () => {

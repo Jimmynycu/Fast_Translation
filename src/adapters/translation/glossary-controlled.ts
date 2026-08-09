@@ -5,15 +5,24 @@ import {
   type CanonicalAudioFormat,
 } from "../../core/audio.js";
 import type { CompiledGlossary, GlossaryAlert } from "../../core/glossary.js";
+import { GenerationPlayoutSequence } from "../../core/playout-sequence.js";
+import { assertTranslationBehaviorCapability } from "../../core/translation-capabilities.js";
 import type {
   GenerationRef,
   LaneContext,
   TranslationCapabilities,
   TranslationErrorEvent,
   TranslationEvent,
+  TranslationFallbackPolicy,
+  TranslationPreparation,
   TranslationPort,
   TranslationRequest,
 } from "../../core/types.js";
+import {
+  attachTranslationEvidenceRef,
+  type DraftTranslationEvent,
+  type TranslationEvidenceRefSource,
+} from "./evidence-ref.js";
 
 export type ControlledTranscriptionInput =
   | Readonly<{ readonly type: "audio"; readonly frame: AudioFrame }>
@@ -95,17 +104,47 @@ export interface ControlledTranslationAdapterOptions {
   readonly transcriber: ControlledTranscriptionPort;
   readonly translator: ControlledTextTranslationPort;
   readonly tts: ControlledTtsPort;
+  /**
+   * The wrapper cannot infer whether its injected stages are fixtures, a
+   * locally validated route, or an already connected remote task.  Require
+   * its owner to state that observation explicitly rather than guessing.
+   */
+  readonly preparation: TranslationPreparation;
+  /**
+   * Immutable operational policy projected from the approved processing
+   * profile. It governs provider text-translation failure only; successful
+   * glossary authorization fail-open remains an independent glossary rule.
+   */
+  readonly fallback: TranslationFallbackPolicy;
   readonly minimumConfidence?: number;
   readonly now?: () => number;
+  readonly evidenceRefSource?: Extract<TranslationEvidenceRefSource, "controlled" | "local_eval">;
 }
 
 export const CONTROLLED_TRANSLATION_CAPABILITIES: TranslationCapabilities = Object.freeze({
   providerId: "openai_controlled",
-  supportedModes: Object.freeze([Object.freeze({
-    mode: "accurate",
-    behaviorVersion: 1,
-    deterministicGlossary: true,
-  })]),
+  modes: Object.freeze([
+    Object.freeze({
+      mode: "fast",
+      behaviorVersion: 1,
+      state: "unsupported",
+      deterministicGlossary: false,
+      reason: "Controlled glossary translation only supports accurate behavior.",
+    }),
+    Object.freeze({
+      mode: "balanced",
+      behaviorVersion: 1,
+      state: "unsupported",
+      deterministicGlossary: false,
+      reason: "Controlled glossary translation only supports accurate behavior.",
+    }),
+    Object.freeze({
+      mode: "accurate",
+      behaviorVersion: 1,
+      state: "locally_controlled",
+      deterministicGlossary: true,
+    }),
+  ]),
   supportsProvisionalRevisions: true,
   supportsFinality: true,
   supportsCancellation: true,
@@ -120,20 +159,58 @@ function isCanonicalTtsFormat(value: unknown): value is CanonicalAudioFormat {
   );
 }
 
+function isUnitInterval(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
 function assertControlledContext(context: LaneContext): void {
-  const mode = CONTROLLED_TRANSLATION_CAPABILITIES.supportedModes.find(
-    (candidate) =>
-      candidate.mode === context.behavior.mode &&
-      candidate.behaviorVersion === context.behavior.version,
+  assertTranslationBehaviorCapability(
+    CONTROLLED_TRANSLATION_CAPABILITIES,
+    context.behavior,
+    { glossaryRequested: context.glossary !== undefined },
   );
-  if (mode === undefined) {
-    throw new TypeError("Controlled glossary translation requires accurate behavior");
+}
+
+function freezePreparation(value: TranslationPreparation): TranslationPreparation {
+  if (
+    value.readiness === "local_route_validated" &&
+    value.remoteConnection === "deferred_until_first_turn"
+  ) {
+    return Object.freeze({
+      readiness: "local_route_validated" as const,
+      remoteConnection: "deferred_until_first_turn" as const,
+    });
   }
-  if (context.glossary !== undefined && !mode.deterministicGlossary) {
-    throw new TypeError(
-      "Controlled glossary translation cannot authorize this behavior's glossary",
-    );
+  if (
+    value.readiness === "remote_task_ready" &&
+    value.remoteConnection === "connected"
+  ) {
+    return Object.freeze({
+      readiness: "remote_task_ready" as const,
+      remoteConnection: "connected" as const,
+    });
   }
+  if (
+    value.readiness === "fixture_local" &&
+    value.remoteConnection === "not_applicable"
+  ) {
+    return Object.freeze({
+      readiness: "fixture_local" as const,
+      remoteConnection: "not_applicable" as const,
+    });
+  }
+  throw new TypeError("Controlled translation preparation is not a valid provider-readiness observation");
+}
+
+function freezeFallbackPolicy(value: TranslationFallbackPolicy): TranslationFallbackPolicy {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (value.kind !== "none" && value.kind !== "same_route_fail_open")
+  ) {
+    throw new TypeError("Controlled translation fallback policy is unsupported");
+  }
+  return Object.freeze({ kind: value.kind });
 }
 
 /**
@@ -148,7 +225,11 @@ export class ControlledTranslationAdapter implements TranslationPort {
   readonly #tts: ControlledTtsPort;
   readonly #minimumConfidence: number;
   readonly #now: () => number;
+  readonly #evidenceRefSource: Extract<TranslationEvidenceRefSource, "controlled" | "local_eval">;
+  readonly #preparation: TranslationPreparation;
+  readonly #fallback: TranslationFallbackPolicy;
   readonly #active = new Map<string, AbortController>();
+  readonly #playoutSequences = new GenerationPlayoutSequence();
 
   constructor(options: ControlledTranslationAdapterOptions) {
     const minimumConfidence = options.minimumConfidence ?? 0.75;
@@ -169,10 +250,14 @@ export class ControlledTranslationAdapter implements TranslationPort {
     this.#tts = options.tts;
     this.#minimumConfidence = minimumConfidence;
     this.#now = options.now ?? (() => performance.now());
+    this.#evidenceRefSource = options.evidenceRefSource ?? "controlled";
+    this.#preparation = freezePreparation(options.preparation);
+    this.#fallback = freezeFallbackPolicy(options.fallback);
   }
 
-  async prepare(context: LaneContext): Promise<void> {
+  async prepare(context: LaneContext): Promise<TranslationPreparation> {
     assertControlledContext(context);
+    return this.#preparation;
   }
 
   async *translate(request: TranslationRequest): AsyncIterable<TranslationEvent> {
@@ -182,6 +267,9 @@ export class ControlledTranslationAdapter implements TranslationPort {
     const controller = new AbortController();
     this.#active.set(key, controller);
     const signal = AbortSignal.any([request.signal, controller.signal]);
+    let evidenceOrdinal = 0;
+    const withEvidenceRef = (event: DraftTranslationEvent): TranslationEvent =>
+      attachTranslationEvidenceRef(this.#evidenceRefSource, evidenceOrdinal++, event);
     let sourceSegmentId: string | undefined;
     let sourceText = "";
     let sourceRevision = 0;
@@ -198,14 +286,14 @@ export class ControlledTranslationAdapter implements TranslationPort {
       for await (const event of transcription) {
         if (signal.aborted) break;
         if (event.type === "error") {
-          yield errorEvent(
+          yield withEvidenceRef(errorEvent(
             request.context,
             event.error.code,
             event.error.message,
             event.error.retryable,
             this.#now(),
             "transcription-error",
-          );
+          ));
           continue;
         }
 
@@ -217,7 +305,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
         }
         if (event.type === "transcript_delta") {
           sourceText += event.delta;
-          yield transcriptEvent(
+          yield withEvidenceRef(transcriptEvent(
             request.context,
             "source_transcript",
             sourceSegmentId,
@@ -225,13 +313,13 @@ export class ControlledTranslationAdapter implements TranslationPort {
             "provisional",
             sourceText,
             event.emittedAtMs,
-          );
+          ));
           sourceRevision += 1;
           continue;
         }
 
         sourceText = event.transcript;
-        yield transcriptEvent(
+        yield withEvidenceRef(transcriptEvent(
           request.context,
           "source_transcript",
           sourceSegmentId,
@@ -239,30 +327,36 @@ export class ControlledTranslationAdapter implements TranslationPort {
           "final",
           sourceText,
           event.emittedAtMs,
-        );
-        yield* this.#translateTranscript(request, event, signal);
+        ));
+        for await (const translatedEvent of this.#translateTranscript(request, event, signal)) {
+          yield withEvidenceRef(translatedEvent);
+        }
       }
     } catch {
       if (!signal.aborted) {
-        yield errorEvent(
+        yield withEvidenceRef(errorEvent(
           request.context,
           "TRANSCRIPTION_FAILED",
           "Speech transcription failed; the turn could not be translated.",
           true,
           this.#now(),
           "transcription-failed",
-        );
+        ));
       }
     } finally {
-      if (this.#active.get(key) === controller) this.#active.delete(key);
+      if (this.#active.get(key) === controller) {
+        this.#active.delete(key);
+        if (signal.aborted) this.#playoutSequences.clear(request.context);
+      }
     }
 
-    yield completedEvent(request.context, this.#now());
+    yield withEvidenceRef(completedEvent(request.context, this.#now()));
   }
 
   async cancel(generation: GenerationRef): Promise<void> {
     const controller = this.#active.get(generationKey(generation));
     controller?.abort();
+    this.#playoutSequences.clear(generation);
     try {
       await this.#transcriber.cancel(generation);
     } catch {
@@ -270,16 +364,18 @@ export class ControlledTranslationAdapter implements TranslationPort {
     }
   }
 
-  async closeSession(_sessionId: string): Promise<void> {}
+  async closeSession(sessionId: string): Promise<void> {
+    this.#playoutSequences.clearSession(sessionId);
+  }
 
   async *#translateTranscript(
     request: TranslationRequest,
     event: ControlledTranscriptCompletedEvent,
     signal: AbortSignal,
-  ): AsyncIterable<TranslationEvent> {
+  ): AsyncIterable<DraftTranslationEvent> {
     const terminologySegmentId = "terminology:" + event.itemId;
     if (
-      event.confidence !== undefined &&
+      isUnitInterval(event.confidence) &&
       event.confidence < this.#minimumConfidence
     ) {
       yield errorEvent(
@@ -289,6 +385,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
         false,
         this.#now(),
         terminologySegmentId + ":confidence",
+        { confidence: event.confidence },
       );
     }
 
@@ -318,7 +415,7 @@ export class ControlledTranslationAdapter implements TranslationPort {
       yield errorEvent(
         request.context,
         "GLOSSARY_UNKNOWN_OR_AMBIGUOUS_TERM",
-        "Possible unknown or ambiguous terminology near approved terms: " + nearMisses.join(", "),
+        "Possible unknown or ambiguous terminology was detected.",
         false,
         this.#now(),
         terminologySegmentId + ":uncertain",
@@ -358,10 +455,14 @@ export class ControlledTranslationAdapter implements TranslationPort {
       } else {
         const authorized = activeGlossary.authorize(translated, bound);
         if (bound.bindings.length > 0) {
+          // The authorization gate commits the target segment that follows it.
+          // Keeping this identity exact (rather than using the terminology
+          // segment) lets consumers retain the gate while the target event is
+          // still pending and apply it to the matching revision.
           yield terminologyEvent(
             request.context,
-            terminologySegmentId,
-            1,
+            "target:" + event.itemId,
+            0,
             "final",
             authorized.status,
             bound.glossaryHash,
@@ -383,8 +484,24 @@ export class ControlledTranslationAdapter implements TranslationPort {
       }
     } catch {
       if (signal.aborted) return;
-      targetText = event.transcript;
-      if (bound !== undefined && bound.bindings.length > 0) {
+      // This provider-failure branch is deliberately separate from the
+      // successful-response glossary authorization fail-open above.
+      if (this.#fallback.kind === "none") {
+        const glossaryBound = bound !== undefined && bound.bindings.length > 0;
+        yield errorEvent(
+          request.context,
+          glossaryBound ? "GLOSSARY_TRANSLATION_FAILED" : "TEXT_TRANSLATION_FAILED",
+          glossaryBound
+            ? "Text translation failed; the approved fallback policy prohibits source substitution, so glossary target_exact output was not released."
+            : "Text translation failed; the approved fallback policy prohibits source substitution, so no target transcript or audio was emitted.",
+          true,
+          this.#now(),
+          "translation-failed:" + event.itemId,
+        );
+        return;
+      }
+      const glossaryBound = bound !== undefined && bound.bindings.length > 0;
+      if (glossaryBound) {
         yield terminologyEvent(
           request.context,
           terminologySegmentId,
@@ -393,23 +510,25 @@ export class ControlledTranslationAdapter implements TranslationPort {
           "bypassed",
           bound.glossaryHash,
           bound.bindings.map((binding) => binding.entryId),
-          targetText,
+          event.transcript,
           [],
           this.#now(),
         );
       }
       yield errorEvent(
         request.context,
-        bound !== undefined && bound.bindings.length > 0
+        glossaryBound
           ? "GLOSSARY_BYPASSED_TRANSLATION_FALLBACK"
           : "TEXT_TRANSLATION_FALLBACK",
-        bound !== undefined && bound.bindings.length > 0
-          ? "Text translation failed; glossary target_exact authorization was bypassed and source speech will play uninterrupted."
-          : "Text translation failed; source speech will play as an uninterrupted fallback.",
+        glossaryBound
+          ? "Text translation failed; glossary target_exact authorization could not be completed, so source substitution was blocked."
+          : "Text translation failed; the approved same-route fail-open policy released source speech.",
         true,
         this.#now(),
         "translation-fallback:" + event.itemId,
       );
+      if (glossaryBound) return;
+      targetText = event.transcript;
     }
     if (signal.aborted) return;
 
@@ -446,9 +565,8 @@ export class ControlledTranslationAdapter implements TranslationPort {
     generation: LaneContext,
     itemId: string,
     signal: AbortSignal,
-  ): AsyncIterable<TranslationEvent> {
+  ): AsyncIterable<DraftTranslationEvent> {
     let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-    let sequence = 0;
     for await (const chunk of this.#tts.synthesize({ text, signal })) {
       if (signal.aborted) return;
       if (!(chunk instanceof Uint8Array)) {
@@ -458,14 +576,25 @@ export class ControlledTranslationAdapter implements TranslationPort {
       while (pending.byteLength >= CANONICAL_AUDIO.bytesPerFrame) {
         const pcm16le = pending.slice(0, CANONICAL_AUDIO.bytesPerFrame);
         pending = pending.slice(CANONICAL_AUDIO.bytesPerFrame);
-        yield audioEvent(generation, itemId, sequence, pcm16le, this.#now());
-        sequence += 1;
+        yield audioEvent(
+          generation,
+          itemId,
+          this.#playoutSequences.next(generation),
+          pcm16le,
+          this.#now(),
+        );
       }
     }
     if (pending.byteLength > 0 && !signal.aborted) {
       const pcm16le = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame);
       pcm16le.set(pending);
-      yield audioEvent(generation, itemId, sequence, pcm16le, this.#now());
+      yield audioEvent(
+        generation,
+        itemId,
+        this.#playoutSequences.next(generation),
+        pcm16le,
+        this.#now(),
+      );
     }
   }
 }
@@ -495,7 +624,7 @@ function transcriptEvent(
   finality: "provisional" | "final",
   text: string,
   emittedAtMs: number,
-): TranslationEvent {
+): DraftTranslationEvent {
   return {
     kind,
     ...eventFields(generation, segmentId, revision, finality, emittedAtMs),
@@ -514,7 +643,7 @@ function terminologyEvent(
   text: string,
   guaranteedTargetExact: readonly string[],
   emittedAtMs: number,
-): TranslationEvent {
+): DraftTranslationEvent {
   return {
     kind: "terminology",
     ...eventFields(generation, segmentId, revision, finality, emittedAtMs),
@@ -532,10 +661,14 @@ function audioEvent(
   sequence: number,
   pcm16le: Uint8Array,
   emittedAtMs: number,
-): TranslationEvent {
+): DraftTranslationEvent {
   return {
     kind: "audio",
     ...eventFields(generation, "audio:" + itemId + ":" + sequence, 0, "final", emittedAtMs),
+    // TTS is synthesized from the committed target item. Preserve that exact
+    // target segment identity on every audio frame so playout/evidence never
+    // has to infer the owning transcript from the audio segment name.
+    targetSegmentId: "target:" + itemId,
     playoutSequence: sequence,
     frame: createAudioFrame({
       ...generationFields(generation),
@@ -546,7 +679,7 @@ function audioEvent(
   };
 }
 
-function completedEvent(generation: LaneContext, emittedAtMs: number): TranslationEvent {
+function completedEvent(generation: LaneContext, emittedAtMs: number): DraftTranslationEvent {
   return {
     kind: "completed",
     ...eventFields(generation, "completed:" + generation.turnId, 0, "final", emittedAtMs),
@@ -558,14 +691,16 @@ function glossaryError(
   alert: GlossaryAlert,
   emittedAtMs: number,
   segmentId: string,
-): TranslationErrorEvent {
+): Omit<TranslationErrorEvent, "evidenceRef"> {
+  const metadata = alert.termId === undefined ? {} : { termId: alert.termId };
   return errorEvent(
     generation,
     "GLOSSARY_" + alert.code.toLocaleUpperCase("en-US"),
     alert.message,
-    false,
+    true,
     emittedAtMs,
     segmentId,
+    metadata,
   );
 }
 
@@ -576,11 +711,18 @@ function errorEvent(
   retryable: boolean,
   emittedAtMs: number,
   segmentId: string,
-): TranslationErrorEvent {
+  metadata: Readonly<{ readonly termId?: string; readonly confidence?: number }> = {},
+): Omit<TranslationErrorEvent, "evidenceRef"> {
   return {
     kind: "error",
     ...eventFields(generation, "error:" + segmentId, 0, "final", emittedAtMs),
-    error: { code, message, retryable },
+    error: {
+      code,
+      message,
+      retryable,
+      ...(metadata.termId === undefined ? {} : { termId: metadata.termId }),
+      ...(metadata.confidence === undefined ? {} : { confidence: metadata.confidence }),
+    },
   };
 }
 

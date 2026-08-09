@@ -26,6 +26,28 @@ test("offerLatest evicts oldest buffered work to preserve freshness", async () =
   assert.equal(queue.offerLatest(4), "closed");
 });
 
+test("offerPriority evicts only the oldest eligible buffered work", async () => {
+  const queue = new AsyncQueue<{ readonly kind: "control" | "audio"; readonly id: number }>(2);
+  assert.equal(queue.offer({ kind: "control", id: 1 }), true);
+  assert.equal(queue.offer({ kind: "audio", id: 2 }), true);
+  assert.equal(
+    queue.offerPriority({ kind: "control", id: 3 }, (candidate) => candidate.kind === "audio"),
+    "evicted",
+  );
+  assert.equal(
+    queue.offerPriority({ kind: "control", id: 4 }, (candidate) => candidate.kind === "audio"),
+    "full",
+  );
+  const iterator = queue[Symbol.asyncIterator]();
+  assert.deepEqual(await iterator.next(), { value: { kind: "control", id: 1 }, done: false });
+  assert.deepEqual(await iterator.next(), { value: { kind: "control", id: 3 }, done: false });
+  queue.close();
+  assert.equal(
+    queue.offerPriority({ kind: "control", id: 5 }, (candidate) => candidate.kind === "audio"),
+    "closed",
+  );
+});
+
 test("offer resolves a waiting consumer without buffering", async () => {
   const queue = new AsyncQueue<string>(1);
   const iterator = queue[Symbol.asyncIterator]();

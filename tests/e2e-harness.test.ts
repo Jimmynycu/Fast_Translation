@@ -1,14 +1,22 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { test } from "node:test";
 import WebSocket, { type RawData } from "ws";
 import { createPcmuSilenceFrame } from "../src/adapters/media/telephony-codec.js";
 import { CANONICAL_AUDIO } from "../src/core/audio.js";
+import {
+  validateApprovedSessionProcessingProfile,
+  type ApprovedSessionProcessingProfile,
+} from "../src/core/processing-profile.js";
 import type { GuardedDuplexRelay, SessionEvent } from "../src/core/types.js";
 import { replayLocalEvalCorpus } from "../src/local-eval/corpus-replay.js";
+import {
+  createSyntheticPocProcessingManifest,
+  createSyntheticPocProcessingProfile,
+} from "../src/local-eval/synthetic-poc-processing-manifest.js";
 import { unpackPlayoutAudio } from "../src/server/protocol.js";
 import {
   ACCEPTANCE_MODES,
@@ -101,14 +109,75 @@ async function openActiveTelephonySession(
     sideB: { language: "zh-TW" },
     provider: "openai_controlled",
     mode,
+    processingManifest: createSyntheticPocProcessingManifest({ mode }),
+    evidenceReviewGrant: {
+      dataOwnerId: "test-data-owner",
+      bilingualReviewerId: "test-bilingual-reviewer",
+    },
     maxQueueFrames,
   });
+  assert.deepEqual(snapshot.spec.evidenceReviewGrant, {
+    dataOwnerId: "test-data-owner",
+    bilingualReviewerId: "test-bilingual-reviewer",
+  });
   const collector = collectRelayEvents(fixture.relay, snapshot.sessionId);
+  await Promise.all(([
+    "A",
+    "B",
+  ] as const).map((side) => fixture.relay.command(snapshot.sessionId, {
+    type: "participant_consent",
+    commandId: randomUUID(),
+    side,
+    consentId: randomUUID(),
+    consentPolicyRef: snapshot.spec.processingManifest.consentPolicyRef,
+    recording: true,
+    processing: true,
+  })));
+  await waitUntil(
+    () => (["A", "B"] as const).every((side) => collector.events.some((event) =>
+      event.type === "participant_consent" &&
+      event.side === side &&
+      event.recording &&
+      event.processing
+    )),
+    "Timed out waiting for participant consent events",
+  );
   fixture.media.connect(snapshot.sessionId, "A");
   fixture.media.connect(snapshot.sessionId, "B");
   await waitUntil(
-    () => fixture.relay.snapshot(snapshot.sessionId).status === "ready",
-    "Timed out waiting for fake telephony participants",
+    () => (["A", "B"] as const).every((side) => collector.events.some((event) =>
+      event.type === "participant_state" && event.side === side && event.connected
+    )),
+    "Timed out waiting for fake telephony participant connections",
+  );
+  await waitUntil(
+    () => (["A", "B"] as const).every((side) => collector.events.some((event) =>
+      event.type === "participant_readiness" &&
+      event.side === side &&
+      event.source === "fake_telephony_fixture" &&
+      event.microphone === "not_applicable" &&
+      event.headphones === "not_applicable"
+    )),
+    "Timed out waiting for fake telephony participant readiness",
+  );
+  await fixture.relay.command(snapshot.sessionId, {
+    type: "arm_recorder",
+    commandId: randomUUID(),
+  });
+  await waitUntil(
+    () => {
+      const current = fixture.relay.snapshot(snapshot.sessionId);
+      return current.status === "ready" &&
+        current.recorderArmState === "armed" &&
+        current.recordingArmed &&
+        current.providerReadiness.A_TO_B !== undefined &&
+        current.providerReadiness.B_TO_A !== undefined &&
+        collector.events.some((event) => event.type === "recorder_state" && event.state === "armed") &&
+        (["A_TO_B", "B_TO_A"] as const).every((lane) => collector.events.some((event) =>
+          event.type === "provider_readiness" && event.lane === lane
+        ));
+    },
+    "Timed out waiting for armed fake telephony participants",
   );
   await fixture.relay.command(snapshot.sessionId, {
     type: "start",
@@ -357,7 +426,63 @@ async function postJson(
   return body;
 }
 
-function mediaUrlFromGrant(
+async function assertSyntheticOnlyProfileRejected(
+  label: string,
+  processingProfile: ApprovedSessionProcessingProfile,
+): Promise<void> {
+  const port = await getAvailablePort();
+  const origin = "http://127.0.0.1:" + port;
+  const fixture = await createKeylessBrowserAcceptanceApplication(origin, "fast", processingProfile);
+  try {
+    await fixture.app.listen({ host: "127.0.0.1", port });
+    const capabilitiesResponse = await fetch(origin + "/api/capabilities", {
+      headers: { authorization: "Bearer " + fixture.operatorToken },
+    });
+    assert.equal(capabilitiesResponse.status, 200, label + " capabilities status");
+    const capabilities: unknown = await capabilitiesResponse.json();
+    assert.ok(isObject(capabilities));
+    assert.equal(capabilities.dataAdmission, "synthetic_only", label + " data admission");
+
+    const rejected = await postJson(origin, "/api/sessions", {
+      languages: { A: "en-US", B: "zh-TW" },
+      translationMode: "fast",
+    }, 422, fixture.operatorToken);
+    assert.deepEqual(rejected.error, {
+      code: "synthetic_only_profile",
+      message: "The configured processing profile permits synthetic benchmark data only",
+      dataAdmission: "synthetic_only",
+    });
+    assert.equal("sessionId" in rejected, false);
+    assert.equal("endpointGrants" in rejected, false);
+  } finally {
+    await fixture.app.close();
+  }
+}
+
+test("human session admission rejects shipped and synthetic POC profiles before grants", {
+  timeout: 20_000,
+}, async () => {
+  const manufacturingPoc = JSON.parse(await readFile(
+    resolve(process.cwd(), "profiles", "manufacturing-poc.json"),
+    "utf8",
+  )) as ApprovedSessionProcessingProfile;
+  const profiles = [
+    ["shipped manufacturing POC", manufacturingPoc],
+    ["synthetic local-eval POC", createSyntheticPocProcessingProfile()],
+  ] as const;
+
+  for (const [label, profile] of profiles) {
+    const validation = validateApprovedSessionProcessingProfile(profile);
+    assert.equal(profile.operationScope, "poc", label + " operation scope");
+    assert.equal(validation.acceptanceImpact, "NOT_RUN", label + " external acceptance");
+    assert.ok(profile.services.some((service) =>
+      service.trainingUse.status === "unverified" || service.serviceRetention.status === "unverified"
+    ));
+    await assertSyntheticOnlyProfileRejected(label, profile);
+  }
+});
+
+function participantAccessTokenFromGrant(
   response: JsonObject,
   origin: string,
   sessionId: string,
@@ -378,7 +503,17 @@ function mediaUrlFromGrant(
   assert.equal(participantUrl.searchParams.get("side"), side);
   const access = new URLSearchParams(participantUrl.hash.slice(1)).get("access");
   assert.ok(access);
+  if (access === null || access.length === 0) throw new Error("Missing participant access token");
+  return access;
+}
 
+function mediaUrlFromGrant(
+  response: JsonObject,
+  origin: string,
+  sessionId: string,
+  side: "A" | "B",
+): string {
+  const access = participantAccessTokenFromGrant(response, origin, sessionId, side);
   const mediaUrl = new URL(
     "/ws/media/" + encodeURIComponent(sessionId) + "/" + side,
     origin,
@@ -567,30 +702,62 @@ test("keyless relay acceptance fences stale audio, keeps capture lanes independe
 
     const audioToABeforeReconnect = fixture.media.outbound(sessionId, "A")
       .filter((event) => event.type === "audio").length;
+    const participantReadinessBeforeReconnect = collector.events.filter((event) =>
+      event.type === "participant_readiness" &&
+      event.side === "A" &&
+      event.source === "fake_telephony_fixture" &&
+      event.microphone === "not_applicable" &&
+      event.headphones === "not_applicable"
+    ).length;
+    const readyBeforeReconnect = collector.events.filter((event) =>
+      event.type === "session_state" && event.status === "ready"
+    ).length;
+    const activeBeforeReconnect = collector.events.filter((event) =>
+      event.type === "session_state" && event.status === "active"
+    ).length;
+    const providerReadinessBeforeReconnect = collector.events.filter((event) =>
+      event.type === "provider_readiness"
+    ).length;
     fixture.media.reconnect(sessionId, "A");
     await waitUntil(
       () => collector.events.some((event) =>
         event.type === "participant_state" && event.side === "A" && !event.connected
       ) && collector.events.some((event) =>
         event.type === "participant_state" && event.side === "A" && event.connected
-      ),
-      "A reconnection did not retain its participant state transitions",
+      ) && collector.events.filter((event) =>
+        event.type === "participant_readiness" &&
+        event.side === "A" &&
+        event.source === "fake_telephony_fixture" &&
+        event.microphone === "not_applicable" &&
+        event.headphones === "not_applicable"
+      ).length > participantReadinessBeforeReconnect,
+      "A reconnection did not retain its participant state and readiness transitions",
     );
-    const bToACutsBeforeReconnectTurn = collector.events.filter((event) =>
-      event.type === "generation_cut" && event.lane === "B_TO_A"
-    ).length;
-    // Force a new B-to-A generation after the reconnect. Besides modelling a
-    // normal resumed turn, this makes the assertion independent of the prior
-    // turn's asynchronous iterator finishing first.
-    fixture.media.speechStarted(sessionId, "A");
-    fixture.media.speechEnded(sessionId, "A");
     await waitUntil(
       () => collector.events.filter((event) =>
-        event.type === "generation_cut" && event.lane === "B_TO_A" &&
-        event.reason === "barge_in"
-      ).length > bToACutsBeforeReconnectTurn,
-      "A reconnect turn did not open a fresh B-to-A generation",
+        event.type === "session_state" && event.status === "ready"
+      ).length > readyBeforeReconnect &&
+        fixture.relay.snapshot(sessionId).providerReadiness.A_TO_B !== undefined &&
+        fixture.relay.snapshot(sessionId).providerReadiness.B_TO_A !== undefined,
+      "A reconnection did not return to ready with retained provider prewarm",
     );
+    assert.equal(
+      collector.events.filter((event) => event.type === "provider_readiness").length,
+      providerReadinessBeforeReconnect,
+      "reconnect must retain provider prewarm rather than preparing a second time",
+    );
+    await fixture.relay.command(sessionId, {
+      type: "start",
+      commandId: "restart-" + randomUUID(),
+    });
+    await waitUntil(
+      () => collector.events.filter((event) =>
+        event.type === "session_state" && event.status === "active"
+      ).length > activeBeforeReconnect,
+      "A reconnection did not require an explicit ready-to-active restart",
+    );
+    // Reconnect closes any prior live lanes. A newly committed B-to-A turn
+    // below proves media resumes only after fresh readiness and explicit start.
     fixture.media.speechStarted(sessionId, "B");
     fixture.media.ingestMulaw(sessionId, "B", 1, createPcmuSilenceFrame());
     fixture.media.speechEnded(sessionId, "B");
@@ -652,17 +819,24 @@ test("real HTTP and WebSocket acceptance stays keyless while carrying duplex rev
     assert.equal(capabilitiesResponse.status, 200);
     const capabilities: unknown = await capabilitiesResponse.json();
     assert.ok(isObject(capabilities));
+    assert.equal(capabilities.dataAdmission, "approved_poc_content");
     assert.ok(isObject(capabilities.translation));
     assert.equal(capabilities.translation.provider, "openai_controlled");
     assert.deepEqual(
-      (capabilities.translation.supportedModes as Array<{ mode?: unknown }>).map((mode) => mode.mode),
-      ["fast", "balanced", "accurate"],
+      (capabilities.translation.modes as Array<{
+        mode?: unknown;
+        state?: unknown;
+      }>).map((mode) => [mode.mode, mode.state]),
+      [
+        ["fast", "locally_controlled"],
+        ["balanced", "locally_controlled"],
+        ["accurate", "locally_controlled"],
+      ],
     );
 
     const created = await postJson(origin, "/api/sessions", {
       languages: { A: "en-US", B: "zh-TW" },
       translationMode: "fast",
-      recordingConsent: true,
     }, 201, fixture.operatorToken);
     const sessionId = created.sessionId;
     assert.equal(typeof sessionId, "string");
@@ -675,16 +849,123 @@ test("real HTTP and WebSocket acceptance stays keyless while carrying duplex rev
       wsOrigin + "/ws/events/" + encodeURIComponent(sessionId) +
         "?access=" + encodeURIComponent(fixture.operatorToken),
     );
-    const readyEvent = waitForJson(
+    const participantAccessA = participantAccessTokenFromGrant(created, origin, sessionId, "A");
+    const participantAccessB = participantAccessTokenFromGrant(created, origin, sessionId, "B");
+    const consentA = waitForJson(
       eventSocket,
-      (message) => message.type === "session_state" && messageData(message).status === "ready",
-      "ready session event",
+      (message) => message.type === "participant_consent" &&
+        messageData(message).side === "A" &&
+        messageData(message).recording === true &&
+        messageData(message).processing === true,
+      "participant A recording and processing consent",
+    );
+    const consentB = waitForJson(
+      eventSocket,
+      (message) => message.type === "participant_consent" &&
+        messageData(message).side === "B" &&
+        messageData(message).recording === true &&
+        messageData(message).processing === true,
+      "participant B recording and processing consent",
+    );
+    await Promise.all([
+      postJson(
+        origin,
+        "/api/sessions/" + sessionId + "/participants/A/recording-processing-consent",
+        { accepted: true, consentId: randomUUID() },
+        202,
+        participantAccessA,
+      ),
+      postJson(
+        origin,
+        "/api/sessions/" + sessionId + "/participants/B/recording-processing-consent",
+        { accepted: true, consentId: randomUUID() },
+        202,
+        participantAccessB,
+      ),
+    ]);
+    await Promise.all([consentA, consentB]);
+
+    const joinedA = waitForJson(
+      eventSocket,
+      (message) => message.type === "participant_joined" && messageData(message).side === "A",
+      "participant A join",
+    );
+    const joinedB = waitForJson(
+      eventSocket,
+      (message) => message.type === "participant_joined" && messageData(message).side === "B",
+      "participant B join",
     );
     [socketA, socketB] = await Promise.all([
       connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "A")),
       connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "B")),
     ]);
-    await readyEvent;
+    await Promise.all([joinedA, joinedB]);
+
+    const readinessA = waitForJson(
+      eventSocket,
+      (message) => message.type === "participant_readiness" &&
+        messageData(message).side === "A" &&
+        messageData(message).source === "participant_browser_self_report" &&
+        messageData(message).microphone === "browser_capture_active" &&
+        messageData(message).headphones === "self_attested",
+      "participant A readiness",
+    );
+    const readinessB = waitForJson(
+      eventSocket,
+      (message) => message.type === "participant_readiness" &&
+        messageData(message).side === "B" &&
+        messageData(message).source === "participant_browser_self_report" &&
+        messageData(message).microphone === "browser_capture_active" &&
+        messageData(message).headphones === "self_attested",
+      "participant B readiness",
+    );
+    socketA.send(JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }));
+    socketB.send(JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }));
+    await Promise.all([readinessA, readinessB]);
+
+    const recorderArmed = waitForJson(
+      eventSocket,
+      (message) => message.type === "recorder_state" &&
+        messageData(message).state === "armed" &&
+        messageData(message).recordingArmed === true,
+      "armed recorder event",
+    );
+    const readyEvent = waitForJson(
+      eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "ready",
+      "ready session event",
+    );
+    const providerA = waitForJson(
+      eventSocket,
+      (message) => message.type === "provider_readiness" &&
+        message.lane === "A_TO_B" &&
+        messageData(message).readiness === "fixture_local" &&
+        messageData(message).remoteConnection === "not_applicable",
+      "A_TO_B provider prewarm",
+    );
+    const providerB = waitForJson(
+      eventSocket,
+      (message) => message.type === "provider_readiness" &&
+        message.lane === "B_TO_A" &&
+        messageData(message).readiness === "fixture_local" &&
+        messageData(message).remoteConnection === "not_applicable",
+      "B_TO_A provider prewarm",
+    );
+    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
+      kind: "arm_recorder",
+      commandId: randomUUID(),
+    }, 202, fixture.operatorToken);
+    await Promise.all([recorderArmed, providerA, providerB, readyEvent]);
 
     const activeEvent = waitForJson(
       eventSocket,
@@ -810,6 +1091,38 @@ test("real HTTP and WebSocket acceptance stays keyless while carrying duplex rev
     );
     socketA = await connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "A"));
     await participantJoined;
+
+    const participantReady = waitForJson(
+      eventSocket,
+      (message) => message.type === "participant_readiness" &&
+        messageData(message).side === "A" &&
+        messageData(message).source === "participant_browser_self_report" &&
+        messageData(message).microphone === "browser_capture_active" &&
+        messageData(message).headphones === "self_attested",
+      "participant A readiness after reconnect",
+    );
+    const readyAfterReconnect = waitForJson(
+      eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "ready",
+      "ready session after reconnect",
+    );
+    socketA.send(JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }));
+    await Promise.all([participantReady, readyAfterReconnect]);
+    const activeAfterReconnect = waitForJson(
+      eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "active",
+      "active session after reconnect",
+    );
+    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
+      kind: "start",
+      commandId: randomUUID(),
+    }, 202, fixture.operatorToken);
+    await activeAfterReconnect;
 
     const reconnectPacket = waitForBinary(socketA, "B-to-A playout after reconnect");
     const reconnectPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x66);
