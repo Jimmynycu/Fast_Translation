@@ -255,4 +255,34 @@ test("playout worklet applies id-correlated clears before acknowledging them", a
     "type" in message &&
     message.type === "playout_dropped"
   ));
+  processor.port.onmessage?.({ data: { type: "interrupt", lane: "A_TO_B" } });
+  const interruptedOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], interruptedOutput), true);
+  assert.ok(
+    interruptedOutput[0]?.[0]?.every((sample) => sample === 0) === true,
+    "interrupt must silence current and queued audio",
+  );
+
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 71, samples },
+  });
+  const suppressedOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], suppressedOutput), true);
+  assert.ok(
+    suppressedOutput[0]?.[0]?.every((sample) => sample === 0) === true,
+    "same-generation pushes stay suppressed after interruption",
+  );
+
+  processor.port.onmessage?.({
+    data: { type: "clear", lane: "A_TO_B", generation: 3, clearId: "clear-3" },
+  });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 3, sequence: 0, samples },
+  });
+  const resumedOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], resumedOutput), true);
+  assert.ok(
+    resumedOutput[0]?.[0]?.some((sample) => sample > 0) === true,
+    "a valid next-generation clear releases normal playback",
+  );
 });

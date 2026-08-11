@@ -666,6 +666,7 @@ interface StopCleanupProbe {
   readonly trackStops: number;
   readonly disconnects: number;
   readonly contextClosed: number;
+  readonly playoutMessages: readonly Readonly<Record<string, unknown>>[];
   readonly error: string;
 }
 
@@ -716,15 +717,18 @@ let socketClosed = 0;
 let trackStops = 0;
 let disconnects = 0;
 let contextClosed = 0;
+const playoutMessages = [];
 class Port {
-  constructor() { this.listeners = []; }
+  constructor(name = "") { this.name = name; this.listeners = []; }
   addEventListener(_type, listener) { this.listeners.push(listener); }
   start() {}
-  postMessage() {}
+  postMessage(message) {
+    if (this.name === "relay-pcm-playout") playoutMessages.push(message);
+  }
   emit(data) { for (const listener of this.listeners) listener({ data }); }
 }
 class Node {
-  constructor() { this.port = new Port(); this.gain = { value: 1 }; }
+  constructor(name = "") { this.port = new Port(name); this.gain = { value: 1 }; }
   connect() {}
   disconnect() { disconnects += 1; }
 }
@@ -781,7 +785,7 @@ globalThis.window = {
   isSecureContext: false,
   WebSocket: RecordingWebSocket,
   AudioContext: FakeAudioContext,
-  AudioWorkletNode: class extends Node { constructor(context, name) { super(); if (name === "relay-pcm-capture") captureNodes.push(this); } },
+  AudioWorkletNode: class extends Node { constructor(context, name) { super(name); if (name === "relay-pcm-capture") captureNodes.push(this); } },
   addEventListener() {},
   clearTimeout,
   setTimeout,
@@ -808,7 +812,7 @@ for (const listener of stopListeners) listener();
 await new Promise((resolve) => setImmediate(resolve));
 await new Promise((resolve) => setImmediate(resolve));
 const error = elements.get("participant-error");
-process.stdout.write(JSON.stringify({ socketClosed, supervisorStop: socketClosed > 0, trackStops, disconnects, contextClosed, error: error.textContent }));
+process.stdout.write(JSON.stringify({ socketClosed, supervisorStop: socketClosed > 0, trackStops, disconnects, contextClosed, playoutMessages, error: error.textContent }));
 `;
   const result = spawnSync(
     process.execPath,
@@ -1430,8 +1434,9 @@ test("target lifecycle correlates projected provider playout IDs without sibling
   assert.doesNotMatch(third.label, /played/iu);
 });
 
-test("audio stop cleanup survives a close-race send failure", () => {
+test("active VAD interrupts local playout before close-race cleanup", () => {
   const probe = probeParticipantStopCleanup();
+  assert.deepEqual(probe.playoutMessages, [{ type: "interrupt", lane: "B_TO_A" }]);
   assert.equal(probe.supervisorStop, true);
   assert.equal(probe.trackStops, 1);
   assert.equal(probe.disconnects, 4);

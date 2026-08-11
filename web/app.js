@@ -2783,6 +2783,15 @@ async function startParticipantAudio() {
       } else if (message.type === "vad") {
         const active = Boolean(message.active);
         if (active === state.vadActive) return;
+        if (
+          active &&
+          ["active", "running", "started"].includes(state.roomStatus)
+        ) {
+          participantAudio.playoutNode.port.postMessage({
+            type: "interrupt",
+            lane: participantPlayoutLane(),
+          });
+        }
         state.vadActive = active;
         sendMediaControl(active ? "speech_start" : "speech_end");
         if (active) {

@@ -9,6 +9,7 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     this.queue = [];
     this.current = null;
     this.position = 0;
+    this.interrupted = false;
     this.lane = null;
     this.latestClear = null;
     this.clearReceipts = new Map();
@@ -30,6 +31,8 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
       const message = event.data || {};
       if (message.type === "clear") {
         this.clear(message);
+      } else if (message.type === "interrupt") {
+        this.interrupt(message);
       } else if (message.type === "push") {
         this.push(message);
       }
@@ -91,8 +94,21 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     this.lane = lane;
     this.rememberClear(clearId, lane, generation);
     this.latestClear = { lane, generation, clearId };
+    this.interrupted = false;
     this.reportQueueSample(true);
     this.port.postMessage({ type: "clear_applied", lane, generation, clearId });
+  }
+
+  interrupt(message) {
+    const lane = message.lane;
+    if (!this.isLane(lane)) return;
+    if (this.lane !== null && this.lane !== lane) return;
+    this.lane = lane;
+    this.interrupted = true;
+    this.queue.length = 0;
+    this.current = null;
+    this.position = 0;
+    this.reportQueueSample(true);
   }
 
   bufferedSamples() {
@@ -181,6 +197,7 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     ) {
       return;
     }
+    if (this.interrupted) return;
     if (generation < this.generation) return;
     if (generation > this.generation) {
       if (!this.advanceGeneration(generation)) return;
