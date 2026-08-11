@@ -238,6 +238,8 @@ class FakeRelay implements GuardedDuplexRelay {
   openError: Error | undefined;
   eventsForSession: readonly SessionEvent[] = [];
   snapshotStatus: SessionSnapshot["status"] = "waiting";
+  behaviorModeOverride: SessionSpec["mode"] | undefined;
+  eventCursorOverride: number | undefined;
   participantConsent: Record<Side, ParticipantConsentState> = {
     A: { consented: false, recording: false, processing: false },
     B: { consented: false, recording: false, processing: false },
@@ -254,13 +256,20 @@ class FakeRelay implements GuardedDuplexRelay {
   async open(spec: SessionSpec): Promise<SessionSnapshot> {
     this.opened.push(spec);
     if (this.openError !== undefined) throw this.openError;
-    return snapshot("session-1", spec);
+    const opened = snapshot("session-1", spec);
+    return {
+      ...opened,
+      ...(this.behaviorModeOverride === undefined
+        ? {}
+        : { behavior: resolveTranslationBehavior(this.behaviorModeOverride) }),
+      ...(this.eventCursorOverride === undefined ? {} : { eventCursor: this.eventCursorOverride }),
+    };
   }
 
   snapshot(sessionId: string): SessionSnapshot {
     const latest = this.opened.at(-1);
     if (latest === undefined) throw new Error("Unknown fake session");
-    return {
+    const current = {
       ...snapshot(sessionId, latest),
       status: this.snapshotStatus,
       participantConsent: this.participantConsent,
@@ -274,6 +283,13 @@ class FakeRelay implements GuardedDuplexRelay {
       ...(this.evidenceFinalization === undefined
         ? {}
         : { evidenceFinalization: this.evidenceFinalization }),
+    };
+    return {
+      ...current,
+      ...(this.behaviorModeOverride === undefined
+        ? {}
+        : { behavior: resolveTranslationBehavior(this.behaviorModeOverride) }),
+      ...(this.eventCursorOverride === undefined ? {} : { eventCursor: this.eventCursorOverride }),
     };
   }
 
@@ -851,6 +867,8 @@ describe("server application", () => {
         translationState: "locally_controlled",
         deterministicGlossary: true,
         sessionId: "session-1",
+        languages: { A: "en-US", B: "zh-TW" },
+        eventCursor: 1,
         state: "waiting",
         participantConsent: {
           A: { consented: false, recording: false, processing: false },
@@ -880,6 +898,7 @@ describe("server application", () => {
             qrDataUrl: "data:image/png;base64,Qg==",
           },
         ],
+        glossaryVersion: "factory-v1",
         glossaryHash: "hash-v1",
         evidenceHealth: "healthy",
         evidenceIdentity: {
@@ -928,6 +947,76 @@ describe("server application", () => {
     } finally {
       await app.close();
     }
+  });
+
+  it("returns authoritative languages and glossary identity on reversed-direction recovery", async () => {
+    const { app, relay } = await fixture();
+    relay.eventCursorOverride = 37;
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        headers: OPERATOR_HEADERS,
+        payload: {
+          languages: { A: "zh-TW", B: "en-US" },
+          translationMode: "accurate",
+          glossaryVersion: "factory-v1",
+        },
+      });
+      assert.equal(response.statusCode, 201);
+      assert.deepEqual(response.json().languages, { A: "zh-TW", B: "en-US" });
+      assert.equal(response.json().eventCursor, 37);
+      assert.equal(response.json().glossaryVersion, "factory-v1");
+      assert.equal(response.json().glossaryHash, "hash-v1");
+
+      const recovered = await app.inject({
+        method: "GET",
+        url: "/api/sessions/session-1",
+        headers: OPERATOR_HEADERS,
+      });
+      assert.equal(recovered.statusCode, 200);
+      assert.deepEqual(recovered.json().languages, { A: "zh-TW", B: "en-US" });
+      assert.equal(recovered.json().eventCursor, 37);
+      assert.equal(recovered.json().glossaryVersion, "factory-v1");
+      assert.equal(recovered.json().glossaryHash, "hash-v1");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects a relay snapshot whose behavior mode differs from the pinned session mode", async () => {
+    const { app, relay, glossaries } = await fixture();
+    relay.behaviorModeOverride = "fast";
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        headers: OPERATOR_HEADERS,
+        payload: {
+          languages: { A: "en-US", B: "zh-TW" },
+          translationMode: "accurate",
+          glossaryVersion: "factory-v1",
+        },
+      });
+      assert.equal(response.statusCode, 500);
+      assert.deepEqual(response.json(), {
+        error: {
+          code: "internal_error",
+          message: "The server could not complete the request",
+        },
+      });
+      assert.doesNotMatch(response.body, /balanced|accurate|private|behavior/u);
+    } finally {
+      await app.close();
+    }
+    const cleanupCommands = relay.commanded.filter((entry) => entry.command.type === "end");
+    assert.equal(cleanupCommands.length, 1);
+    const cleanup = cleanupCommands[0]?.command;
+    if (cleanup?.type !== "end") throw new Error("payload validation did not issue an end command");
+    assert.match(cleanup.commandId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu);
+    assert.equal(cleanup.reason, "session_payload_invalid");
+    assert.deepEqual(glossaries.releaseAttempts, ["factory-v1"]);
+    assert.deepEqual(glossaries.releasedVersions, ["factory-v1"]);
   });
 
   it("injects the configured review grant server-side without exposing either identity", async () => {
@@ -2026,6 +2115,40 @@ describe("server application", () => {
     }
   });
 
+  it("preserves confirmed operational alert codes after redaction", async () => {
+    const { app, relay } = await fixture();
+    await openFakeSession(relay);
+    const codes = ["source_queue_overflow", "playout_clear_failed", "provider_cancel_failed"] as const;
+    relay.eventsForSession = codes.map((code, index) => ({
+      cursor: index + 1,
+      sessionId: "session-1",
+      timestampMonoMs: 200 + index,
+      lane: "A_TO_B" as const,
+      generation: index,
+      type: "alert" as const,
+      alert: {
+        code,
+        message: "internal failure details must not cross the boundary",
+        retryable: false,
+      },
+    }));
+    try {
+      const { messages } = await openAndCollect(
+        app,
+        "/ws/events/session-1?access=" + encodeURIComponent(OPERATOR_TOKEN),
+        codes.length,
+      );
+      const events = messages.map((message) => JSON.parse(message) as {
+        type: string;
+        data: Record<string, unknown>;
+      });
+      assert.deepEqual(events.map((event) => event.data.code), codes);
+      assert.ok(events.every((event) => event.type === "error"));
+    } finally {
+      await app.close();
+    }
+  });
+
   it("preserves invalid participant state as a bounded alert without its raw message", async () => {
     const { app, relay } = await fixture();
     await openFakeSession(relay);
@@ -2285,6 +2408,18 @@ describe("server application", () => {
       });
       assert.equal(accepted.statusCode, 202);
       assert.deepEqual(accepted.json(), { accepted: true, consentId });
+      const operatorSnapshot = await app.inject({
+        method: "GET",
+        url: "/api/sessions/session-1",
+        headers: OPERATOR_HEADERS,
+      });
+      assert.equal(operatorSnapshot.statusCode, 200);
+      assert.deepEqual(operatorSnapshot.json().participantConsent.A, {
+        consented: true,
+        recording: true,
+        processing: true,
+      });
+      assert.doesNotMatch(operatorSnapshot.body, /consentPolicyRef|consentId|withdrawalId/u);
       const command = relay.commanded[0]?.command;
       assert.deepEqual(
         command === undefined
@@ -3461,6 +3596,42 @@ describe("server application", () => {
     });
     assert.equal(throwingCloseSocket.terminateCalls, 1);
     assert.doesNotMatch(throwingCloseSocket.sent[0] ?? "", /private iterator path/u);
+  });
+
+  it("surfaces stale event cursors and subscriber overflow as session-scoped resync errors", async () => {
+    for (const [code, message] of [
+      ["event_cursor_gap", "Event history is unavailable for the requested cursor; resync is required"],
+      ["event_stream_overflow", "Event stream fell behind; resync is required"],
+    ] as const) {
+      const socket = new BackpressuredEventSocket();
+      socket.bufferedAmount = 0;
+      await streamEventSocket({
+        socket,
+        sessionId: "session-1",
+        events: () => {
+          throw new RelaySessionError(
+            code as unknown as RelaySessionError["code"],
+            "private relay details",
+          );
+        },
+        eventAccess: { kind: "operator" },
+        processingProfile: TEST_PROCESSING_PROFILE,
+        deploymentBuildSha256: DEPLOYMENT_BUILD_SHA256,
+      });
+      const payload = JSON.parse(socket.sent[0] ?? "") as {
+        cursor: number;
+        sessionId: string;
+        timestampMonoMs: number;
+        type: string;
+        data: Record<string, unknown>;
+      };
+      assert.equal(payload.cursor, 0);
+      assert.equal(payload.sessionId, "session-1");
+      assert.equal(payload.type, "error");
+      assert.equal(Number.isFinite(payload.timestampMonoMs), true);
+      assert.deepEqual(payload.data, { code, message });
+      assert.doesNotMatch(socket.sent[0] ?? "", /private relay details/u);
+    }
   });
 
   it("projects sequence-gap telemetry through the event socket contract", async () => {

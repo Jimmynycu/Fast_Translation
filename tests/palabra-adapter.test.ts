@@ -34,6 +34,7 @@ class FakeSocket implements PalabraWebSocketLike {
   closed = false;
   failFlush = false;
   respondTask = true;
+  taskConfig: Record<string, unknown> | undefined;
   sendError: Error | undefined;
   sendErrorMessageType: string | undefined;
 
@@ -46,6 +47,9 @@ class FakeSocket implements PalabraWebSocketLike {
   send(value: string): void {
     const message = JSON.parse(value) as Record<string, unknown>;
     this.sent.push(message);
+    if (message.message_type === "set_task") {
+      this.taskConfig = message.data as Record<string, unknown>;
+    }
     this.onSend?.(message);
     for (const waiter of this.#sentWaiters.splice(0)) {
       if (this.sent.filter((item) => item.message_type === waiter.messageType).length >= waiter.count) {
@@ -58,8 +62,12 @@ class FakeSocket implements PalabraWebSocketLike {
     if (message.message_type === "flush_task" && this.failFlush) throw new Error("flush failed");
     if (this.sendError && (this.sendErrorMessageType === undefined || this.sendErrorMessageType === message.message_type)) throw this.sendError;
     if (message.message_type === "get_task" && this.respondTask) {
-      this.emit("message", { message_type: "current_task", data: { task_status: "running" } });
+      this.emit("message", { message_type: "current_task", data: { ...this.taskConfig, task_status: "running" } });
     }
+  }
+
+  currentTask(taskConfig = this.taskConfig, taskStatus = "running"): Record<string, unknown> {
+    return { message_type: "current_task", data: { ...taskConfig, task_status: taskStatus } };
   }
 
   waitForSent(messageType: string, count: number): Promise<void> {
@@ -144,6 +152,19 @@ function pipeline(socket: FakeSocket, index = 0): Record<string, unknown> {
   const task = setTasks[index];
   assert.ok(task);
   return task.data.pipeline;
+}
+
+function accurateAdapter(socket: FakeSocket): PalabraTranslationAdapter {
+  return new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "a".repeat(32),
+    webSocketFactory: () => socket,
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+    settleWindowMs: 1,
+    turnTimeoutMs: 500,
+    sleep: async () => undefined,
+  });
 }
 
 async function tick(): Promise<void> {
@@ -600,16 +621,68 @@ test("reports Palabra remote readiness only after the socket task is running", a
   });
 
   await socket.waitForSent("get_task", 1);
+  assert.deepEqual(socket.sent.find((message) => message.message_type === "get_task")?.data, { exclude_hidden: false });
   await tick();
   assert.equal(settled, false);
-  socket.emit("message", {
-    message_type: "current_task",
-    data: { task_status: "running" },
-  });
+  socket.emit("message", socket.currentTask());
   assert.deepEqual(await preparation, {
     readiness: "remote_task_ready",
     remoteConnection: "connected",
   });
+});
+
+test("fences readiness to the task configuration applied by the latest set_task", async () => {
+  const socket = new FakeSocket();
+  socket.respondTask = false;
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "fence".padEnd(32, "f"),
+    webSocketFactory: () => socket,
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+  });
+  const balanced = context(0, "en", "es", "balanced", "A_TO_B", "readiness-balanced");
+  const accurate = context(0, "en", "es", "accurate", "A_TO_B", "readiness-accurate");
+  const first = adapter.prepare(balanced);
+  await socket.waitForSent("get_task", 1);
+  const balancedTask = socket.taskConfig;
+  socket.emit("message", socket.currentTask(balancedTask));
+  await first;
+
+  const second = adapter.prepare(accurate);
+  await socket.waitForSent("set_task", 2);
+  await socket.waitForSent("get_task", 2);
+  let settled = false;
+  void second.then(() => { settled = true; });
+  socket.emit("message", socket.currentTask(balancedTask));
+  await tick();
+  assert.equal(settled, false);
+  await socket.waitForSent("get_task", 3);
+  socket.emit("message", socket.currentTask(socket.taskConfig));
+  assert.deepEqual(await second, {
+    readiness: "remote_task_ready",
+    remoteConnection: "connected",
+  });
+});
+
+test("invalidates lane readiness when the socket closes", async () => {
+  const sockets = [new FakeSocket(), new FakeSocket()];
+  let factoryCalls = 0;
+  const adapter = new PalabraTranslationAdapter({
+    apiKey: "key",
+    randomHash: "close".padEnd(32, "c"),
+    webSocketFactory: () => sockets[factoryCalls++] ?? new FakeSocket(),
+    pollIntervalMs: 1,
+    readinessTimeoutMs: 100,
+  });
+  const ref = context(0, "en", "es", "balanced", "A_TO_B", "readiness-close");
+  await adapter.prepare(ref);
+  sockets[0]?.emit("close");
+  assert.deepEqual(await adapter.prepare(ref), {
+    readiness: "remote_task_ready",
+    remoteConnection: "connected",
+  });
+  assert.equal(factoryCalls, 2);
 });
 
 test("retires timed-out sockets before a retry and fences late lifecycle events", async () => {
@@ -669,10 +742,7 @@ test("accepts Node ws Buffer payloads for readiness and provider events", async 
   const ref = context(0, "en", "es", "balanced", "A_TO_B", "buffer-wire-turn");
   const preparation = adapter.prepare(ref);
   await socket.waitForSent("get_task", 1);
-  socket.emit("message", Buffer.from(JSON.stringify({
-    message_type: "current_task",
-    data: { task_status: "running" },
-  })));
+  socket.emit("message", Buffer.from(JSON.stringify(socket.currentTask())));
   assert.deepEqual(await preparation, {
     readiness: "remote_task_ready",
     remoteConnection: "connected",
@@ -718,7 +788,7 @@ test("joins bounded fragmented Node ws RawData and closes on aggregate overflow"
   };
   const preparation = adapter.prepare(ref);
   await socket.waitForSent("get_task", 1);
-  socket.emit("message", wire({ message_type: "current_task", data: { task_status: "running" } }, true));
+  socket.emit("message", wire(socket.currentTask(), true));
   assert.deepEqual(await preparation, { readiness: "remote_task_ready", remoteConnection: "connected" });
 
   const pending = collect(adapter.translate({ context: ref, frames: frames(ref, 16), signal: new AbortController().signal }));
@@ -878,6 +948,59 @@ test("paces fixed 320ms Palabra input while the source remains open", async () =
 
   controller.abort();
   await pending;
+});
+
+test("Accurate withholds target and audio until an open input iterator finishes", async () => {
+  const socket = new FakeSocket();
+  const adapter = accurateAdapter(socket);
+  const ref = context(0, "en", "es", "accurate", "A_TO_B", "accurate-open-turn");
+  const controller = new AbortController();
+  const iterator = adapter.translate({ context: ref, frames: openFrames(ref, 16), signal: controller.signal })[Symbol.asyncIterator]();
+  const first = iterator.next();
+  await socket.waitForSent("input_audio_data", 1);
+  const providerId = "accurate-open-provider";
+  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: providerId, text: "hello" } } });
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: providerId, translation_part_id: 0, text: "hola" } } });
+  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: providerId, last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+
+  const observed: TranslationEvent[] = [];
+  const firstResult = await first;
+  if (!firstResult.done) observed.push(firstResult.value);
+  await tick();
+  assert.equal(eventsOf(observed, "target_transcript").length, 0);
+  assert.equal(eventsOf(observed, "audio").length, 0);
+  controller.abort();
+  for (;;) {
+    const next = await iterator.next();
+    if (next.done) break;
+    observed.push(next.value);
+  }
+  assert.equal(eventsOf(observed, "target_transcript").length, 0);
+  assert.equal(eventsOf(observed, "audio").length, 0);
+});
+
+test("Accurate releases only final target and audio after input completion", async () => {
+  const socket = new FakeSocket();
+  let releaseInput!: () => void;
+  const inputReleased = new Promise<void>((resolve) => { releaseInput = resolve; });
+  async function* gatedFrames(ref: LaneContext): AsyncIterable<ReturnType<typeof frame>> {
+    yield* frames(ref, 16);
+    await inputReleased;
+  }
+  const adapter = accurateAdapter(socket);
+  const ref = context(0, "en", "es", "accurate", "A_TO_B", "accurate-final-turn");
+  const pending = collect(adapter.translate({ context: ref, frames: gatedFrames(ref), signal: new AbortController().signal }));
+  await socket.waitForSent("input_audio_data", 1);
+  const providerId = "accurate-final-provider";
+  socket.emit("message", { message_type: "validated_transcription", data: { transcription: { transcription_id: providerId, text: "hello" } } });
+  socket.emit("message", { message_type: "translated_transcription", data: { transcription: { transcription_id: providerId, translation_part_id: 0, text: "hola" } } });
+  socket.emit("message", { message_type: "output_audio_data", data: { transcription_id: providerId, last_chunk: true, data: Buffer.from(new Uint8Array(960)).toString("base64") } });
+  await tick();
+  releaseInput();
+  const events = await pending;
+  assert.deepEqual(eventsOf(events, "target_transcript").map((event) => event.finality), ["final"]);
+  assert.deepEqual(eventsOf(events, "audio").map((event) => event.finality), ["final"]);
+  assert.equal(eventsOf(events, "completed").length, 1);
 });
 
 test("evicts superseded Palabra generations while retaining same-generation playout order", async () => {
@@ -1150,10 +1273,16 @@ test("failed flush closes only its lane and the next turn reconnects", async () 
   });
   const firstRef = context(0, "en", "es", "balanced", "A_TO_B", "first");
   const first = adapter.translate({ context: firstRef, frames: frames(firstRef, 100000), signal: new AbortController().signal })[Symbol.asyncIterator]();
-  void first.next();
+  const firstEvent = first.next();
   await tick();
   sockets[0]!.failFlush = true;
-  await adapter.cancel(firstRef);
+  await assert.rejects(adapter.cancel(firstRef), (error: unknown) =>
+    error instanceof Error &&
+    (error as { readonly code?: unknown }).code === "PALABRA_CONNECTION",
+  );
+  const surfaced = await firstEvent;
+  assert.equal(surfaced.value?.kind, "error");
+  assert.equal(surfaced.value?.kind === "error" ? surfaced.value.error.code : undefined, "PALABRA_CONNECTION");
   assert.equal(sockets[0]?.closed, true);
   await first.return?.();
 

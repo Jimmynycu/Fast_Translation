@@ -126,6 +126,7 @@ interface LaneSession {
   turn: Turn | undefined;
   closePromise: Promise<void> | undefined;
   context: PreparedTask | undefined;
+  expectedTaskConfig: Record<string, unknown> | undefined;
   preparationError: PalabraAdapterError | undefined;
   retiredProviderIds: Set<string>;
   retiredProviderIdOrder: string[];
@@ -164,6 +165,8 @@ interface Turn {
   sawFinalTarget: boolean;
   sawLastAudio: boolean;
   inputFinished: boolean;
+  deferredProviderEvents: Array<{ readonly type: string; readonly data: Record<string, unknown> }>;
+  deferredProviderEventBytes: number;
   completionTimer: ReturnType<typeof setTimeout> | undefined;
   hardTimer: ReturnType<typeof setTimeout> | undefined;
 }
@@ -326,8 +329,10 @@ export class PalabraTranslationAdapter implements TranslationPort {
     }
     lane.preparationError = undefined;
     lane.prepared = false;
-    this.#send(lane, { message_type: "set_task", data: taskConfig(context.sourceLanguage, context.targetLanguage, context.behavior) });
+    const expectedTaskConfig = taskConfig(context.sourceLanguage, context.targetLanguage, context.behavior);
+    lane.expectedTaskConfig = expectedTaskConfig;
     try {
+      this.#send(lane, { message_type: "set_task", data: expectedTaskConfig });
       await this.#waitReady(lane);
       lane.prepared = true;
       lane.context = Object.freeze({
@@ -338,6 +343,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
       });
       return PALABRA_REMOTE_TASK_PREPARATION;
     } catch (error) { lane.prepared = false; throw error; }
+    finally { lane.expectedTaskConfig = undefined; }
   }
 
   async #waitReady(lane: LaneSession): Promise<void> {
@@ -345,7 +351,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     while (Date.now() < deadline) {
       if (lane.preparationError) throw lane.preparationError;
       const waiter = this.#taskWait(lane, Math.max(1, deadline - Date.now()));
-      try { this.#send(lane, { message_type: "get_task", data: { exclude_hidden: true } }); }
+      try { this.#send(lane, { message_type: "get_task", data: { exclude_hidden: false } }); }
       catch (error: unknown) {
         if (error instanceof PalabraAdapterError) throw error;
         throw new PalabraAdapterError("PALABRA_CONNECTION", "The translation service could not send a readiness check.", true);
@@ -536,7 +542,10 @@ export class PalabraTranslationAdapter implements TranslationPort {
   #dispatch(lane: LaneSession, envelope: Envelope): void {
     const data = envelope.data;
     if (envelope.type === "current_task") {
-      this.#resolveTask(lane, data.task_status === "running" ? "running" : "not_found");
+      this.#resolveTask(
+        lane,
+        data.task_status === "running" && currentTaskMatches(data, lane.expectedTaskConfig) ? "running" : "not_found",
+      );
       return;
     }
     if (envelope.type === "error") {
@@ -568,6 +577,14 @@ export class PalabraTranslationAdapter implements TranslationPort {
     }
     const turn = lane.turn;
     if (!turn || turn.lifecycle !== "active" || !turn.acceptEvents) return;
+    if (
+      turn.context.behavior.mode === "accurate" &&
+      !turn.inputFinished &&
+      (envelope.type === "translated_transcription" || envelope.type === "output_audio_data")
+    ) {
+      this.#deferAccurateProviderEvent(turn, envelope);
+      return;
+    }
     if (!this.#validateProviderEvent(lane, turn, data)) return;
     if (envelope.type === "partial_transcription") {
       if (turn.context.behavior.transcriptPolicy === "provisional_revisions" && this.#acceptTranscriptEvent(lane, turn, data)) {
@@ -600,6 +617,30 @@ export class PalabraTranslationAdapter implements TranslationPort {
 
   #resolveTask(lane: LaneSession, status: "running" | "not_found" | "other"): void {
     lane.taskWaiters.shift()?.resolve(status);
+  }
+
+  #deferAccurateProviderEvent(turn: Turn, envelope: Envelope): void {
+    const encodedBytes = utf8Bytes(JSON.stringify(envelope.data));
+    if (
+      turn.deferredProviderEvents.length >= MAX_QUEUED_PROVIDER_EVENTS ||
+      encodedBytes > MAX_QUEUED_PROVIDER_EVENT_BYTES ||
+      turn.deferredProviderEventBytes > MAX_QUEUED_PROVIDER_EVENT_BYTES - encodedBytes
+    ) {
+      this.#rejectProviderEventQueue(turn.lane);
+      return;
+    }
+    turn.deferredProviderEvents.push({ type: envelope.type, data: envelope.data });
+    turn.deferredProviderEventBytes += encodedBytes;
+  }
+
+  #releaseDeferredProviderEvents(turn: Turn): void {
+    if (!turn.deferredProviderEvents.length || turn.lifecycle !== "active") return;
+    const deferred = turn.deferredProviderEvents.splice(0);
+    turn.deferredProviderEventBytes = 0;
+    for (const event of deferred) {
+      if (turn.lifecycle !== "active") return;
+      this.#dispatch(turn.lane, { type: event.type, data: event.data });
+    }
   }
 
   #acceptTranscriptEvent(lane: LaneSession, turn: Turn, data: Record<string, unknown>): boolean {
@@ -798,9 +839,11 @@ export class PalabraTranslationAdapter implements TranslationPort {
     }
     turn.pendingAudio = join(turn.pendingAudio, bytes);
     while (turn.pendingAudio.byteLength >= CANONICAL_AUDIO.bytesPerFrame) {
-      const finality = data.last_chunk === true && turn.pendingAudio.byteLength === CANONICAL_AUDIO.bytesPerFrame
+      const finality = turn.context.behavior.mode === "accurate"
         ? "final"
-        : "provisional";
+        : data.last_chunk === true && turn.pendingAudio.byteLength === CANONICAL_AUDIO.bytesPerFrame
+          ? "final"
+          : "provisional";
       this.#emitAudio(
         turn,
         turn.pendingAudio.slice(0, CANONICAL_AUDIO.bytesPerFrame),
@@ -998,6 +1041,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     await this.#sendInput(lane, turn, new Uint8Array(FIXED_INPUT_CHUNK_BYTES));
     if (turn.lifecycle !== "active" || request.signal.aborted) return;
     turn.inputFinished = true;
+    this.#releaseDeferredProviderEvents(turn);
     this.#maybeComplete(turn);
   }
 
@@ -1029,8 +1073,8 @@ export class PalabraTranslationAdapter implements TranslationPort {
     let wakeInputStop = (): void => undefined;
     const inputStopPromise = new Promise<void>((resolve) => { wakeInputStop = resolve; });
     let turn!: Turn;
-    const abortListener = (): void => { if (turn.lifecycle === "active") void this.#cancelTurn(lane, turn); };
-    turn = { lane, context, queue: new EventQueue(maximumBufferedAudioFrames(context.behavior)), segments: new Map(), providerIds: new Set(), validatedProviderIds: new Set(), abortListener, acceptEvents: false, sawValidated: false, nextSegmentId: 0, nextAudioSegmentId: 0, nextDiagnosticId: 0, droppedAudioFrames: 0, queueTrimMetricFinal: false, queueFailureInProgress: false, signal, inputStopPromise, wakeInputStop, lifecycle: "active", inputStopped: false, inputIterator: undefined, inputReturnRequested: false, lastInputSequence: undefined, lastInputCapturedAtMs: undefined, lastInputSentAtMs: undefined, pendingAudio: new Uint8Array(0), pendingAudioTargetSegmentId: undefined, pendingAudioTargetRevision: undefined, lastCapturedAtMs: 0, sawFinalTarget: false, sawLastAudio: false, inputFinished: false, completionTimer: undefined, hardTimer: undefined };
+    const abortListener = (): void => { if (turn.lifecycle === "active") void this.#cancelTurn(lane, turn).catch(() => undefined); };
+    turn = { lane, context, queue: new EventQueue(maximumBufferedAudioFrames(context.behavior)), segments: new Map(), providerIds: new Set(), validatedProviderIds: new Set(), abortListener, acceptEvents: false, sawValidated: false, nextSegmentId: 0, nextAudioSegmentId: 0, nextDiagnosticId: 0, droppedAudioFrames: 0, queueTrimMetricFinal: false, queueFailureInProgress: false, signal, inputStopPromise, wakeInputStop, lifecycle: "active", inputStopped: false, inputIterator: undefined, inputReturnRequested: false, lastInputSequence: undefined, lastInputCapturedAtMs: undefined, lastInputSentAtMs: undefined, pendingAudio: new Uint8Array(0), pendingAudioTargetSegmentId: undefined, pendingAudioTargetRevision: undefined, lastCapturedAtMs: 0, sawFinalTarget: false, sawLastAudio: false, inputFinished: false, deferredProviderEvents: [], deferredProviderEventBytes: 0, completionTimer: undefined, hardTimer: undefined };
     turn.hardTimer = setTimeout(() => { if (turn.lifecycle === "active") this.#failTurn(turn, "PALABRA_TURN_TIMEOUT", "The translation service timed out while finishing the turn.", true); }, this.#turnMs);
     signal.addEventListener("abort", abortListener, { once: true });
     return turn;
@@ -1094,20 +1138,32 @@ export class PalabraTranslationAdapter implements TranslationPort {
     if (turn.completionTimer) clearTimeout(turn.completionTimer);
     this.#stopInput(turn);
     this.#finalizeQueueTrimMetric(turn);
-    turn.queue.end();
     let flushed = false;
+    let flushError: unknown;
     if (lane.socket && !lane.closed) {
-      try { this.#send(lane, { message_type: "flush_task", data: { languages: ["global"], pause_task: false } }); flushed = true; } catch { /* reconnect below */ }
+      try { this.#send(lane, { message_type: "flush_task", data: { languages: ["global"], pause_task: false } }); flushed = true; }
+      catch (error: unknown) { flushError = error; }
+    } else {
+      flushError = new PalabraAdapterError("PALABRA_CONNECTION", "The translation service connection is unavailable.", true);
     }
     if (!flushed) {
-      if (lane.closed) return;
-      lane.closed = true;
-      lane.prepared = false;
-      await this.#closeLane(lane, { remove: true, graceful: false });
-      return;
+      const failure = flushError instanceof PalabraAdapterError
+        ? flushError
+        : new PalabraAdapterError("PALABRA_CONNECTION", "The translation service connection failed while cancelling.", true);
+      this.#enqueue(turn, this.#error(turn.context, failure.code, failure.message, failure.retryable, failure.evidenceRef));
+      turn.queue.end();
+      if (!lane.closed) {
+        lane.closed = true;
+        lane.prepared = false;
+        await this.#closeLane(lane, { remove: true, graceful: false });
+      }
+      this.#cleanupTurn(lane, turn);
+      throw failure;
     }
     this.#retireTurnIds(lane, turn);
     if (lane.turn === turn) lane.turn = undefined;
+    turn.queue.end();
+    this.#cleanupTurn(lane, turn);
   }
 
   #retireTurnIds(lane: LaneSession, turn: Turn): void {
@@ -1206,7 +1262,7 @@ export class PalabraTranslationAdapter implements TranslationPort {
     const key = laneKey(context);
     const existing = this.#lanes.get(key);
     if (existing && !existing.closed) return existing;
-    const lane: LaneSession = { key, sessionId: context.sessionId, lane: context.lane, socket: undefined, socketEpoch: 0, opened: false, closed: false, intentionalClose: false, prepared: false, preparePromise: undefined, taskWaiters: [], turn: undefined, closePromise: undefined, context: undefined, preparationError: undefined, retiredProviderIds: new Set(), retiredProviderIdOrder: [], playoutGeneration: undefined };
+    const lane: LaneSession = { key, sessionId: context.sessionId, lane: context.lane, socket: undefined, socketEpoch: 0, opened: false, closed: false, intentionalClose: false, prepared: false, preparePromise: undefined, taskWaiters: [], turn: undefined, closePromise: undefined, context: undefined, expectedTaskConfig: undefined, preparationError: undefined, retiredProviderIds: new Set(), retiredProviderIdOrder: [], playoutGeneration: undefined };
     this.#lanes.set(key, lane);
     return lane;
   }
@@ -1277,6 +1333,23 @@ function sameTask(
     current.targetLanguage === next.targetLanguage &&
     current.behaviorVersion === next.behavior.version &&
     current.mode === next.behavior.mode;
+}
+function currentTaskMatches(data: Record<string, unknown>, expected: Record<string, unknown> | undefined): boolean {
+  if (expected === undefined) return false;
+  const direct = record(data.input_stream) && record(data.output_stream) && record(data.pipeline)
+    ? data
+    : asRecord(data.task) ?? asRecord(data.task_config);
+  return direct !== undefined && deepSubset(expected, direct);
+}
+function deepSubset(expected: unknown, actual: unknown): boolean {
+  if (Array.isArray(expected)) {
+    return Array.isArray(actual) && expected.length === actual.length && expected.every((value, index) => deepSubset(value, actual[index]));
+  }
+  if (record(expected)) {
+    if (!record(actual)) return false;
+    return Object.entries(expected).every(([key, value]) => deepSubset(value, actual[key]));
+  }
+  return Object.is(expected, actual);
 }
 function positiveMs(value: number, field: string): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > 2147483647) throw new PalabraAdapterError("PALABRA_CONFIGURATION", field + " must be a positive whole number of milliseconds.", false);

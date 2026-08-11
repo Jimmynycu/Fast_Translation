@@ -41,6 +41,7 @@ const state = {
   glossaryVersion: null,
   glossaryDirection: null,
   glossaryHash: null,
+  glossaryImportEpoch: 0,
   capabilitiesReady: false,
   dataAdmission: null,
   translation: null,
@@ -51,6 +52,9 @@ const state = {
   eventEpoch: 0,
   eventReconnectTimer: null,
   eventAttempts: 0,
+  eventResyncPromise: null,
+  eventResyncSessionId: null,
+  eventResyncToken: null,
   eventsClosed: false,
   lastCursor: 0,
   seenCursors: new Set(),
@@ -83,21 +87,26 @@ const state = {
   },
   pendingValidation: new Map(),
   pendingPlayed: new Map(),
+  pendingMediaClears: new Map(),
+  pendingMediaSocket: null,
   laneGenerations: new Map(),
   latencySamples: [],
   cutCount: 0,
   alertCount: 0,
   audio: null,
+  mediaStarting: false,
+  startingMediaSupervisor: null,
   mediaEpoch: 0,
   vadActive: false,
   captureBackpressureAlerted: false,
   capturePreroll: [],
+  commandEpoch: 0,
 };
 
 const MODE_LABELS = {
   fast: "Fast — streaming",
   balanced: "Balanced — stable phrases",
-  accurate: "Accurate — whole sentences",
+  accurate: "Accurate — speech-end sentences",
 };
 
 const PROVIDER_LABELS = {
@@ -412,6 +421,26 @@ function updateParticipantConnection(label, online) {
   element.replaceChildren(dot, document.createTextNode(" " + label));
 }
 
+function updateParticipantCaptureConnection(connectedLabel, roomLabel, audio = state.audio) {
+  if (!audio) {
+    updateParticipantConnection(roomLabel, true);
+    return;
+  }
+  const socket = audio.socketSupervisor?.socket;
+  if (
+    state.audio === audio &&
+    audio.captureReady === true &&
+    audio.context?.state === "running" &&
+    isOpenMediaSocket(socket)
+  ) {
+    updateParticipantConnection(connectedLabel, true);
+  } else if (!isOpenMediaSocket(socket)) {
+    updateParticipantConnection("Audio reconnecting", false);
+  } else {
+    updateParticipantConnection("Microphone stopped", false);
+  }
+}
+
 function updateParticipantLiveStatus(message, warning = false) {
   if (route.role !== "participant") return;
   const element = $("participant-live-status");
@@ -428,12 +457,17 @@ function setPreflight(id, outcome) {
     outcome === true ? "\u2713" : outcome === false ? "!" : "...";
 }
 
-function renderJoinCards(grants) {
+function renderJoinCards(grants, languageValues) {
   const container = $("join-cards");
   container.replaceChildren();
+  const languageLabel = (side, value) => {
+    const select = $("language-" + side.toLowerCase());
+    const option = Array.from(select?.options || []).find((item) => item.value === value);
+    return option?.textContent || value;
+  };
   const languages = {
-    A: $("language-a").selectedOptions[0].textContent,
-    B: $("language-b").selectedOptions[0].textContent,
+    A: languageLabel("A", languageValues?.A || $("language-a").value),
+    B: languageLabel("B", languageValues?.B || $("language-b").value),
   };
 
   ["A", "B"].forEach((side) => {
@@ -516,6 +550,94 @@ function resetSegmentRendering() {
       container.replaceChildren(empty);
     }
   }
+}
+
+function resetFeed(containerId, emptyText) {
+  const container = $(containerId);
+  if (!container) return;
+  const empty = document.createElement("p");
+  empty.className = "empty-state";
+  empty.textContent = emptyText;
+  container.replaceChildren(empty);
+}
+
+function clearParticipantReadiness(side) {
+  if (side !== "A" && side !== "B") return;
+  state.evidence.participantReadiness[side] = null;
+  if (route.role !== "operator") return;
+  const suffix = side.toLowerCase();
+  const capture = $("evidence-capture-" + suffix);
+  const headphones = $("evidence-headphones-" + suffix);
+  if (capture) capture.textContent = "Capture not reported";
+  if (headphones) headphones.textContent = "Headphones not attested";
+}
+
+function resetSessionProjection() {
+  state.commandEpoch += 1;
+  state.glossaryImportEpoch += 1;
+  state.roomStatus = "waiting";
+  for (const button of [$("start-session"), $("pause-session"), $("end-session")]) {
+    if (button) {
+      setLoading(button, false);
+      button.disabled = true;
+    }
+  }
+  state.participants.clear();
+  state.participantConsent = { A: false, B: false };
+  state.recorderArmState = "awaiting_consents";
+  state.recordingArmed = false;
+  state.processingDisclosure = null;
+  state.evidenceIdentity = null;
+  state.evidence.recorderPreflight = null;
+  clearParticipantReadiness("A");
+  clearParticipantReadiness("B");
+  state.evidence.providerReadiness = { A_TO_B: null, B_TO_A: null };
+  state.evidence.queues.clear();
+  state.evidence.latestPlayoutLag = null;
+  state.evidence.bargeStages.clear();
+  state.evidence.finalization = null;
+  state.latencySamples = [];
+  state.cutCount = 0;
+  state.alertCount = 0;
+  state.glossaryVersion = null;
+  state.glossaryDirection = null;
+  state.glossaryHash = null;
+  state.pendingMediaClears.clear();
+  state.pendingMediaSocket = null;
+  resetSegmentRendering();
+  const textResets = {
+    "participant-count": "0 / 2 joined",
+    "latency-value": "--",
+    "latency-detail": "No samples yet",
+    "cut-count": "0",
+    "alert-count": "0",
+    "alert-detail": "No alerts",
+    "evidence-audible-lag": "No audible-start acknowledgement yet.",
+    "evidence-finalization-status": "Not finalized",
+    "evidence-finalization-detail": "No review verdict is available until a verified seal is published.",
+    "evidence-finalization-record": "No sanitized finalization record has been published.",
+    "evidence-build-sha256": "Waiting for operator identity",
+    "evidence-profile-reference": "Waiting for operator identity",
+    "evidence-profile-sha256": "Waiting for operator identity",
+    "evidence-manifest-sha256": "Waiting for operator identity",
+    "evidence-services-sha256": "Waiting for operator identity",
+  };
+  for (const [id, text] of Object.entries(textResets)) {
+    const element = $(id);
+    if (element) element.textContent = text;
+  }
+  const roomState = $("room-state");
+  if (roomState) roomState.textContent = "Waiting";
+  updateParticipantConsentStatus();
+  updateRecording({ state: state.recorderArmState });
+  resetFeed("pipeline-feed", "The event stream will appear here.");
+  resetFeed("terminology-feed", "No terminology events.");
+  resetFeed("evidence-queue-feed", "No scoped queue samples yet.");
+  resetFeed("evidence-terminology-feed", "No terminology gate events.");
+  resetFeed("evidence-barge-feed", "No interruption chain yet.");
+  const finalizationTracks = $("evidence-finalization-tracks");
+  if (finalizationTracks) resetFeed("evidence-finalization-tracks", "No sealed track digests.");
+  updateRecorderControls();
 }
 
 function segmentUpdate(data) {
@@ -959,6 +1081,8 @@ function updateRoomState(value) {
   const pause = $("pause-session");
   const end = $("end-session");
   if (normal === "ended" || normal === "closed" || normal === "failed") {
+    state.commandEpoch += 1;
+    for (const button of [start, pause, end]) setLoading(button, false);
     start.disabled = true;
     pause.disabled = true;
     end.disabled = true;
@@ -966,22 +1090,34 @@ function updateRoomState(value) {
     if (route.role === "participant") {
       $("start-microphone").disabled = true;
       updateParticipantConnection("Session " + normal, false);
-      if (state.audio) void stopParticipantAudio(false);
+      void stopParticipantAudio(false);
     } else {
       updateGlobalStatus("Session " + normal, false);
     }
   } else if (normal === "closing") {
+    state.commandEpoch += 1;
+    for (const button of [start, pause, end]) setLoading(button, false);
     start.disabled = true;
     pause.disabled = true;
     end.disabled = true;
-    if (route.role === "operator") updateGlobalStatus("Finalizing evidence", true);
+    if (route.role === "participant") {
+      updateParticipantConnection("Session closing", false);
+      void stopParticipantAudio(false);
+    } else {
+      updateGlobalStatus("Finalizing evidence", true);
+    }
   } else if (normal === "active" || normal === "running" || normal === "started") {
     start.disabled = true;
     pause.disabled = false;
     pause.textContent = "Pause";
     end.disabled = false;
     if (route.role === "participant") {
-      updateParticipantConnection(state.audio ? "Live" : "Room live", true);
+      if (previousStatus === "paused" && state.audio) {
+        for (const track of state.audio.stream.getAudioTracks?.() ?? []) track.enabled = true;
+        state.capturePreroll = [];
+        updateParticipantCaptureReadiness(state.audio, true, "Live");
+      }
+      updateParticipantCaptureConnection("Live", "Room live");
       if (
         state.audio &&
         shouldSendSpeechStartForActiveTransition(previousStatus, normal, state.vadActive)
@@ -996,8 +1132,12 @@ function updateRoomState(value) {
     pause.disabled = false;
     pause.textContent = "Resume";
     end.disabled = false;
-    if (route.role === "participant" && state.audio && state.vadActive) {
-      sendMediaControl("speech_end");
+    if (route.role === "participant" && state.audio) {
+      for (const track of state.audio.stream.getAudioTracks?.() ?? []) track.enabled = false;
+      state.capturePreroll = [];
+      updateParticipantCaptureReadiness(state.audio, false, "Session paused");
+      state.vadActive = false;
+      updateParticipantLiveStatus("Session paused. Microphone frames are not sent.");
     } else if (route.role === "operator") {
       updateGlobalStatus("Session paused", true);
     }
@@ -1391,6 +1531,10 @@ function updateParticipantConsentControls() {
     !state.participantConsent[route.side] || state.eventsClosed;
 }
 
+function participantAudioStartAllowed() {
+  return !state.eventsClosed && !["closing", "closed", "ended", "failed"].includes(state.roomStatus);
+}
+
 function renderParticipantProcessingDisclosure(value) {
   if (route.role !== "participant") return;
   const disclosure = normalizeProcessingDisclosure(value);
@@ -1419,10 +1563,80 @@ function endSessionAfterConsentWithdrawal() {
       "Recording and processing consent was withdrawn. This session has ended.";
     updateParticipantConnection("Consent withdrawn — session ended", false);
     updateParticipantConsentControls();
-    if (state.audio) void stopParticipantAudio(false);
   } else {
     updateGlobalStatus("Participant consent withdrawn — session ended", false);
   }
+}
+
+function isEventHistoryGap(type, data) {
+  const code = typeof data?.code === "string" ? data.code : type;
+  return code === "event_cursor_gap" || code === "event_stream_overflow";
+}
+
+function recoverFromEventHistoryGap(code) {
+  const sessionId = state.eventSessionId;
+  if (!sessionId) return;
+  if (state.eventResyncPromise && state.eventResyncSessionId === sessionId) return;
+  const staleSocket = state.eventSocket;
+  const eventEpoch = ++state.eventEpoch;
+  state.eventSocket = null;
+  if (state.eventReconnectTimer) window.clearTimeout(state.eventReconnectTimer);
+  state.eventReconnectTimer = null;
+  state.eventAttempts = 0;
+  state.lastCursor = 0;
+  state.seenCursors.clear();
+  try {
+    staleSocket?.close(1011, "Event history resync required");
+  } catch {
+    // A close race must not prevent the authoritative resync path.
+  }
+
+  if (route.role === "participant") {
+    state.eventsClosed = true;
+    void stopParticipantAudio(false);
+    updateParticipantConnection("Event history gap — reload/rejoin", false);
+    updateParticipantLiveStatus(
+      "Event history is incomplete (" + code + "). Reload or rejoin this session.",
+      true,
+    );
+    return;
+  }
+
+  const resyncToken = { sessionId, eventEpoch };
+  state.eventResyncSessionId = sessionId;
+  state.eventResyncToken = resyncToken;
+  const isCurrentResync = () =>
+    state.eventResyncToken === resyncToken &&
+    state.eventEpoch === eventEpoch &&
+    state.eventSessionId === sessionId;
+  const resyncPromise = (async () => {
+    try {
+      resetSessionProjection();
+      const snapshot = await getJson("/api/sessions/" + encodeURIComponent(sessionId));
+      if (!isCurrentResync()) return;
+      if (!snapshot || snapshot.sessionId !== sessionId) {
+        throw new Error("The server returned a different session during event resync.");
+      }
+      showOperatorSession(snapshot, false);
+      updateGlobalStatus("Session resynced", true);
+    } catch (errorValue) {
+      if (!isCurrentResync()) return;
+      state.eventsClosed = true;
+      updateGlobalStatus("Event history unavailable", false);
+      addFeedItem(
+        $("pipeline-feed"),
+        "Event history unavailable",
+        errorValue instanceof Error ? errorValue.message : String(errorValue),
+        true,
+      );
+    }
+  })().finally(() => {
+    if (state.eventResyncToken !== resyncToken) return;
+    state.eventResyncPromise = null;
+    state.eventResyncSessionId = null;
+    state.eventResyncToken = null;
+  });
+  state.eventResyncPromise = resyncPromise;
 }
 
 function handleParticipantCaptions(envelope, type, data) {
@@ -1469,6 +1683,12 @@ function markParticipantTargetCut() {
 
 function handleEvent(envelope) {
   if (!envelope || typeof envelope !== "object") return;
+  const type = String(envelope.type || "event");
+  const data = envelope.data && typeof envelope.data === "object" ? envelope.data : {};
+  if (isEventHistoryGap(type, data)) {
+    recoverFromEventHistoryGap(typeof data.code === "string" ? data.code : type);
+    return;
+  }
   if (envelope.cursor !== undefined) {
     const cursor = String(envelope.cursor);
     const numericCursor = Number(envelope.cursor);
@@ -1481,8 +1701,6 @@ function handleEvent(envelope) {
     if (state.seenCursors.size > 5000) state.seenCursors.clear();
   }
 
-  const type = String(envelope.type || "event");
-  const data = envelope.data && typeof envelope.data === "object" ? envelope.data : {};
   const sides = eventSides(envelope);
   const summary = eventSummary(data, envelope);
   const isWarning = type === "error" || type === "terminology_alert";
@@ -1514,7 +1732,10 @@ function handleEvent(envelope) {
     updateRecorderControls();
   } else if (type === "participant_left") {
     const side = normaliseSide(data.side || envelope.lane);
-    if (side) state.participants.delete(side);
+    if (side) {
+      state.participants.delete(side);
+      clearParticipantReadiness(side);
+    }
     const participantCount = $("participant-count");
     if (participantCount) participantCount.textContent = state.participants.size + " / 2 joined";
     updateRecorderControls();
@@ -1624,7 +1845,7 @@ function connectEventStream(sessionId) {
   if (route.role === "participant" && !state.participantTransportSecure) return;
   clearPendingPlayed();
   if (state.eventSessionId !== null && state.eventSessionId !== sessionId) {
-    state.lastCursor = 0;
+    if (!state.session || state.session.sessionId !== sessionId) resetSessionProjection();
     state.seenCursors.clear();
     resetSegmentRendering();
   }
@@ -1658,7 +1879,7 @@ function connectEventStream(sessionId) {
     ) return;
     state.eventAttempts = 0;
     if (route.role === "participant") {
-      updateParticipantConnection(state.audio ? "Live" : "Room connected", true);
+      updateParticipantCaptureConnection("Live", "Room connected");
     } else {
       updateGlobalStatus("Event stream connected", true);
     }
@@ -1766,6 +1987,7 @@ function glossaryImportAllowed() {
 }
 
 function clearImportedGlossary() {
+  state.glossaryImportEpoch += 1;
   state.glossaryVersion = null;
   state.glossaryDirection = null;
   state.glossaryHash = null;
@@ -1848,6 +2070,7 @@ function invalidateGlossaryIfDirectionChanged() {
   ) {
     return;
   }
+  state.glossaryImportEpoch += 1;
   state.glossaryVersion = null;
   state.glossaryDirection = null;
   state.glossaryHash = null;
@@ -1871,16 +2094,28 @@ async function importGlossary(event) {
     return;
   }
 
+  const importEpoch = ++state.glossaryImportEpoch;
+  const sourceLanguage = $("language-a").value;
+  const targetLanguage = $("language-b").value;
+  const direction = sourceLanguage + "->" + targetLanguage;
+  const selectedFile = file;
+  const isCurrentSelection = () =>
+    state.glossaryImportEpoch === importEpoch &&
+    $("glossary-file").files?.[0] === selectedFile &&
+    currentGlossaryDirection() === direction;
+
   setLoading(button, true, "Importing...");
   try {
-    const upload = glossaryUploadContents(file.name, await file.arrayBuffer());
+    const upload = glossaryUploadContents(selectedFile.name, await selectedFile.arrayBuffer());
+    if (!isCurrentSelection()) throw new Error("Glossary selection changed; re-import it.");
     const response = await postJson("/api/glossaries", {
       name: $("glossary-name").value.trim(),
       ...upload,
-      sourceLanguage: $("language-a").value,
-      targetLanguage: $("language-b").value,
+      sourceLanguage,
+      targetLanguage,
       approvedBy: $("glossary-approved-by").value.trim(),
     });
+    if (!isCurrentSelection()) throw new Error("Glossary selection changed; re-import it.");
     const version =
       response.glossaryVersion ??
       response.version ??
@@ -1889,21 +2124,34 @@ async function importGlossary(event) {
       (response.glossary &&
         (response.glossary.version || response.glossary.hash || response.glossary.id));
     if (!version) throw new Error("The server did not return a glossary version.");
+    if (!isCurrentSelection()) throw new Error("Glossary selection changed; re-import it.");
     state.glossaryVersion = String(version);
-    state.glossaryDirection = currentGlossaryDirection();
+    state.glossaryDirection = direction;
     $("glossary-status").textContent = "Imported";
     $("glossary-status").classList.add("state-pill");
     updateGlossaryControls();
   } catch (errorValue) {
-    showError(error, errorValue);
+    if (state.glossaryImportEpoch === importEpoch) showError(error, errorValue);
   } finally {
-    setLoading(button, false, "Importing...");
+    if (state.glossaryImportEpoch === importEpoch) setLoading(button, false, "Importing...");
   }
 }
 
+function snapshotLanguagePair(value) {
+  if (!value || typeof value !== "object") return null;
+  const source = typeof value.A === "string" ? value.A.trim() : "";
+  const target = typeof value.B === "string" ? value.B.trim() : "";
+  if (!source || !target || source === target) return null;
+  return { A: source, B: target };
+}
+
 function showOperatorSession(snapshot, updateHistory) {
+  state.glossaryImportEpoch += 1;
   if (!snapshot || !snapshot.sessionId) {
     throw new Error("The server did not return a session ID.");
+  }
+  if (!Number.isSafeInteger(snapshot.eventCursor) || snapshot.eventCursor < 0) {
+    throw new Error("The server did not return an authoritative event cursor.");
   }
   if (
     typeof snapshot.provider !== "string" ||
@@ -1917,20 +2165,39 @@ function showOperatorSession(snapshot, updateHistory) {
   ) {
     throw new Error("The server did not return the pinned translation behavior.");
   }
+  if (state.session && state.session.sessionId !== snapshot.sessionId) {
+    resetSessionProjection();
+  }
+  const languages = snapshotLanguagePair(snapshot.languages);
+  if (!languages) {
+    throw new Error("The server did not return authoritative session languages.");
+  }
+  for (const [id, language] of [["language-a", languages.A], ["language-b", languages.B]]) {
+    const select = $(id);
+    if (select && Array.from(select.options || []).some((option) => option.value === language)) {
+      select.value = language;
+    }
+  }
   state.session = snapshot;
+  state.lastCursor = snapshot.eventCursor;
+  state.seenCursors.clear();
   const snapshotGlossaryHash = typeof snapshot.glossaryHash === "string" && snapshot.glossaryHash.trim()
     ? snapshot.glossaryHash.trim()
     : null;
   const snapshotGlossaryVersion = typeof snapshot.glossaryVersion === "string" && snapshot.glossaryVersion.trim()
     ? snapshot.glossaryVersion.trim()
     : null;
-  if (snapshotGlossaryHash === null && snapshotGlossaryVersion === null) {
-    state.glossaryHash = null;
-    state.glossaryVersion = null;
-    state.glossaryDirection = null;
-  } else {
-    state.glossaryHash = snapshotGlossaryHash;
-    if (snapshotGlossaryVersion !== null) state.glossaryVersion = snapshotGlossaryVersion;
+  state.glossaryHash = snapshotGlossaryHash;
+  state.glossaryVersion = snapshotGlossaryVersion;
+  state.glossaryDirection = snapshotGlossaryHash || snapshotGlossaryVersion
+    ? languages.A + "->" + languages.B
+    : null;
+  const glossaryStatus = $("glossary-status");
+  if (glossaryStatus) {
+    glossaryStatus.textContent = snapshotGlossaryHash || snapshotGlossaryVersion
+      ? "Imported"
+      : "Not imported";
+    glossaryStatus.classList.toggle?.("state-pill", Boolean(snapshotGlossaryHash || snapshotGlossaryVersion));
   }
   try {
     hydrateEvidenceConsole(snapshot);
@@ -1960,7 +2227,7 @@ function showOperatorSession(snapshot, updateHistory) {
   state.recordingArmed = snapshot.recordingArmed === true;
   updateRecording({ state: state.recorderArmState });
   updateParticipantConsentStatus();
-  renderJoinCards(Array.isArray(snapshot.endpointGrants) ? snapshot.endpointGrants : []);
+  renderJoinCards(Array.isArray(snapshot.endpointGrants) ? snapshot.endpointGrants : [], languages);
   $("setup-section").hidden = true;
   $("operator-dashboard").hidden = false;
   updateRoomState(snapshot.state || "created");
@@ -2031,6 +2298,8 @@ async function createSession(event) {
 
 async function sendSessionCommand(kind) {
   if (!state.session) return;
+  const sessionId = state.session.sessionId;
+  const commandEpoch = ++state.commandEpoch;
   const buttons = {
     arm_recorder: $("arm-recorder"),
     start: $("start-session"),
@@ -2050,14 +2319,26 @@ async function sendSessionCommand(kind) {
   setLoading(button, true, loadingLabels[kind]);
   try {
     await postJson(
-      "/api/sessions/" + encodeURIComponent(state.session.sessionId) + "/commands",
+      "/api/sessions/" + encodeURIComponent(sessionId) + "/commands",
       { kind, commandId: uniqueId() },
     );
+    if (
+      state.commandEpoch !== commandEpoch ||
+      !state.session ||
+      state.session.sessionId !== sessionId ||
+      ["closing", "closed", "ended", "failed"].includes(state.roomStatus)
+    ) return;
     setLoading(button, false, "");
     if (kind === "start" || kind === "resume") updateRoomState("active");
     if (kind === "pause") updateRoomState("paused");
     if (kind === "end") updateGlobalStatus("Finalizing evidence", true);
   } catch (errorValue) {
+    if (
+      state.commandEpoch !== commandEpoch ||
+      !state.session ||
+      state.session.sessionId !== sessionId ||
+      ["closing", "closed", "ended", "failed"].includes(state.roomStatus)
+    ) return;
     addFeedItem($("pipeline-feed"), "Command failed", errorValue.message, true);
     setLoading(button, false, "");
   }
@@ -2089,6 +2370,18 @@ async function initialiseOperator() {
   $("language-b").addEventListener("change", invalidateGlossaryIfDirectionChanged);
 
   $("glossary-file").addEventListener("change", (event) => {
+    state.glossaryImportEpoch += 1;
+    if (state.glossaryVersion !== null || state.glossaryHash !== null) {
+      state.glossaryVersion = null;
+      state.glossaryDirection = null;
+      state.glossaryHash = null;
+      const status = $("glossary-status");
+      if (status) {
+        status.textContent = "Not imported";
+        status.classList.remove?.("state-pill");
+      }
+      updateGlossaryControls();
+    }
     const file = event.currentTarget.files[0];
     $("file-label").textContent = file ? file.name : "Choose a glossary";
     $("file-drop").classList.toggle("has-file", Boolean(file));
@@ -2181,10 +2474,15 @@ function retainOutstandingClearRequest(audio, clearId, pending) {
 }
 
 function sendParticipantReadiness(audio, socket = currentMediaSocket()) {
+  const track = (audio.stream.getAudioTracks?.() ?? [])[0];
   if (
     state.audio !== audio ||
     state.mediaEpoch !== audio.epoch ||
     !audio.captureReady ||
+    !track ||
+    track.readyState !== "live" ||
+    track.muted === true ||
+    track.enabled === false ||
     audio.context.state !== "running" ||
     !isOpenMediaSocket(socket) ||
     audio.readinessSockets.has(socket)
@@ -2222,10 +2520,12 @@ function sendParticipantStoppedReadiness(audio, socket = currentMediaSocket()) {
 
 function updateParticipantCaptureReadiness(audio, active, status) {
   if (state.audio !== audio || state.mediaEpoch !== audio.epoch) return;
-  const track = audio.stream.getAudioTracks?.()[0];
-  const trackLive = !track || (track.readyState === "live" && track.muted !== true);
+  const track = (audio.stream.getAudioTracks?.() ?? [])[0];
+  const trackLive = Boolean(
+    track && track.readyState === "live" && track.muted !== true && track.enabled !== false,
+  );
   const running = audio.context.state === "running";
-  const ready = active && running && trackLive;
+  const ready = active && running && trackLive && state.roomStatus !== "paused";
   audio.captureReady = ready;
   if (ready) {
     sendParticipantReadiness(audio);
@@ -2295,7 +2595,69 @@ function clearParticipantPlayout(lane, generation, clearId, label, deliverySocke
   retainOutstandingClearRequest(audio, clearId, pending);
   if (alreadyDeliveredToSocket) return;
   audio.playoutNode.port.postMessage({ type: "clear", lane, generation, clearId });
-  $("playback-label").textContent = label;
+  if (label && audio.playoutActive === false) {
+    // The worklet owns the audible-start boundary; do not call this "playing"
+    // until it reports a playout_started message.
+    $("playback-label").textContent = "Clearing AI voice";
+  }
+}
+
+function queuePendingMediaClear(control, sourceSocket) {
+  if (
+    !control ||
+    control.type !== "clear" ||
+    typeof control.lane !== "string" ||
+    !Number.isSafeInteger(Number(control.generation)) ||
+    Number(control.generation) < 0 ||
+    typeof control.clearId !== "string" ||
+    control.clearId.trim().length === 0 ||
+    control.clearId.length > 256
+  ) return;
+  if (state.pendingMediaSocket !== sourceSocket) {
+    state.pendingMediaClears.clear();
+    state.pendingMediaSocket = sourceSocket;
+  }
+  state.pendingMediaClears.set(control.clearId, {
+    lane: control.lane,
+    generation: Number(control.generation),
+    clearId: control.clearId,
+    socket: sourceSocket,
+  });
+  while (state.pendingMediaClears.size > MAX_OUTSTANDING_CLEAR_REQUESTS) {
+    const oldest = state.pendingMediaClears.keys().next().value;
+    if (oldest === undefined) break;
+    state.pendingMediaClears.delete(oldest);
+  }
+}
+
+function replayPendingMediaClears(audio, deliverySocket) {
+  const socket = deliverySocket ?? audio.socketSupervisor.socket;
+  if (!socket || !isOpenMediaSocket(socket)) return;
+  const pending = Array.from(state.pendingMediaClears.values());
+  state.pendingMediaClears.clear();
+  state.pendingMediaSocket = null;
+  for (const control of pending) {
+    clearParticipantPlayout(
+      control.lane,
+      control.generation,
+      control.clearId,
+      "Audio queue cleared",
+      socket,
+    );
+  }
+}
+
+function replayOutstandingClearRequests(audio, socket) {
+  if (!socket || !isOpenMediaSocket(socket)) return;
+  for (const pending of audio.pendingClears.values()) {
+    pending.deliverySocket = socket;
+    audio.playoutNode.port.postMessage({
+      type: "clear",
+      lane: pending.lane,
+      generation: pending.generation,
+      clearId: pending.clearId,
+    });
+  }
 }
 
 function forwardPlayoutWorkletMessage(audio, message) {
@@ -2324,6 +2686,11 @@ function forwardPlayoutWorkletMessage(audio, message) {
       clearId,
     }, socket)) {
       rememberTerminalClearReceipt(audio, clearId, pending);
+      audio.pendingSpeechRecovery = false;
+      audio.speechRecoveryAttempted = false;
+      audio.playoutInterrupted = false;
+      audio.playoutActive = false;
+      $("playback-label").textContent = "Audio queue cleared";
     }
     return;
   }
@@ -2371,6 +2738,13 @@ function forwardPlayoutWorkletMessage(audio, message) {
   ) {
     return;
   }
+  if (message.type === "playout_started") {
+    audio.playoutActive = true;
+    $("playback-label").textContent = "Playing AI voice - generation " + message.generation;
+  } else {
+    audio.playoutActive = false;
+    $("playback-label").textContent = "Translated audio ready";
+  }
   sendMediaPayload({
     type: message.type,
     generation: message.generation,
@@ -2381,13 +2755,6 @@ function forwardPlayoutWorkletMessage(audio, message) {
 async function handleMediaMessage(message, sourceSocket) {
   const audio = state.audio;
   const epoch = audio?.epoch;
-  if (
-    !audio ||
-    !Number.isSafeInteger(epoch) ||
-    state.mediaEpoch !== epoch ||
-    audio.socketSupervisor.socket !== sourceSocket ||
-    !isOpenMediaSocket(sourceSocket)
-  ) return;
   if (typeof message === "string") {
     try {
       const control = JSON.parse(message);
@@ -2395,13 +2762,34 @@ async function handleMediaMessage(message, sourceSocket) {
         const lane = control.lane;
         const generation = Number(control.generation);
         const clearId = control.clearId;
-        clearParticipantPlayout(lane, generation, clearId, "Audio queue cleared", sourceSocket);
+        if (!audio && state.mediaStarting) {
+          queuePendingMediaClear({
+            type: "clear",
+            lane,
+            generation,
+            clearId,
+          }, sourceSocket);
+        } else if (
+          Number.isSafeInteger(epoch) &&
+          state.mediaEpoch === epoch &&
+          audio.socketSupervisor.socket === sourceSocket &&
+          isOpenMediaSocket(sourceSocket)
+        ) {
+          clearParticipantPlayout(lane, generation, clearId, "Audio queue cleared", sourceSocket);
+        }
       }
     } catch {
       showError($("participant-error"), "Received an invalid media control message.");
     }
     return;
   }
+  if (
+    !audio ||
+    !Number.isSafeInteger(epoch) ||
+    state.mediaEpoch !== epoch ||
+    audio.socketSupervisor.socket !== sourceSocket ||
+    !isOpenMediaSocket(sourceSocket)
+  ) return;
 
   const buffer = message instanceof Blob ? await message.arrayBuffer() : message;
   if (
@@ -2430,7 +2818,6 @@ async function handleMediaMessage(message, sourceSocket) {
     { type: "push", lane: participantPlayoutLane(), generation, sequence, samples },
     [samples.buffer],
   );
-  $("playback-label").textContent = "Playing AI voice - generation " + generation;
 }
 
 function openMediaSocket(sessionId, side) {
@@ -2499,15 +2886,28 @@ async function releaseParticipantWakeLock(audio) {
 }
 
 function sendMediaControl(type) {
-  sendMediaPayload({ type });
+  return sendMediaPayload({ type });
 }
 
 async function stopParticipantAudio(reportStopped) {
   const audio = state.audio;
+  state.mediaStarting = false;
+  const startingSupervisor = state.startingMediaSupervisor;
+  state.startingMediaSupervisor = null;
+  if (!audio && startingSupervisor) {
+    try {
+      startingSupervisor.stop(1000, "Microphone stopped");
+    } catch {
+      // Continue clearing the remaining startup state.
+    }
+  }
   if (audio) sendParticipantStoppedReadiness(audio, audio.socketSupervisor.socket);
   state.mediaEpoch += 1;
   state.audio = null;
+  state.pendingMediaClears.clear();
+  state.pendingMediaSocket = null;
   if (!audio) {
+    $("playback-label").textContent = "Translated audio ready";
     updateParticipantConsentControls();
     return;
   }
@@ -2556,6 +2956,7 @@ async function stopParticipantAudio(reportStopped) {
   $("call-live").hidden = true;
   $("call-idle").hidden = false;
   $("audio-meter").style.height = "0%";
+  $("playback-label").textContent = "Translated audio ready";
   if (reportStopped) {
     updateParticipantConnection(
       state.eventSocket && state.eventSocket.readyState === WebSocket.OPEN
@@ -2628,8 +3029,14 @@ async function startParticipantAudio() {
     );
     return;
   }
+  const startMediaEpoch = state.mediaEpoch;
+  if (!participantAudioStartAllowed()) {
+    showError(error, "This session is no longer accepting microphone capture.");
+    return;
+  }
 
   setLoading(button, true, "Requesting microphone...");
+  state.mediaStarting = true;
   let stream;
   let context;
   let socketSupervisor;
@@ -2644,6 +3051,9 @@ async function startParticipantAudio() {
     );
     state.participantConsent[route.side] = true;
     updateParticipantConsentControls();
+    if (state.mediaEpoch !== startMediaEpoch || !participantAudioStartAllowed()) {
+      throw new Error("This session closed while consent was being confirmed.");
+    }
     setLoading(button, true, "Requesting microphone...");
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
@@ -2657,6 +3067,9 @@ async function startParticipantAudio() {
         autoGainControl: true,
       },
     });
+    if (state.mediaEpoch !== startMediaEpoch || !participantAudioStartAllowed()) {
+      throw new Error("This session closed while the microphone was starting.");
+    }
     setPreflight("check-mic", true);
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -2680,20 +3093,46 @@ async function startParticipantAudio() {
         }
         state.captureBackpressureAlerted = false;
         clearError(error);
-        if (state.vadActive && connectedSocket.readyState === WebSocket.OPEN) {
-          connectedSocket.send(JSON.stringify({ type: "speech_start" }));
+        if (participantAudio.pendingSpeechRecovery) {
+          const recovered = sendMediaPayload({ type: "speech_start" }, connectedSocket);
+          const ended = recovered && (
+            state.vadActive || sendMediaPayload({ type: "speech_end" }, connectedSocket)
+          );
+          if (recovered && ended) {
+            participantAudio.pendingSpeechRecovery = false;
+            participantAudio.speechRecoveryAttempted = true;
+          }
+        } else if (state.vadActive && connectedSocket.readyState === WebSocket.OPEN) {
+          sendMediaPayload({ type: "speech_start" }, connectedSocket);
         }
+        replayOutstandingClearRequests(participantAudio, connectedSocket);
+        replayPendingMediaClears(participantAudio, connectedSocket);
         if (participantAudio.captureReady) {
           sendParticipantReadiness(participantAudio, connectedSocket);
         } else {
           sendParticipantStoppedReadiness(participantAudio, connectedSocket);
         }
-        updateParticipantConnection(detail.reconnected ? "Live - reconnected" : "Live", true);
+        updateParticipantCaptureConnection(
+          detail.reconnected ? "Live - reconnected" : "Live",
+          "Room connected",
+          participantAudio,
+        );
       },
       onDisconnect: () => {
-        if (state.audio === participantAudio) {
-          updateParticipantConnection("Audio reconnecting", false);
+        if (!participantAudio || state.audio !== participantAudio) return;
+        if (participantAudio.playoutInterrupted) {
+          if (!participantAudio.speechRecoveryAttempted) {
+            participantAudio.pendingSpeechRecovery = true;
+          }
+        } else {
+          participantAudio.playoutNode.port.postMessage({
+            type: "reset",
+            lane: participantPlayoutLane(),
+          });
         }
+        participantAudio.playoutActive = false;
+        $("playback-label").textContent = "Translated audio ready";
+        updateParticipantConnection("Audio reconnecting", false);
       },
       onRetry: (_connectionError, delayMs) => {
         if (state.audio === participantAudio) {
@@ -2701,7 +3140,11 @@ async function startParticipantAudio() {
         }
       },
     });
+    state.startingMediaSupervisor = socketSupervisor;
     await socketSupervisor.start();
+    if (state.mediaEpoch !== startMediaEpoch || !participantAudioStartAllowed()) {
+      throw new Error("This session closed while the audio channel was starting.");
+    }
     const captureNode = new AudioWorkletNode(context, "relay-pcm-capture", {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -2728,6 +3171,9 @@ async function startParticipantAudio() {
     playoutNode.connect(context.destination);
 
     const epoch = ++state.mediaEpoch;
+    if (!participantAudioStartAllowed()) {
+      throw new Error("This session closed while the audio graph was starting.");
+    }
     participantAudio = {
       epoch,
       context,
@@ -2743,8 +3189,14 @@ async function startParticipantAudio() {
       stoppedReadinessSockets: new WeakSet(),
       pendingClears: new Map(),
       terminalClearReceipts: new Map(),
+      playoutInterrupted: false,
+      pendingSpeechRecovery: false,
+      speechRecoveryAttempted: false,
+      playoutActive: false,
     };
     state.audio = participantAudio;
+    state.mediaStarting = false;
+    state.startingMediaSupervisor = null;
     installParticipantReadinessListeners(participantAudio);
 
     state.capturePreroll = [];
@@ -2772,6 +3224,10 @@ async function startParticipantAudio() {
       if (message.type === "frame") {
         const level = Math.min(100, Math.max(2, Number(message.rms || 0) * 500));
         $("audio-meter").style.height = level + "%";
+        if (state.roomStatus === "paused" || ["closing", "closed", "ended", "failed"].includes(state.roomStatus)) {
+          state.capturePreroll = [];
+          return;
+        }
         if (!state.vadActive) {
           if (message.pcm instanceof ArrayBuffer) {
             state.capturePreroll.push(message.pcm);
@@ -2783,17 +3239,26 @@ async function startParticipantAudio() {
       } else if (message.type === "vad") {
         const active = Boolean(message.active);
         if (active === state.vadActive) return;
+        if (state.roomStatus === "paused") {
+          state.vadActive = false;
+          state.capturePreroll = [];
+          return;
+        }
+        if (["closing", "closed", "ended", "failed"].includes(state.roomStatus)) return;
         if (
           active &&
           ["active", "running", "started"].includes(state.roomStatus)
         ) {
+          participantAudio.speechRecoveryAttempted = false;
+          participantAudio.playoutInterrupted = true;
           participantAudio.playoutNode.port.postMessage({
             type: "interrupt",
             lane: participantPlayoutLane(),
           });
         }
         state.vadActive = active;
-        sendMediaControl(active ? "speech_start" : "speech_end");
+        const sent = sendMediaControl(active ? "speech_start" : "speech_end");
+        if (active && !sent) participantAudio.pendingSpeechRecovery = true;
         if (active) {
           const preroll = state.capturePreroll.splice(0);
           for (const frame of preroll) sendPcmFrame(frame);
@@ -2807,9 +3272,13 @@ async function startParticipantAudio() {
       forwardPlayoutWorkletMessage(participantAudio, message);
     });
     playoutNode.port.start();
+    replayPendingMediaClears(participantAudio);
 
     await context.resume();
     updateParticipantCaptureReadiness(participantAudio, true, "Live");
+    if (!participantAudio.captureReady) {
+      throw new Error("The browser returned no active microphone track.");
+    }
     await requestParticipantWakeLock(participantAudio);
     setLoading(button, false, "");
     $("call-idle").hidden = true;
@@ -2819,6 +3288,8 @@ async function startParticipantAudio() {
     );
     updateParticipantConnection(connected ? "Live" : "Audio reconnecting", connected);
   } catch (errorValue) {
+    state.mediaStarting = false;
+    state.startingMediaSupervisor = null;
     state.audio = null;
     if (socketSupervisor) socketSupervisor.stop();
     if (participantAudio) await releaseParticipantWakeLock(participantAudio);

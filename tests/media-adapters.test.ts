@@ -84,6 +84,12 @@ async function nextWithin<T>(
   });
 }
 
+async function waitForSent(socket: FakeSocket, count: number): Promise<void> {
+  while (socket.sent.length < count) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 function frame(sessionId: string, generation = 2, sequence = 9) {
   return createAudioFrame({
     sessionId,
@@ -766,9 +772,7 @@ describe("BrowserWebSocketMediaPort", () => {
         started.push({ sequence: accepted.sequence, at });
       },
     });
-    while (socketB.sent.length === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    await waitForSent(socketB, 1);
     assert.equal(socketB.sent.length, 1);
     const packet = socketB.sent[0];
     assert.ok(packet instanceof Uint8Array);
@@ -837,7 +841,7 @@ describe("BrowserWebSocketMediaPort", () => {
     await events.return?.();
   });
 
-  it("does not retain a clear after browser delivery throws", async () => {
+  it("retains a clear for reconnect after browser delivery throws", async () => {
     const errors: BrowserMediaProtocolError[] = [];
     const media = new BrowserWebSocketMediaPort({
       onProtocolError: (error) => errors.push(error),
@@ -866,7 +870,47 @@ describe("BrowserWebSocketMediaPort", () => {
 
     const replacement = new FakeSocket();
     media.attach("clear-send-error", "B", replacement);
-    assert.deepEqual(replacement.sent, []);
+    assert.deepEqual(replacement.sent, [JSON.stringify({
+      type: "clear",
+      lane: "A_TO_B",
+      generation: 2,
+      clearId: "clear-send-error-2",
+    })]);
+  });
+
+  it("fails an undeliverable clear replay and retains it for the next socket", async () => {
+    const errors: BrowserMediaProtocolError[] = [];
+    const media = new BrowserWebSocketMediaPort({
+      onProtocolError: (error) => errors.push(error),
+    });
+    await media.clear({
+      sessionId: "clear-replay-send-error",
+      side: "B",
+      lane: "A_TO_B",
+      generation: 2,
+      clearId: "clear-replay-send-error-2",
+    });
+
+    const throwing = new FakeSocket();
+    throwing.sendError = new Error("replay send failure");
+    assert.throws(
+      () => media.attach("clear-replay-send-error", "B", throwing),
+      (error: unknown) =>
+        error instanceof BrowserMediaProtocolError &&
+        error.code === "socket_error" &&
+        error.message === "Browser clear replay failed",
+    );
+    assert.equal(throwing.readyState, 3);
+
+    const replacement = new FakeSocket();
+    media.attach("clear-replay-send-error", "B", replacement);
+    assert.deepEqual(replacement.sent, [JSON.stringify({
+      type: "clear",
+      lane: "A_TO_B",
+      generation: 2,
+      clearId: "clear-replay-send-error-2",
+    })]);
+    assert.deepEqual(errors.map((error) => error.code), ["socket_error"]);
   });
 
   it("rejects unknown clear lanes before destination routing", async () => {
@@ -909,14 +953,176 @@ describe("BrowserWebSocketMediaPort", () => {
       signal: new AbortController().signal,
       onPlayoutStarted: () => undefined,
     });
-    while (socket.sent.length === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    await waitForSent(socket, 1);
     now = 21;
     release();
     await play;
     assert.equal(socket.sent.length, 2);
     assert.equal(errors.at(-1)?.code, "playout_overflow");
+  });
+
+  it("waits for browser playout ACK capacity instead of dropping a burst", async () => {
+    const errors: BrowserMediaProtocolError[] = [];
+    const media = new BrowserWebSocketMediaPort({
+      queueCapacity: 2,
+      playoutAckTimeoutMs: 1_000,
+      onProtocolError: (error) => errors.push(error),
+    });
+    const socket = new FakeSocket();
+    media.attach("ack-capacity", "B", socket);
+    const play = media.play({
+      sessionId: "ack-capacity",
+      side: "B",
+      frames: (async function* () {
+        for (let sequence = 0; sequence < 4; sequence += 1) {
+          yield frame("ack-capacity", 1, sequence);
+        }
+      })(),
+      signal: new AbortController().signal,
+      onPlayoutStarted: () => undefined,
+    });
+    await waitForSent(socket, 2);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(socket.sent.length, 2);
+
+    socket.message(JSON.stringify({ type: "playout_started", generation: 1, sequence: 0 }), false);
+    await waitForSent(socket, 3);
+    socket.message(JSON.stringify({ type: "playout_started", generation: 1, sequence: 1 }), false);
+    await waitForSent(socket, 4);
+    socket.message(JSON.stringify({ type: "playout_started", generation: 1, sequence: 2 }), false);
+    socket.message(JSON.stringify({ type: "playout_started", generation: 1, sequence: 3 }), false);
+    await play;
+    assert.deepEqual(errors, []);
+  });
+
+  it("wakes a capped playout producer when its request is aborted", async () => {
+    const media = new BrowserWebSocketMediaPort({
+      queueCapacity: 1,
+      playoutAckTimeoutMs: 1_000,
+    });
+    const socket = new FakeSocket();
+    const controller = new AbortController();
+    media.attach("ack-capacity-abort", "B", socket);
+    const play = media.play({
+      sessionId: "ack-capacity-abort",
+      side: "B",
+      frames: (async function* () {
+        yield frame("ack-capacity-abort", 1, 0);
+        yield frame("ack-capacity-abort", 1, 1);
+      })(),
+      signal: controller.signal,
+      onPlayoutStarted: () => undefined,
+    });
+    await waitForSent(socket, 1);
+    controller.abort();
+    await play;
+    assert.equal(socket.sent.length, 1);
+  });
+
+  it("expires the final playout ACK after the frame stream ends", async () => {
+    let now = 0;
+    const errors: BrowserMediaProtocolError[] = [];
+    const media = new BrowserWebSocketMediaPort({
+      playoutAckTimeoutMs: 20,
+      now: () => now,
+      onProtocolError: (error) => errors.push(error),
+    });
+    const socket = new FakeSocket();
+    const controller = new AbortController();
+    const events = media.frames({ sessionId: "final-ack-timeout", signal: controller.signal })[
+      Symbol.asyncIterator
+    ]();
+    media.attach("final-ack-timeout", "B", socket);
+
+    await media.play({
+      sessionId: "final-ack-timeout",
+      side: "B",
+      frames: (async function* () {
+        yield frame("final-ack-timeout", 1, 0);
+      })(),
+      signal: new AbortController().signal,
+      onPlayoutStarted: () => undefined,
+    });
+    assert.equal(socket.sent.length, 1);
+    now = 21;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    assert.deepEqual(errors.map((error) => error.code), ["playout_overflow"]);
+    assert.equal((await events.next()).value?.type, "participant_state");
+    const expired = (await events.next()).value;
+    assert.equal(expired?.type, "alert");
+    if (expired?.type === "alert") assert.equal(expired.code, "playout_overflow");
+    controller.abort();
+    await events.return?.();
+  });
+
+  it("accepts a final playout ACK after the frame stream ends and cancels its timer", async () => {
+    let now = 0;
+    const errors: BrowserMediaProtocolError[] = [];
+    const media = new BrowserWebSocketMediaPort({
+      playoutAckTimeoutMs: 20,
+      now: () => now,
+      onProtocolError: (error) => errors.push(error),
+    });
+    const socket = new FakeSocket();
+    const started: number[] = [];
+    media.attach("final-ack", "B", socket);
+
+    await media.play({
+      sessionId: "final-ack",
+      side: "B",
+      frames: (async function* () {
+        yield frame("final-ack", 1, 0);
+      })(),
+      signal: new AbortController().signal,
+      onPlayoutStarted: (accepted) => started.push(accepted.sequence),
+    });
+    socket.message(JSON.stringify({
+      type: "playout_started",
+      generation: 1,
+      sequence: 0,
+    }), false);
+    assert.deepEqual(started, [0]);
+    now = 21;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    assert.deepEqual(errors, []);
+  });
+
+  it("clears a final playout timeout when the browser detaches or session closes", async () => {
+    let now = 0;
+    const errors: BrowserMediaProtocolError[] = [];
+    const media = new BrowserWebSocketMediaPort({
+      playoutAckTimeoutMs: 20,
+      now: () => now,
+      onProtocolError: (error) => errors.push(error),
+    });
+    const detached = new FakeSocket();
+    media.attach("final-detach", "B", detached);
+    await media.play({
+      sessionId: "final-detach",
+      side: "B",
+      frames: (async function* () {
+        yield frame("final-detach", 1, 0);
+      })(),
+      signal: new AbortController().signal,
+      onPlayoutStarted: () => undefined,
+    });
+    media.detach("final-detach", "B", detached);
+
+    const closed = new FakeSocket();
+    media.attach("final-close", "B", closed);
+    await media.play({
+      sessionId: "final-close",
+      side: "B",
+      frames: (async function* () {
+        yield frame("final-close", 1, 0);
+      })(),
+      signal: new AbortController().signal,
+      onPlayoutStarted: () => undefined,
+    });
+    media.closeSession("final-close");
+    now = 21;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    assert.deepEqual(errors, []);
   });
 
   it("rejects stale, foreign, and duplicate clear acknowledgements", async () => {
@@ -1060,19 +1266,31 @@ describe("BrowserWebSocketMediaPort", () => {
     ]();
 
     media.attach("clear-backpressure", "B", stalled);
-    for (const [generation, clearId] of [
-      [4, "clear-backpressure-4"],
-      [5, "clear-backpressure-5"],
-      [6, "clear-backpressure-6"],
-    ] as const) {
-      await media.clear({
+    await assert.rejects(
+      media.clear({
         sessionId: "clear-backpressure",
         side: "B",
         lane: "A_TO_B",
-        generation,
-        clearId,
-      });
-    }
+        generation: 4,
+        clearId: "clear-backpressure-4",
+      }),
+      (error: unknown) =>
+        error instanceof BrowserMediaProtocolError && error.code === "playout_overflow",
+    );
+    await media.clear({
+      sessionId: "clear-backpressure",
+      side: "B",
+      lane: "A_TO_B",
+      generation: 5,
+      clearId: "clear-backpressure-5",
+    });
+    await media.clear({
+      sessionId: "clear-backpressure",
+      side: "B",
+      lane: "A_TO_B",
+      generation: 6,
+      clearId: "clear-backpressure-6",
+    });
 
     assert.deepEqual(stalled.sent, []);
     assert.equal(stalled.readyState, 3);

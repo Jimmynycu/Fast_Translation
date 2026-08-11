@@ -422,6 +422,7 @@ process.stdout.write(JSON.stringify({
 }
 
 interface SegmentRenderProbe {
+  readonly socketUrls: readonly string[];
   readonly lines: readonly Readonly<{
     readonly text: string;
     readonly turnId: string;
@@ -433,11 +434,143 @@ interface SegmentRenderProbe {
   }>[];
 }
 
-function probeOperatorSegmentLifecycle(): SegmentRenderProbe {
+interface EventResyncFenceProbe {
+  readonly afterLateASessionId: string;
+  readonly finalSessionId: string;
+  readonly resyncGetCount: number;
+}
+
+function probeOperatorSegmentLifecycle(eventGapProbe?: boolean, staleResyncProbe?: false): SegmentRenderProbe;
+function probeOperatorSegmentLifecycle(eventGapProbe: false, staleResyncProbe: true): EventResyncFenceProbe;
+function probeOperatorSegmentLifecycle(eventGapProbe = false, staleResyncProbe = false): SegmentRenderProbe | EventResyncFenceProbe {
   const appUrl = pathToFileURL(resolve(process.cwd(), "web", "app.js"));
   appUrl.searchParams.set("operator-segment-test", randomUUID());
   const temporaryDirectory = resolve(process.cwd(), "work", "tmp");
   mkdirSync(temporaryDirectory, { recursive: true });
+  const gapScenario = eventGapProbe
+    ? `
+globalThis.eventSocket.emit("message", { data: JSON.stringify({ sessionId: "session-1", cursor: 0, type: "error", data: { code: "event_cursor_gap" } }) });
+await Promise.resolve();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+`
+    : "";
+  const setup = staleResyncProbe
+    ? `
+const response = (payload) => ({ ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) });
+const capabilities = {
+  provider: "deterministic",
+  modes: [
+    { mode: "fast", behavior: { version: 1 }, state: "locally_controlled", deterministicGlossary: true },
+    { mode: "balanced", behavior: { version: 1 }, state: "native", deterministicGlossary: false },
+    { mode: "accurate", behavior: { version: 1 }, state: "experimental", deterministicGlossary: false, reason: "Unavailable" },
+  ],
+  defaultMode: "fast",
+};
+const snapshotA = {
+  sessionId: "session-a", languages: { A: "en-US", B: "zh-TW" }, eventCursor: 0,
+  provider: "deterministic", translationMode: "fast", behaviorVersion: 1,
+  deterministicGlossary: false, translationState: "native", state: "created",
+  participantConsent: { A: { consented: false }, B: { consented: false } },
+  recorderArmState: "awaiting_consents", recordingArmed: false, endpointGrants: [],
+};
+const snapshotB = { ...snapshotA, sessionId: "session-b" };
+const pendingGets = [];
+let postCount = 0;
+globalThis.window = {
+  location: { search: "", hash: "", hostname: "localhost", href: "http://localhost:4207/" },
+  isSecureContext: false, WebSocket: RecordingWebSocket, addEventListener() {},
+  clearTimeout() {}, setTimeout() { return 0; }, history: { replaceState() {} },
+};
+globalThis.document = document;
+globalThis.WebSocket = RecordingWebSocket;
+globalThis.fetch = async (url, options = {}) => {
+  const path = String(url);
+  if (path.endsWith("/api/capabilities")) return response({ dataAdmission: "approved_poc_content", translation: capabilities });
+  if (path.endsWith("/api/sessions") && options.method === "POST") {
+    postCount += 1;
+    return response(postCount === 1 ? snapshotA : snapshotB);
+  }
+  if (path.endsWith("/api/sessions/session-a")) {
+    return new Promise((resolve) => pendingGets.push({ sessionId: "session-a", resolve }));
+  }
+  if (path.endsWith("/api/sessions/session-b")) {
+    return new Promise((resolve) => pendingGets.push({ sessionId: "session-b", resolve }));
+  }
+  return response({});
+};
+`
+    : `
+const snapshot = {
+  sessionId: "session-1",
+  languages: { A: "en-US", B: "zh-TW" },
+  eventCursor: ${eventGapProbe ? 7 : 0},
+  provider: "deterministic",
+  translationMode: "fast",
+  behaviorVersion: 1,
+  deterministicGlossary: false,
+  translationState: "native",
+  state: "created",
+  participantConsent: { A: { consented: false }, B: { consented: false } },
+  recorderArmState: "awaiting_consents",
+  recordingArmed: false,
+  endpointGrants: [],
+};
+globalThis.window = {
+  location: { search: "?sessionId=session-1", hash: "", hostname: "localhost", href: "http://localhost:4207/?sessionId=session-1" },
+  isSecureContext: false,
+  WebSocket: RecordingWebSocket,
+  addEventListener() {},
+  clearTimeout() {},
+  setTimeout() { return 0; },
+  history: { replaceState() {} },
+};
+globalThis.document = document;
+globalThis.WebSocket = RecordingWebSocket;
+globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => snapshot, text: async () => JSON.stringify(snapshot) });
+`;
+  const staleResyncScenario = staleResyncProbe
+    ? `
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const submit = document.getElementById("session-form").listeners.get("submit")?.[0];
+await submit?.({ preventDefault() {} });
+await new Promise((resolve) => setImmediate(resolve));
+const socketA = globalThis.eventSocket;
+if (!socketA) throw new Error("session-a create failed: " + document.getElementById("session-form-error").textContent);
+socketA.emit("message", { data: JSON.stringify({ sessionId: "session-a", cursor: 0, type: "error", data: { code: "event_cursor_gap" } }) });
+await Promise.resolve();
+await new Promise((resolve) => setImmediate(resolve));
+await submit?.({ preventDefault() {} });
+await new Promise((resolve) => setImmediate(resolve));
+const socketB = globalThis.eventSocket;
+socketB.emit("message", { data: JSON.stringify({ sessionId: "session-b", cursor: 0, type: "error", data: { code: "event_cursor_gap" } }) });
+await Promise.resolve();
+await new Promise((resolve) => setImmediate(resolve));
+const getA = pendingGets.find((entry) => entry.sessionId === "session-a");
+getA?.resolve(response(snapshotA));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const afterLateASessionId = document.getElementById("session-id").textContent;
+await submit?.({ preventDefault() {} });
+await new Promise((resolve) => setImmediate(resolve));
+const socketB2 = globalThis.eventSocket;
+socketB2.emit("message", { data: JSON.stringify({ sessionId: "session-b", cursor: 0, type: "error", data: { code: "event_cursor_gap" } }) });
+await Promise.resolve();
+await new Promise((resolve) => setImmediate(resolve));
+const getB = pendingGets.find((entry) => entry.sessionId === "session-b");
+getB?.resolve(response(snapshotB));
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+process.stdout.write(JSON.stringify({ afterLateASessionId, finalSessionId: document.getElementById("session-id").textContent, resyncGetCount: pendingGets.length }));
+process.exit(0);
+`
+    : "";
   const script = `
 class FakeElement {
   constructor(id = "") {
@@ -536,6 +669,7 @@ const document = {
   },
   createTextNode(textContent) { return { textContent }; },
 };
+const socketUrls = [];
 class RecordingWebSocket {
   static OPEN = 1;
   static CONNECTING = 0;
@@ -543,6 +677,7 @@ class RecordingWebSocket {
     this.url = String(url);
     this.readyState = RecordingWebSocket.OPEN;
     this.listeners = new Map();
+    socketUrls.push(this.url);
     globalThis.eventSocket = this;
   }
   addEventListener(type, listener) {
@@ -555,33 +690,11 @@ class RecordingWebSocket {
   }
   close() { this.readyState = 3; }
 }
-const snapshot = {
-  sessionId: "session-1",
-  provider: "deterministic",
-  translationMode: "fast",
-  behaviorVersion: 1,
-  deterministicGlossary: false,
-  translationState: "native",
-  state: "created",
-  participantConsent: { A: { consented: false }, B: { consented: false } },
-  recorderArmState: "awaiting_consents",
-  recordingArmed: false,
-  endpointGrants: [],
-};
-globalThis.window = {
-  location: { search: "?sessionId=session-1", hash: "", hostname: "localhost", href: "http://localhost:4207/?sessionId=session-1" },
-  isSecureContext: false,
-  WebSocket: RecordingWebSocket,
-  addEventListener() {},
-  clearTimeout() {},
-  setTimeout() { return 0; },
-  history: { replaceState() {} },
-};
-globalThis.document = document;
-globalThis.WebSocket = RecordingWebSocket;
-globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => snapshot, text: async () => JSON.stringify(snapshot) });
+${setup}
 await import(${JSON.stringify(appUrl.href)});
 await Promise.resolve();
+${staleResyncScenario}
+${gapScenario}
 const emit = (event) => globalThis.eventSocket.emit("message", {
   data: JSON.stringify({ sessionId: "session-1", ...event }),
 });
@@ -632,7 +745,7 @@ emit({ cursor: 10, type: "latency", lane: "B_TO_A", generation: 1, data: {
 } });
 await Promise.resolve();
 const transcript = elements.get("transcript-b");
-process.stdout.write(JSON.stringify({ lines: transcript.children.filter((line) => line.dataset?.kind === "target").map((line) => ({
+  process.stdout.write(JSON.stringify({ socketUrls, lines: transcript.children.filter((line) => line.dataset?.kind === "target").map((line) => ({
   text: line.querySelector("p")?.textContent || "",
   turnId: line.dataset.turnId || "",
   segmentId: line.dataset.segmentId || "",
@@ -657,7 +770,11 @@ process.stdout.write(JSON.stringify({ lines: transcript.children.filter((line) =
     },
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  return JSON.parse(result.stdout) as SegmentRenderProbe;
+  return JSON.parse(result.stdout) as SegmentRenderProbe | EventResyncFenceProbe;
+}
+
+function probeOperatorResyncFence(): EventResyncFenceProbe {
+  return probeOperatorSegmentLifecycle(false, true) as EventResyncFenceProbe;
 }
 
 interface StopCleanupProbe {
@@ -670,12 +787,117 @@ interface StopCleanupProbe {
   readonly error: string;
 }
 
-function probeParticipantStopCleanup(): StopCleanupProbe {
+interface OfflineRecoveryProbe {
+  readonly recoverySpeechControls: readonly string[];
+  readonly secondRecoverySpeechControls: readonly string[];
+  readonly clearAppliedCount: number;
+}
+
+interface PauseReconnectProbe {
+  readonly pausedTrackEnabled: boolean;
+  readonly pausedReadiness: readonly string[];
+  readonly pausedConnection: string;
+  readonly resumedTrackEnabled: boolean;
+  readonly resumedReadiness: readonly string[];
+  readonly resumedConnection: string;
+}
+
+interface EventGapParticipantProbe {
+  readonly trackStops: number;
+  readonly socketClosed: number;
+  readonly connection: string;
+  readonly liveStatus: string;
+  readonly reconnectTimers: number;
+}
+
+interface CaptureStartProbe {
+  readonly activeReadiness: boolean;
+  readonly liveVisible: boolean;
+  readonly connection: string;
+  readonly error: string;
+  readonly trackStops: number;
+  readonly socketClosed: number;
+}
+
+function probeParticipantStopCleanup(): StopCleanupProbe;
+function probeParticipantStopCleanup(offlineRecovery: true): OfflineRecoveryProbe;
+function probeParticipantStopCleanup(offlineRecovery: false, pauseReconnect: true): PauseReconnectProbe;
+function probeParticipantStopCleanup(offlineRecovery: false, pauseReconnect: false, eventGapProbe: true): EventGapParticipantProbe;
+function probeParticipantStopCleanup(offlineRecovery: false, pauseReconnect: false, eventGapProbe: false, trackMode: "empty" | "muted"): CaptureStartProbe;
+function probeParticipantStopCleanup(offlineRecovery = false, pauseReconnect = false, eventGapProbe = false, trackMode: "normal" | "empty" | "muted" = "normal"): StopCleanupProbe | OfflineRecoveryProbe | PauseReconnectProbe | EventGapParticipantProbe | CaptureStartProbe {
   const appUrl = pathToFileURL(resolve(process.cwd(), "web", "app.js"));
   appUrl.searchParams.set("participant-stop-test", randomUUID());
   const temporaryDirectory = resolve(process.cwd(), "work", "tmp");
   mkdirSync(temporaryDirectory, { recursive: true });
+  const scenario = trackMode !== "normal"
+    ? `
+await new Promise((resolve) => setImmediate(resolve));
+const activeReadiness = mediaPayloads.some((entry) => entry.payload.type === "participant_readiness" && entry.payload.microphone === "browser_capture_active");
+process.stdout.write(JSON.stringify({ activeReadiness, liveVisible: !(elements.get("call-live")?.hidden ?? true), connection: elements.get("participant-connection")?.textContent || "", error: elements.get("participant-error")?.textContent || "", trackStops, socketClosed }));
+`
+    : eventGapProbe
+      ? `
+eventSocket.emit("message", { data: JSON.stringify({ sessionId: "session-1", cursor: 0, type: "error", data: { code: "event_stream_overflow" } }) });
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+process.stdout.write(JSON.stringify({ trackStops, socketClosed, connection: elements.get("participant-connection").textContent, liveStatus: elements.get("participant-live-status").textContent, reconnectTimers: reconnectTimers.length }));
+`
+      : offlineRecovery
+    ? `
+const firstMediaSocket = mediaSockets[0];
+firstMediaSocket.close();
+captureNodes[0].port.emit({ type: "vad", active: false });
+await new Promise((resolve) => setImmediate(resolve));
+reconnectTimers.shift()?.();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const recoveredSocket = mediaSockets[1];
+playoutNodes[0].port.emit({ type: "clear_applied", lane: "B_TO_A", generation: 0, clearId: "clear-recovery" });
+await Promise.resolve();
+const speechControls = (socketIndex) => mediaPayloads
+  .filter((entry) => entry.socketIndex === socketIndex && ["speech_start", "speech_end"].includes(entry.payload.type))
+  .map((entry) => entry.payload.type);
+const recoverySpeechControls = speechControls(1);
+recoveredSocket.close();
+reconnectTimers.shift()?.();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+process.stdout.write(JSON.stringify({ recoverySpeechControls, secondRecoverySpeechControls: speechControls(2), clearAppliedCount: mediaPayloads.filter((entry) => entry.payload.type === "clear_applied").length }));
+  `
+    : pauseReconnect
+      ? `
+eventSocket.emit("message", { data: JSON.stringify({ sessionId: "session-1", cursor: 2, type: "session_state", data: { state: "paused" } }) });
+await Promise.resolve();
+const readinessFor = (socketIndex) => mediaPayloads
+  .filter((entry) => entry.socketIndex === socketIndex && entry.payload.type === "participant_readiness")
+  .map((entry) => entry.payload.microphone);
+const pausedTrackEnabled = track.enabled;
+const pausedReadiness = readinessFor(0);
+mediaSockets[0].close();
+await new Promise((resolve) => setImmediate(resolve));
+reconnectTimers.shift()?.();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const pausedConnection = elements.get("participant-connection").textContent;
+eventSocket.emit("message", { data: JSON.stringify({ sessionId: "session-1", cursor: 3, type: "session_state", data: { state: "active" } }) });
+await Promise.resolve();
+const resumedTrackEnabled = track.enabled;
+const resumedReadiness = readinessFor(1);
+const resumedConnection = elements.get("participant-connection").textContent;
+process.stdout.write(JSON.stringify({ pausedTrackEnabled, pausedReadiness, pausedConnection, resumedTrackEnabled, resumedReadiness, resumedConnection }));
+`
+      : `
+const stopListeners = document.getElementById("stop-microphone").listeners.get("click") || [];
+for (const listener of stopListeners) listener();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
+const error = elements.get("participant-error");
+process.stdout.write(JSON.stringify({ socketClosed, supervisorStop: socketClosed > 0, trackStops, disconnects, contextClosed, playoutMessages, error: error.textContent }));
+`;
   const script = `
+const recoveryMode = ${offlineRecovery || pauseReconnect || eventGapProbe ? "true" : "false"};
+const startupRaceMode = ${offlineRecovery ? "true" : "false"};
+const trackMode = ${JSON.stringify(trackMode)};
 class FakeElement {
   constructor(id = "") {
     this.id = id;
@@ -695,7 +917,7 @@ class FakeElement {
   }
   append() {}
   prepend() {}
-  replaceChildren() {}
+  replaceChildren(...nodes) { this.textContent = nodes.map((node) => node?.textContent || "").join(""); }
   querySelector(selector) { return selector === "span" ? new FakeElement("span") : null; }
   querySelectorAll() { return []; }
   setAttribute() {}
@@ -713,6 +935,24 @@ const document = {
   createTextNode(textContent) { return { textContent }; },
 };
 const captureNodes = [];
+const playoutNodes = [];
+const mediaSockets = [];
+const reconnectTimers = [];
+const mediaPayloads = [];
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+function scheduleTimer(callback, delay) {
+  if (recoveryMode && delay >= 500 && delay < 10000) {
+    reconnectTimers.push(callback);
+    return reconnectTimers.length;
+  }
+  return nativeSetTimeout(callback, delay);
+}
+function clearTimer(id) { nativeClearTimeout(id); }
+if (recoveryMode) {
+  globalThis.setTimeout = scheduleTimer;
+  globalThis.clearTimeout = clearTimer;
+}
 let socketClosed = 0;
 let trackStops = 0;
 let disconnects = 0;
@@ -747,13 +987,12 @@ class FakeAudioContext {
 }
 class FakeTrack {
   readyState = "live";
-  muted = false;
+  constructor(muted = false) { this.muted = muted; }
   addEventListener() {}
   stop() { trackStops += 1; this.readyState = "ended"; }
 }
-const stream = { getAudioTracks: () => [new FakeTrack()], getTracks: () => [new FakeTrack()] };
-// Keep one track instance so teardown can be observed.
-stream.getTracks = () => stream.getAudioTracks();
+const track = trackMode === "empty" ? null : new FakeTrack(trackMode === "muted");
+const stream = { getAudioTracks: () => track ? [track] : [], getTracks: () => track ? [track] : [] };
 class RecordingWebSocket {
   static OPEN = 1;
   static CONNECTING = 0;
@@ -763,7 +1002,15 @@ class RecordingWebSocket {
     this.bufferedAmount = 0;
     this.listeners = new Map();
     this.isMedia = this.url.includes("/ws/media/");
-    if (this.isMedia) queueMicrotask(() => { this.readyState = RecordingWebSocket.OPEN; this.emit("open", {}); });
+    if (this.isMedia) mediaSockets.push(this);
+    if (this.isMedia) queueMicrotask(() => {
+      this.readyState = RecordingWebSocket.OPEN;
+      this.emit("open", {});
+      if (startupRaceMode && mediaSockets.length === 1) {
+        this.emit("message", { data: JSON.stringify({ type: "clear", lane: "B_TO_A", generation: 0, clearId: "clear-recovery" }) });
+        queueMicrotask(() => this.close());
+      }
+    });
     else this.readyState = RecordingWebSocket.OPEN;
     globalThis.lastSocket = this;
   }
@@ -773,7 +1020,13 @@ class RecordingWebSocket {
     this.listeners.set(type, listeners);
   }
   emit(type, event) { for (const listener of this.listeners.get(type) || []) listener.call(this, event); }
-  send() { if (this.isMedia) throw new Error("socket closed during speech_end"); }
+  send(value) {
+    if (!this.isMedia) return;
+    if (typeof value === "string") {
+      try { mediaPayloads.push({ socketIndex: mediaSockets.indexOf(this), payload: JSON.parse(value) }); } catch { /* binary */ }
+    }
+    if (!recoveryMode) throw new Error("socket closed during speech_end");
+  }
   close() { socketClosed += 1; this.readyState = 3; this.emit("close", {}); }
 }
 const disclosure = {
@@ -785,10 +1038,10 @@ globalThis.window = {
   isSecureContext: false,
   WebSocket: RecordingWebSocket,
   AudioContext: FakeAudioContext,
-  AudioWorkletNode: class extends Node { constructor(context, name) { super(name); if (name === "relay-pcm-capture") captureNodes.push(this); } },
+  AudioWorkletNode: class extends Node { constructor(context, name) { super(name); if (name === "relay-pcm-capture") captureNodes.push(this); if (name === "relay-pcm-playout") playoutNodes.push(this); } },
   addEventListener() {},
-  clearTimeout,
-  setTimeout,
+  clearTimeout: clearTimer,
+  setTimeout: scheduleTimer,
 };
 globalThis.document = document;
 globalThis.WebSocket = RecordingWebSocket;
@@ -806,13 +1059,8 @@ const startListeners = document.getElementById("start-microphone").listeners.get
 for (const listener of startListeners) listener();
 await new Promise((resolve) => setImmediate(resolve));
 await new Promise((resolve) => setImmediate(resolve));
-if (captureNodes[0]) captureNodes[0].port.emit({ type: "vad", active: true });
-const stopListeners = document.getElementById("stop-microphone").listeners.get("click") || [];
-for (const listener of stopListeners) listener();
-await new Promise((resolve) => setImmediate(resolve));
-await new Promise((resolve) => setImmediate(resolve));
-const error = elements.get("participant-error");
-process.stdout.write(JSON.stringify({ socketClosed, supervisorStop: socketClosed > 0, trackStops, disconnects, contextClosed, playoutMessages, error: error.textContent }));
+  if (captureNodes[0]) captureNodes[0].port.emit({ type: "vad", active: true });
+  ${scenario}
 `;
   const result = spawnSync(
     process.execPath,
@@ -1071,6 +1319,8 @@ const capabilities = {
 };
 const importedSnapshot = {
   sessionId: "session-imported",
+  languages: { A: "en-US", B: "zh-TW" },
+  eventCursor: 0,
   provider: "deterministic",
   translationMode: "fast",
   behaviorVersion: 1,
@@ -1274,6 +1524,8 @@ const capabilities = {
 };
 const snapshot = {
   sessionId: "session-approved",
+  languages: { A: "en-US", B: "zh-TW" },
+  eventCursor: 0,
   provider: "deterministic",
   translationMode: "fast",
   behaviorVersion: 1,
@@ -1434,6 +1686,19 @@ test("target lifecycle correlates projected provider playout IDs without sibling
   assert.doesNotMatch(third.label, /played/iu);
 });
 
+test("operator event-gap resync seeds the authoritative cursor without reconnect looping", () => {
+  const probe = probeOperatorSegmentLifecycle(true);
+  assert.equal(probe.socketUrls.length, 2);
+  assert.ok(probe.socketUrls.every((url) => /[?&]after=7(?:&|$)/u.test(url)));
+});
+
+test("late event-gap snapshots cannot clobber a newer session or resync promise", () => {
+  const probe = probeOperatorResyncFence();
+  assert.equal(probe.afterLateASessionId, "session-b");
+  assert.equal(probe.finalSessionId, "session-b");
+  assert.equal(probe.resyncGetCount, 2);
+});
+
 test("active VAD interrupts local playout before close-race cleanup", () => {
   const probe = probeParticipantStopCleanup();
   assert.deepEqual(probe.playoutMessages, [{ type: "interrupt", lane: "B_TO_A" }]);
@@ -1441,6 +1706,41 @@ test("active VAD interrupts local playout before close-race cleanup", () => {
   assert.equal(probe.trackStops, 1);
   assert.equal(probe.disconnects, 4);
   assert.equal(probe.contextClosed, 1);
+});
+
+test("offline VAD recovery sends one authoritative pair and does not replay it after clear", () => {
+  const probe = probeParticipantStopCleanup(true);
+  assert.deepEqual(probe.recoverySpeechControls, ["speech_start", "speech_end"]);
+  assert.deepEqual(probe.secondRecoverySpeechControls, []);
+  assert.equal(probe.clearAppliedCount, 1);
+});
+
+test("pause reconnect keeps capture stopped until resume re-advertises active capture", () => {
+  const probe = probeParticipantStopCleanup(false, true);
+  assert.equal(probe.pausedTrackEnabled, false);
+  assert.equal(probe.pausedReadiness.at(-1), "stopped");
+  assert.match(probe.pausedConnection, /Microphone stopped/u);
+  assert.equal(probe.resumedTrackEnabled, true);
+  assert.equal(probe.resumedReadiness.at(-1), "browser_capture_active");
+  assert.match(probe.resumedConnection, /Live/u);
+});
+
+test("participant event-history gaps stop audio and fail closed without reconnect", () => {
+  const probe = probeParticipantStopCleanup(false, false, true);
+  assert.equal(probe.trackStops, 1);
+  assert.equal(probe.reconnectTimers, 0);
+  assert.match(probe.connection, /reload\/rejoin/iu);
+  assert.match(probe.liveStatus, /event history is incomplete/iu);
+});
+
+test("missing or muted microphone tracks never advertise active capture", () => {
+  for (const mode of ["empty", "muted"] as const) {
+    const probe = probeParticipantStopCleanup(false, false, false, mode);
+    assert.equal(probe.activeReadiness, false, mode);
+    assert.equal(probe.liveVisible, false, mode);
+    assert.match(probe.error, /no active microphone track/iu, mode);
+    assert.equal(probe.socketClosed > 0, true, mode);
+  }
 });
 
 test("switching to a non-glossary-capable mode clears imported terminology", () => {
@@ -1532,6 +1832,25 @@ test("web UI fences retired streams and bounds operator lifecycle state", async 
   assert.match(app, /track\.addEventListener\?\.\("ended"/u);
   assert.match(app, /track\.addEventListener\?\.\("mute"/u);
   assert.match(app, /audio\.context\.addEventListener\?\.\("statechange"/u);
+  assert.match(app, /track\.enabled = false/u, "pause must disable microphone tracks");
+  assert.match(app, /track\.enabled = true/u, "resume must re-enable microphone tracks");
+  assert.match(app, /track\.enabled === false/u, "muted or disabled tracks cannot report active capture");
+  assert.match(app, /track\.muted !== true/u, "muted tracks cannot report active capture");
+  assert.match(app, /The browser returned no active microphone track/u);
+  assert.match(app, /pendingMediaClears/u, "early media clears must survive worklet initialization");
+  assert.match(app, /pendingSpeechRecovery/u, "offline VAD interruption recovery must wait for server controls");
+  assert.doesNotMatch(app, /type:\s*["']resume["']/u, "client must not self-authorize playout recovery");
+  assert.match(app, /event_cursor_gap/u);
+  assert.match(app, /event_stream_overflow/u);
+  assert.match(app, /snapshot\.languages/u);
+  assert.match(app, /snapshot\.eventCursor/u);
+  assert.match(app, /authoritative event cursor/u);
+  assert.match(app, /state\.glossaryImportEpoch \+= 1;\s+if \(!snapshot/u);
+  assert.match(app, /authoritative session languages/u);
+  assert.match(app, /speechRecoveryAttempted/u);
+  assert.match(app, /state\.roomStatus !== "paused"/u);
+  assert.match(app, /updateParticipantCaptureReadiness\(state\.audio, true, "Live"\)/u);
+  assert.match(app, /if \(!participantAudio \|\| state\.audio !== participantAudio\) return/u);
 });
 
 test("operator start gate requires actual capture, headphone attestation, and both provider preparations", async () => {

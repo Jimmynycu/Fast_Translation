@@ -1,4 +1,5 @@
 import type { ServerOptions as HttpsServerOptions } from "node:https";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
@@ -41,6 +42,8 @@ import {
   type EvidenceFinalization,
   type Lane,
   type MediaProfile,
+  type ParticipantConsentState,
+  type ParticipantEndpointGrant,
   type ParticipantReadiness,
   type RecorderPreflightResult,
   type RelayCommand,
@@ -238,11 +241,14 @@ const SAFE_ALERT_CODES = new Set([
   "placeholder_missing",
   "placeholder_reordered",
   "placeholder_unknown",
+  "playout_clear_failed",
   "playout_clear_tracking_trimmed",
   "playout_metadata_trimmed",
   "playout_queue_trimmed",
+  "provider_cancel_failed",
   "provider_error",
   "request_failed",
+  "source_queue_overflow",
   "source_input_closed",
   "source_queue_trimmed",
   "target_exact_missing",
@@ -716,6 +722,36 @@ function safeParticipantReadiness(
   });
 }
 
+function safeParticipantConsent(
+  consent: ParticipantConsentState,
+): Readonly<Pick<ParticipantConsentState, "consented" | "recording" | "processing">> {
+  return Object.freeze({
+    consented: consent.consented,
+    recording: consent.recording,
+    processing: consent.processing,
+  });
+}
+
+function safeEndpointGrant(grant: ParticipantEndpointGrant): Readonly<ParticipantEndpointGrant> {
+  switch (grant.kind) {
+    case "browser_link":
+      return Object.freeze({
+        kind: grant.kind,
+        side: grant.side,
+        url: grant.url,
+        qrDataUrl: grant.qrDataUrl,
+      });
+    case "telephony_test":
+      return Object.freeze({
+        kind: grant.kind,
+        side: grant.side,
+        address: grant.address,
+      });
+    default:
+      throw new TypeError("participant endpoint grant is invalid");
+  }
+}
+
 function safeProviderReadiness(
   readiness: TranslationPreparation,
 ): Readonly<TranslationPreparation> {
@@ -1154,6 +1190,7 @@ function publicTranslationCapabilities(translation: ConfiguredTranslation): Read
 function pinnedSessionTranslation(
   snapshot: SessionSnapshot,
   translation: ConfiguredTranslation,
+  requestedMode?: TranslationMode,
 ): Readonly<{
   provider: TranslationProviderId;
   translationMode: TranslationMode;
@@ -1166,6 +1203,8 @@ function pinnedSessionTranslation(
   if (
     snapshot.spec.provider !== translation.providerId ||
     capability === undefined ||
+    (requestedMode !== undefined && snapshot.spec.mode !== requestedMode) ||
+    snapshot.behavior.mode !== snapshot.spec.mode ||
     snapshot.behavior.version !== capability.behaviorVersion
   ) {
     throw new TypeError("relay snapshot does not match the configured translation behavior");
@@ -1244,11 +1283,12 @@ function safeSocketError(
   socket: Readonly<{ send(data: string): void }>,
   code: string,
   message: string,
+  sessionId = "",
 ): void {
   try {
     socket.send(JSON.stringify({
       cursor: 0,
-      sessionId: "",
+      sessionId,
       timestampMonoMs: performance.now(),
       type: "error",
       data: { code, message },
@@ -1260,6 +1300,19 @@ function safeSocketError(
 
 function safeEventStreamError(error: unknown): Readonly<{ code: string; message: string }> {
   if (error instanceof RelaySessionError) {
+    const relayCode = String(error.code);
+    if (relayCode === "event_cursor_gap") {
+      return {
+        code: "event_cursor_gap",
+        message: "Event history is unavailable for the requested cursor; resync is required",
+      };
+    }
+    if (relayCode === "event_stream_overflow") {
+      return {
+        code: "event_stream_overflow",
+        message: "Event stream fell behind; resync is required",
+      };
+    }
     switch (error.code) {
       case "invalid_session":
         return { code: error.code, message: "The requested session was not found" };
@@ -1283,11 +1336,17 @@ function safeRelayErrorMessage(code: RelaySessionError["code"]): string {
       return "The session already exists";
     case "invalid_spec":
       return "The session specification is invalid";
+    case "event_cursor_gap":
+      return "Event history is unavailable for the requested cursor; resync is required";
+    case "event_stream_overflow":
+      return "Event stream fell behind; resync is required";
   }
 }
 
 export interface EventSocketStreamOptions {
   readonly socket: EventSocket;
+  /** Session identity used on structured stream errors before the first event. */
+  readonly sessionId?: string;
   readonly events: AsyncIterable<SessionEvent> | (() => AsyncIterable<SessionEvent>);
   readonly eventAccess: EventAccessScope;
   readonly processingProfile: ApprovedSessionProcessingProfile;
@@ -1408,7 +1467,7 @@ export async function streamEventSocket(options: EventSocketStreamOptions): Prom
   } catch (error: unknown) {
     if (socketClosed) return;
     const eventStreamError = safeEventStreamError(error);
-    safeSocketError(socket, eventStreamError.code, eventStreamError.message);
+    safeSocketError(socket, eventStreamError.code, eventStreamError.message, options.sessionId);
     if (socket.readyState === socket.OPEN) closeEventSocket(socket, 1011, "Event stream failed");
   } finally {
     socketClosed = true;
@@ -1590,11 +1649,19 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
     }
   };
 
-  const sessionPayload = (snapshot: SessionSnapshot) => ({
-    ...pinnedSessionTranslation(snapshot, translation),
+  const sessionPayload = (snapshot: SessionSnapshot, requestedMode?: TranslationMode) => ({
+    ...pinnedSessionTranslation(snapshot, translation, requestedMode),
     sessionId: snapshot.sessionId,
+    languages: Object.freeze({
+      A: snapshot.spec.sideA.language,
+      B: snapshot.spec.sideB.language,
+    }),
+    eventCursor: snapshot.eventCursor,
     state: snapshot.status,
-    participantConsent: snapshot.participantConsent,
+    participantConsent: Object.freeze({
+      A: safeParticipantConsent(snapshot.participantConsent.A),
+      B: safeParticipantConsent(snapshot.participantConsent.B),
+    }),
     recorderArmState: snapshot.recorderArmState,
     recordingArmed: snapshot.recordingArmed,
     processingDisclosure: publicProcessingDisclosure(snapshot, processingProfile),
@@ -1606,8 +1673,16 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
       ? {}
       : { evidenceFinalization: safeEvidenceFinalization(snapshot.evidenceFinalization) }),
     ...snapshotOperationalReadiness(snapshot),
-    endpointGrants: [snapshot.participants.A, snapshot.participants.B],
-    ...(snapshot.glossary === undefined ? {} : { glossaryHash: snapshot.glossary.hash }),
+    endpointGrants: Object.freeze([
+      safeEndpointGrant(snapshot.participants.A),
+      safeEndpointGrant(snapshot.participants.B),
+    ]),
+    ...(snapshot.glossary === undefined
+      ? {}
+      : {
+          glossaryVersion: snapshot.glossary.version,
+          glossaryHash: snapshot.glossary.hash,
+        }),
     evidenceHealth: evidenceHealth(),
   });
 
@@ -1871,12 +1946,43 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
       if (error instanceof RelaySessionError) throw error;
       throw new ApiError(500, "session_open_failed", "The session could not be opened");
     }
+    let payload: ReturnType<typeof sessionPayload>;
+    try {
+      // Validate the relay's authoritative mode/spec before attaching a
+      // glossary lease to a session that cannot be safely exposed.
+      payload = sessionPayload(snapshot, body.translationMode);
+    } catch (error: unknown) {
+      // Relay admission succeeded, so terminate that session before returning
+      // the redacted payload-validation failure. The command is intentionally
+      // best effort: preserve the original safe error if cleanup itself fails.
+      try {
+        await options.relay.command(snapshot.sessionId, {
+          type: "end",
+          commandId: randomUUID(),
+          reason: "session_payload_invalid",
+        });
+      } catch {
+        // Preserve the original payload-validation error and its redaction.
+      }
+      if (glossaryLease !== undefined) {
+        try {
+          await releaseUnattachedGlossaryLease(glossaryLease);
+        } catch {
+          throw new ApiError(
+            500,
+            "session_open_cleanup_failed",
+            "The session could not be opened; glossary cleanup will be retried during shutdown",
+          );
+        }
+      }
+      throw error;
+    }
     if (glossaryLease !== undefined) {
       glossaryLeases.set(snapshot.sessionId, glossaryLease);
       unattachedGlossaryLeases.delete(glossaryLease);
       watchGlossaryLease(snapshot.sessionId);
     }
-    return reply.code(201).send(sessionPayload(snapshot));
+    return reply.code(201).send(payload);
   });
 
   app.post<{ Params: { sessionId: string } }>(
@@ -2202,6 +2308,7 @@ export async function createServerApp(options: ServerAppOptions): Promise<Fastif
       const eventController = new AbortController();
       void streamEventSocket({
         socket: socket as unknown as EventSocket,
+        sessionId: request.params.sessionId,
         events: () => options.relay.events(request.params.sessionId, after, eventController.signal),
         eventAccess,
         processingProfile,

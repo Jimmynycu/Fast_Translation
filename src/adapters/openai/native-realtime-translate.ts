@@ -515,6 +515,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
     // from an audio event/sequence name.
     let currentTargetSegmentId: string | undefined;
     let currentTargetRevision: number | undefined;
+    let hasValidTargetOutput = false;
     let missingTargetAudioReported = false;
     const publishTranscript = (
       kind: "source_transcript" | "target_transcript",
@@ -553,6 +554,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         currentTargetSegmentId = state.segmentId;
         currentTargetRevision = state.revision;
         missingTargetAudioReported = false;
+        if (state.text.trim().length > 0) hasValidTargetOutput = true;
       }
       queueEvent(
         {
@@ -578,6 +580,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
           currentTargetSegmentId = state.segmentId;
           currentTargetRevision = state.revision;
           missingTargetAudioReported = false;
+          if (state.text.trim().length > 0) hasValidTargetOutput = true;
         }
         queueEvent(
           {
@@ -619,6 +622,7 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
         }
         return;
       }
+      hasValidTargetOutput = true;
       const outputSequence = this.#playoutSequences.next(ref);
       const evidenceRef = providerId === undefined
         ? undefined
@@ -807,8 +811,24 @@ export class NativeRealtimeTranslateAdapter implements TranslationPort {
       if (lifecycle !== "active") return;
       clearCloseDeadline();
       stopInput();
+      continuousInputWindows?.end({ discardBuffered: true });
       finalizeTranscripts();
       finishOutputAudio();
+      if (!hasValidTargetOutput) {
+        if (missingTargetAudioReported) {
+          lifecycle = "failed";
+          events.closeAfterDrain();
+          closeSocket(socket);
+          return;
+        }
+        fail(
+          "OPENAI_REALTIME_NO_OUTPUT",
+          "The translation service closed before producing target translation output.",
+          true,
+          evidenceRef,
+        );
+        return;
+      }
       lifecycle = "completed";
       events.closeAfterDrain(completedEvent(evidenceRef));
       closeSocket(socket);

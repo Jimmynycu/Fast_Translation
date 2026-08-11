@@ -78,6 +78,9 @@ interface PendingPlayback {
 interface BrowserPlayback {
   readonly pending: Map<string, PendingPlayback>;
   readonly onPlayoutStarted: MediaPlaybackRequest["onPlayoutStarted"];
+  readonly capacityWaiters: Set<() => void>;
+  finished: boolean;
+  expiryTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 interface BrowserClearState {
@@ -311,6 +314,12 @@ export class BrowserWebSocketMediaPort implements MediaPort {
       }
     } finally {
       session.closed = true;
+      for (const side of ["A", "B"] as const) {
+        const playback = session.playback[side];
+        if (playback === undefined) continue;
+        this.#clearPlayback(playback);
+        delete session.playback[side];
+      }
       session.ingress.close();
       this.#sessions.delete(sessionId);
       this.#rememberClosedSession(sessionId);
@@ -335,9 +344,14 @@ export class BrowserWebSocketMediaPort implements MediaPort {
   async play(request: MediaPlaybackRequest): Promise<void> {
     assertIdentity(request.sessionId, request.side);
     const session = this.#session(request.sessionId);
+    const previous = session.playback[request.side];
+    if (previous !== undefined) this.#clearPlayback(previous);
     const playback: BrowserPlayback = {
       pending: new Map(),
       onPlayoutStarted: request.onPlayoutStarted,
+      capacityWaiters: new Set(),
+      finished: false,
+      expiryTimer: undefined,
     };
     session.playback[request.side] = playback;
     try {
@@ -346,10 +360,21 @@ export class BrowserWebSocketMediaPort implements MediaPort {
         const attachment = session.attachments[request.side];
         if (attachment === undefined || !isOpen(attachment.socket)) continue;
         this.#expirePending(playback, request.sessionId, request.side);
-        if (
-          (attachment.socket.bufferedAmount ?? 0) > this.#maximumBufferedBytes ||
-          playback.pending.size >= this.#queueCapacity
-        ) {
+        let canSend = true;
+        let currentAttachment: SocketAttachment | undefined = attachment;
+        while (playback.pending.size >= this.#queueCapacity) {
+          await this.#waitForPendingCapacity(playback, request.signal);
+          if (request.signal.aborted || session.closed || session.playback[request.side] !== playback) {
+            return;
+          }
+          currentAttachment = session.attachments[request.side];
+          if (currentAttachment === undefined || !isOpen(currentAttachment.socket)) {
+            canSend = false;
+            break;
+          }
+        }
+        if (!canSend || currentAttachment === undefined) continue;
+        if ((currentAttachment.socket.bufferedAmount ?? 0) > this.#maximumBufferedBytes) {
           this.#reject(
             "playout_overflow",
             "Browser playout exceeded its latency budget; the newest frame was dropped",
@@ -361,17 +386,27 @@ export class BrowserWebSocketMediaPort implements MediaPort {
         const key = playoutKey(frame.generation, frame.sequence);
         playback.pending.set(key, { frame, sentAtMs: this.#now() });
         try {
-          attachment.socket.send(
+          currentAttachment.socket.send(
             packPlayoutAudio(frame.generation, frame.sequence, frame.pcm16le),
           );
         } catch (error: unknown) {
           playback.pending.delete(key);
+          this.#schedulePendingExpiry(playback, request.sessionId, request.side);
           throw error;
         }
+        this.#schedulePendingExpiry(playback, request.sessionId, request.side);
       }
     } finally {
-      if (session.playback[request.side] === playback) delete session.playback[request.side];
-      playback.pending.clear();
+      playback.finished = true;
+      if (request.signal.aborted || session.closed || session.playback[request.side] !== playback) {
+        this.#clearPlayback(playback);
+        if (session.playback[request.side] === playback) delete session.playback[request.side];
+      } else if (playback.pending.size === 0) {
+        this.#clearPlayback(playback);
+        delete session.playback[request.side];
+      } else {
+        this.#schedulePendingExpiry(playback, request.sessionId, request.side);
+      }
     }
   }
 
@@ -408,55 +443,37 @@ export class BrowserWebSocketMediaPort implements MediaPort {
     }
     const playback = session.playback[request.side];
     if (playback !== undefined) {
+      let released = false;
       for (const [key, pending] of playback.pending) {
-        if (pending.frame.generation < request.generation) playback.pending.delete(key);
+        if (pending.frame.generation < request.generation) {
+          playback.pending.delete(key);
+          released = true;
+        }
+      }
+      if (released) this.#wakeCapacityWaiters(playback);
+      this.#schedulePendingExpiry(playback, request.sessionId, request.side);
+      if (playback.finished && playback.pending.size === 0 && session.playback[request.side] === playback) {
+        delete session.playback[request.side];
       }
     }
     const attachment = session.attachments[request.side];
     if (attachment !== undefined && isOpen(attachment.socket)) {
       try {
         this.#sendClear(
-          request.sessionId,
-          request.side,
           attachment.socket,
           request.lane,
           request.generation,
           request.clearId,
         );
-      } catch {
-        const current = session.clears[request.lane];
-        if (
-          current !== undefined &&
-          current.generation === request.generation &&
-          current.clearId === request.clearId
-        ) {
-          delete session.clears[request.lane];
-        }
-        try {
-          this.#reject(
-            "socket_error",
-            "Browser clear delivery failed",
-            request.sessionId,
-            request.side,
-          );
-        } catch {
-          // Keep teardown best effort even if the observer fails.
-        }
-        const currentAttachment = session.attachments[request.side];
-        if (currentAttachment?.socket === attachment.socket) {
-          const failedSides = new Set<Side>();
-          try {
-            this.#detach(request.sessionId, request.side, currentAttachment, true, failedSides);
-          } catch {
-            failedSides.add(request.side);
-          }
-          try {
-            currentAttachment.socket.close?.(1008, "Browser clear delivery failed");
-          } catch {
-            failedSides.add(request.side);
-          }
-        }
-        throw new BrowserMediaProtocolError("socket_error", "Browser clear delivery failed");
+      } catch (error: unknown) {
+        throw this.#failClearDelivery(
+          session,
+          request.sessionId,
+          request.side,
+          attachment.socket,
+          error,
+          "Browser clear delivery failed",
+        );
       }
     }
   }
@@ -497,28 +514,60 @@ export class BrowserWebSocketMediaPort implements MediaPort {
   }
 
   #sendClear(
-    sessionId: string,
-    side: Side,
     socket: BrowserSocketLike,
     lane: Lane,
     generation: number,
     clearId: string,
   ): void {
     if ((socket.bufferedAmount ?? 0) > this.#maximumBufferedBytes) {
-      this.#reject(
+      const error = new BrowserMediaProtocolError(
         "playout_overflow",
         "Browser playout exceeded its latency budget; the pending clear will be replayed on reconnect",
+      );
+      throw error;
+    }
+    socket.send(JSON.stringify({ type: "clear", lane, generation, clearId }));
+  }
+
+  #failClearDelivery(
+    session: BrowserSession,
+    sessionId: string,
+    side: Side,
+    socket: BrowserSocketLike,
+    error: unknown,
+    message: "Browser clear delivery failed" | "Browser clear replay failed",
+  ): BrowserMediaProtocolError {
+    const failure = error instanceof BrowserMediaProtocolError && error.code === "playout_overflow"
+      ? error
+      : new BrowserMediaProtocolError("socket_error", message);
+    try {
+      this.#reject(
+        failure.code,
+        failure.code === "playout_overflow" ? failure.message : message,
         sessionId,
         side,
       );
-      const attachment = this.#sessions.get(sessionId)?.attachments[side];
-      if (attachment?.socket === socket) {
-        this.#detach(sessionId, side, attachment, true);
-      }
-      socket.close?.(1008, "Browser playout backpressure");
-      return;
+    } catch {
+      // Keep teardown best effort even if the observer fails.
     }
-    socket.send(JSON.stringify({ type: "clear", lane, generation, clearId }));
+    const attachment = session.attachments[side];
+    if (attachment?.socket === socket) {
+      const failedSides = new Set<Side>();
+      try {
+        this.#detach(sessionId, side, attachment, true, failedSides);
+      } catch {
+        failedSides.add(side);
+      }
+      try {
+        socket.close?.(
+          1008,
+          failure.code === "playout_overflow" ? "Browser playout backpressure" : message,
+        );
+      } catch {
+        failedSides.add(side);
+      }
+    }
+    return failure;
   }
 
   #replayOutstandingClear(
@@ -538,35 +587,16 @@ export class BrowserWebSocketMediaPort implements MediaPort {
         continue;
       }
       try {
-        this.#sendClear(sessionId, side, socket, lane, clear.generation, clear.clearId);
-      } catch {
-        const current = session.clears[lane];
-        if (
-          current !== undefined &&
-          current.generation === clear.generation &&
-          current.clearId === clear.clearId
-        ) {
-          delete session.clears[lane];
-        }
-        try {
-          this.#reject("socket_error", "Browser clear replay failed", sessionId, side);
-        } catch {
-          // Keep the attachment teardown best effort.
-        }
-        const attachment = session.attachments[side];
-        if (attachment?.socket === socket) {
-          const failedSides = new Set<Side>();
-          try {
-            this.#detach(sessionId, side, attachment, true, failedSides);
-          } catch {
-            failedSides.add(side);
-          }
-          try {
-            socket.close?.(1008, "Browser clear replay failed");
-          } catch {
-            failedSides.add(side);
-          }
-        }
+        this.#sendClear(socket, lane, clear.generation, clear.clearId);
+      } catch (error: unknown) {
+        throw this.#failClearDelivery(
+          session,
+          sessionId,
+          side,
+          socket,
+          error,
+          "Browser clear replay failed",
+        );
       }
     }
   }
@@ -868,6 +898,11 @@ export class BrowserWebSocketMediaPort implements MediaPort {
       const pending = playback.pending.get(key);
       if (control.type === "playout_dropped") {
         if (pending !== undefined) playback.pending.delete(key);
+        if (pending !== undefined) this.#wakeCapacityWaiters(playback);
+        this.#schedulePendingExpiry(playback, sessionId, side);
+        if (playback.finished && playback.pending.size === 0 && session.playback[side] === playback) {
+          delete session.playback[side];
+        }
         this.#reject(
           "playout_overflow",
           "Browser trimmed stale playout before it reached the audio device",
@@ -878,6 +913,11 @@ export class BrowserWebSocketMediaPort implements MediaPort {
       }
       if (pending === undefined) return;
       playback.pending.delete(key);
+      this.#wakeCapacityWaiters(playback);
+      this.#schedulePendingExpiry(playback, sessionId, side);
+      if (playback.finished && playback.pending.size === 0 && session.playback[side] === playback) {
+        delete session.playback[side];
+      }
       playback.onPlayoutStarted(pending.frame, this.#now());
       return;
     }
@@ -900,16 +940,89 @@ export class BrowserWebSocketMediaPort implements MediaPort {
     });
   }
 
-  #expirePending(playback: BrowserPlayback, sessionId: string, side: Side): void {
-    const cutoffMs = this.#now() - this.#playoutAckTimeoutMs;
+  #clearPlaybackTimer(playback: BrowserPlayback): void {
+    if (playback.expiryTimer === undefined) return;
+    clearTimeout(playback.expiryTimer);
+    playback.expiryTimer = undefined;
+  }
+
+  #wakeCapacityWaiters(playback: BrowserPlayback): void {
+    for (const wake of [...playback.capacityWaiters]) wake();
+  }
+
+  #clearPlayback(playback: BrowserPlayback): void {
+    this.#clearPlaybackTimer(playback);
+    playback.pending.clear();
+    this.#wakeCapacityWaiters(playback);
+  }
+
+  async #waitForPendingCapacity(playback: BrowserPlayback, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const wake = () => {
+        if (settled) return;
+        settled = true;
+        playback.capacityWaiters.delete(wake);
+        signal.removeEventListener("abort", wake);
+        resolve();
+      };
+      playback.capacityWaiters.add(wake);
+      signal.addEventListener("abort", wake, { once: true });
+      if (signal.aborted) wake();
+    });
+  }
+
+  #schedulePendingExpiry(playback: BrowserPlayback, sessionId: string, side: Side): void {
+    this.#clearPlaybackTimer(playback);
+    if (playback.pending.size === 0) return;
+    let earliestSentAtMs = Number.POSITIVE_INFINITY;
+    for (const pending of playback.pending.values()) {
+      if (pending.sentAtMs < earliestSentAtMs) earliestSentAtMs = pending.sentAtMs;
+    }
+    const deadlineMs = earliestSentAtMs + this.#playoutAckTimeoutMs;
+    const delayMs = Math.max(0, deadlineMs - this.#now());
+    const timer = setTimeout(() => {
+      playback.expiryTimer = undefined;
+      const session = this.#sessions.get(sessionId);
+      if (session === undefined || session.closed || session.playback[side] !== playback) {
+        this.#clearPlayback(playback);
+        return;
+      }
+      try {
+        // Use the timer's deadline as a lower bound so injected clocks cannot
+        // leave a final pending frame alive after its real timeout elapsed.
+        this.#expirePending(playback, sessionId, side, Math.max(this.#now(), deadlineMs));
+      } finally {
+        if (playback.pending.size === 0) {
+          if (playback.finished && session.playback[side] === playback) {
+            delete session.playback[side];
+          }
+        } else {
+          this.#schedulePendingExpiry(playback, sessionId, side);
+        }
+      }
+    }, delayMs);
+    playback.expiryTimer = timer;
+    (timer as unknown as { readonly unref?: () => void }).unref?.();
+  }
+
+  #expirePending(
+    playback: BrowserPlayback,
+    sessionId: string,
+    side: Side,
+    cutoffMs = this.#now(),
+  ): void {
+    const cutoff = cutoffMs - this.#playoutAckTimeoutMs;
     let expired = 0;
     for (const [key, pending] of playback.pending) {
-      if (pending.sentAtMs <= cutoffMs) {
+      if (pending.sentAtMs <= cutoff) {
         playback.pending.delete(key);
         expired += 1;
       }
     }
     if (expired === 0) return;
+    this.#wakeCapacityWaiters(playback);
     this.#reject(
       "playout_overflow",
       expired + " unacknowledged browser playout frames expired",
@@ -991,6 +1104,8 @@ export class BrowserWebSocketMediaPort implements MediaPort {
     const session = this.#sessions.get(sessionId);
     if (session === undefined || session.attachments[side] !== attachment) return;
     const wasReady = session.readiness[side];
+    const playback = session.playback[side];
+    if (playback !== undefined) this.#clearPlayback(playback);
     if (session.terminalPendingReady.has(side)) {
       for (let index = session.terminalPending.length - 1; index >= 0; index -= 1) {
         if (session.terminalPending[index]?.side === side) session.terminalPending.splice(index, 1);
@@ -1054,7 +1169,6 @@ export class BrowserWebSocketMediaPort implements MediaPort {
       }
     }
     delete session.attachments[side];
-    session.playback[side]?.pending.clear();
     session.readiness[side] = false;
   }
 

@@ -51,6 +51,42 @@ async function loadCaptureProcessor(options: {
   return new Processor({ processorOptions: options });
 }
 
+async function loadPlayoutProcessor(): Promise<{
+  readonly port: WorkletPort;
+  process(inputs: unknown[], outputs: Float32Array[][]): boolean;
+}> {
+  let Processor: (new (options: unknown) => {
+    readonly port: WorkletPort;
+    process(inputs: unknown[], outputs: Float32Array[][]): boolean;
+  }) | undefined;
+  class Port implements WorkletPort {
+    onmessage?: (event: { data: unknown }) => void;
+    readonly messages: unknown[] = [];
+    postMessage(message: unknown): void {
+      this.messages.push(structuredClone(message));
+    }
+  }
+  class ProcessorBase {
+    readonly port = new Port();
+  }
+  const source = await readFile(
+    resolve(process.cwd(), "web", "public", "playout-worklet.js"),
+    "utf8",
+  );
+  runInNewContext(source, {
+    AudioWorkletProcessor: ProcessorBase,
+    sampleRate: 48_000,
+    registerProcessor: (_name: string, candidate: typeof Processor) => {
+      Processor = candidate;
+    },
+    Float32Array,
+    Number,
+    Math,
+  });
+  assert.ok(Processor !== undefined);
+  return new Processor({ processorOptions: { sourceSampleRate: 24_000 } });
+}
+
 function captureFrames(processor: CaptureProcessor): Array<{
   readonly type: "frame";
   readonly pcm: ArrayBuffer;
@@ -274,6 +310,19 @@ test("playout worklet applies id-correlated clears before acknowledging them", a
   );
 
   processor.port.onmessage?.({
+    data: { type: "reset", lane: "A_TO_B" },
+  });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 72, samples },
+  });
+  const resetOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], resetOutput), true);
+  assert.ok(
+    resetOutput[0]?.[0]?.every((sample) => sample === 0) === true,
+    "a local disconnect reset must keep same-generation audio suppressed until an authoritative clear",
+  );
+
+  processor.port.onmessage?.({
     data: { type: "clear", lane: "A_TO_B", generation: 3, clearId: "clear-3" },
   });
   processor.port.onmessage?.({
@@ -285,4 +334,70 @@ test("playout worklet applies id-correlated clears before acknowledging them", a
     resumedOutput[0]?.[0]?.some((sample) => sample > 0) === true,
     "a valid next-generation clear releases normal playback",
   );
+});
+
+test("playout worklet lets a newer generation supersede interruption while suppressing same-generation audio", async () => {
+  const processor = await loadPlayoutProcessor();
+  const samples = new Float32Array(480).fill(0.25);
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 0, samples },
+  });
+  processor.port.onmessage?.({ data: { type: "interrupt", lane: "A_TO_B" } });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 3, sequence: 0, samples },
+  });
+  const newerOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], newerOutput), true);
+  assert.ok(newerOutput[0]?.[0]?.some((sample) => sample > 0) === true);
+
+  processor.port.onmessage?.({ data: { type: "interrupt", lane: "A_TO_B" } });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 3, sequence: 1, samples },
+  });
+  const sameGenerationOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], sameGenerationOutput), true);
+  assert.ok(sameGenerationOutput[0]?.[0]?.every((sample) => sample === 0) === true);
+});
+
+test("playout reset replays an applied clear without releasing a later interruption", async () => {
+  const processor = await loadPlayoutProcessor();
+  const samples = new Float32Array(480).fill(0.25);
+  processor.port.onmessage?.({
+    data: { type: "clear", lane: "A_TO_B", generation: 2, clearId: "clear-2" },
+  });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 0, samples },
+  });
+  const initialOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], initialOutput), true);
+  assert.ok(initialOutput[0]?.[0]?.some((sample) => sample > 0) === true);
+
+  processor.port.onmessage?.({ data: { type: "reset", lane: "A_TO_B" } });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 1, samples },
+  });
+  const fencedOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], fencedOutput), true);
+  assert.ok(fencedOutput[0]?.[0]?.every((sample) => sample === 0) === true);
+
+  processor.port.onmessage?.({
+    data: { type: "clear", lane: "A_TO_B", generation: 2, clearId: "clear-2" },
+  });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 1, samples },
+  });
+  const replayedClearOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], replayedClearOutput), true);
+  assert.ok(replayedClearOutput[0]?.[0]?.some((sample) => sample > 0) === true);
+
+  processor.port.onmessage?.({ data: { type: "interrupt", lane: "A_TO_B" } });
+  processor.port.onmessage?.({
+    data: { type: "clear", lane: "A_TO_B", generation: 2, clearId: "clear-2" },
+  });
+  processor.port.onmessage?.({
+    data: { type: "push", lane: "A_TO_B", generation: 2, sequence: 2, samples },
+  });
+  const interruptedOutput = [[new Float32Array(128)]];
+  assert.equal(processor.process([], interruptedOutput), true);
+  assert.ok(interruptedOutput[0]?.[0]?.every((sample) => sample === 0) === true);
 });

@@ -717,6 +717,33 @@ class RejectingClearMedia extends FakeMedia {
   }
 }
 
+class DeferredFirstClearRejectMedia extends FakeMedia {
+  #rejectFirst!: (error: Error) => void;
+  #firstClearStarted!: () => void;
+  readonly #firstClear = new Promise<void>((resolve) => {
+    this.#firstClearStarted = resolve;
+  });
+
+  override async clear(request: MediaClearRequest): Promise<void> {
+    this.clears.push(request);
+    if (this.clears.length === 1) {
+      this.#firstClearStarted();
+      await new Promise<void>((_resolve, reject) => {
+        this.#rejectFirst = reject;
+      });
+      return;
+    }
+  }
+
+  async waitForFirstClear(): Promise<void> {
+    await this.#firstClear;
+  }
+
+  rejectFirstClear(): void {
+    this.#rejectFirst(new Error("first playout clear rejected late"));
+  }
+}
+
 class FakeTranslation implements TranslationPort {
   readonly capabilities = TEST_CAPABILITIES;
   readonly captured: AudioFrame[] = [];
@@ -801,6 +828,57 @@ class FakeTranslation implements TranslationPort {
     this.closedSessions.push(sessionId);
   }
 
+}
+
+class RejectingCancelTranslation extends FakeTranslation {
+  override async cancel(_generation: GenerationRef): Promise<void> {
+    throw new Error("translation cancellation rejected");
+  }
+}
+
+class ReprepareFailureTranslation extends FakeTranslation {
+  #prepareCount = 0;
+
+  override async prepare(context: LaneContext): Promise<TranslationPreparation> {
+    this.#prepareCount += 1;
+    if (this.#prepareCount > 2) throw new Error("provider transport went stale");
+    return super.prepare(context);
+  }
+}
+
+class DelayedRefreshTranslation extends FakeTranslation {
+  readonly #delayAt: number;
+  #prepareCount = 0;
+  #markRefreshStarted!: () => void;
+  #releaseRefresh!: () => void;
+  readonly #refreshStarted = new Promise<void>((resolve) => {
+    this.#markRefreshStarted = resolve;
+  });
+  readonly #refreshReleased = new Promise<void>((resolve) => {
+    this.#releaseRefresh = resolve;
+  });
+
+  constructor(delayAt = 3) {
+    super();
+    this.#delayAt = delayAt;
+  }
+
+  override async prepare(context: LaneContext): Promise<TranslationPreparation> {
+    this.#prepareCount += 1;
+    if (this.#prepareCount === this.#delayAt) {
+      this.#markRefreshStarted();
+      await this.#refreshReleased;
+    }
+    return super.prepare(context);
+  }
+
+  async waitForRefreshStart(): Promise<void> {
+    await this.#refreshStarted;
+  }
+
+  releaseRefresh(): void {
+    this.#releaseRefresh();
+  }
 }
 
 class NeverClosingTranslation extends FakeTranslation {
@@ -1615,6 +1693,7 @@ function makeRelay(
   finalizationTimeoutMs?: number,
   evidenceOperationTimeoutMs?: number,
   adapterCloseTimeoutMs?: number,
+  eventHistoryLimit?: number,
 ) {
   return new ModularGuardedDuplexRelay({
     media,
@@ -1626,6 +1705,7 @@ function makeRelay(
     ...(evidenceOperationTimeoutMs === undefined ? {} : { evidenceOperationTimeoutMs }),
     ...(adapterCloseTimeoutMs === undefined ? {} : { adapterCloseTimeoutMs }),
     ...(finalizationTimeoutMs === undefined ? {} : { finalizationTimeoutMs }),
+    ...(eventHistoryLimit === undefined ? {} : { eventHistoryLimit }),
     endpointGrant: (sessionId, side) => ({
       kind: "browser_link",
       side,
@@ -1692,6 +1772,7 @@ async function readySession(
   maxQueueFrames: number | null = 10,
   syntheticReadiness = false,
   timeoutMs = 2_000,
+  onEvent?: (event: SessionEvent) => void,
 ): Promise<{ events: SessionEvent[]; collector: Promise<void> }> {
   const snapshot = await relay.open(testSessionSpec({
     sideA: { language: "en-US" },
@@ -1703,7 +1784,10 @@ async function readySession(
   }));
   const events: SessionEvent[] = [];
   const collector = (async () => {
-    for await (const event of relay.events(snapshot.sessionId)) events.push(event);
+    for await (const event of relay.events(snapshot.sessionId)) {
+      events.push(event);
+      onEvent?.(event);
+    }
   })();
   for (const side of ["A", "B"] as const) {
     await relay.command(snapshot.sessionId, {
@@ -2217,10 +2301,10 @@ describe("ModularGuardedDuplexRelay", () => {
       () => relay.snapshot(snapshot.sessionId).status === "ready",
       "reconnected participant readiness did not restore ready",
     );
-    assert.equal(translation.prepared.length, 2, "reconnect must not prepare providers again");
+    assert.equal(translation.prepared.length, 2, "reconnect alone must not prepare providers again");
 
     await relay.command(snapshot.sessionId, { type: "start", commandId: "start-after-provider-ready" });
-    assert.equal(translation.prepared.length, 2, "Start must not prepare providers a second time");
+    assert.equal(translation.prepared.length, 4, "Start must refresh provider readiness");
     await relay.command(snapshot.sessionId, { type: "end", commandId: "end-pre-prepare" });
     await collector;
   });
@@ -2755,7 +2839,7 @@ describe("ModularGuardedDuplexRelay", () => {
 
     assert.deepEqual(consentProjected, [true, true]);
     assert.deepEqual(readinessProjected, [true, true]);
-    assert.deepEqual(providerProjected, [true, true]);
+    assert.deepEqual(providerProjected, [true, true, true, true]);
     assert.deepEqual(preflightProjected, [true]);
     assert.ok(recorderProjected.length >= 3);
     assert.equal(recorderProjected.every(Boolean), true);
@@ -3765,7 +3849,7 @@ describe("ModularGuardedDuplexRelay", () => {
     })), /cannot authorize a deterministic glossary/u);
   });
 
-  it("prepares both lanes before ready, then lets Start activate without a second preparation", async () => {
+  it("prepares both lanes before ready, then refreshes them before Start", async () => {
     const media = new FakeMedia();
     const translation = new FakeTranslation();
     const relay = makeRelay(media, translation, new FakeEvidence());
@@ -3779,12 +3863,244 @@ describe("ModularGuardedDuplexRelay", () => {
     assert.ok(lastProviderReadinessIndex < readyIndex);
     await relay.command("session-1", { type: "start", commandId: "start-prepare" });
     await waitUntil(() => events.some((event) => event.type === "session_state" && event.status === "active"), "active event was not observed");
-    assert.equal(translation.prepared.length, 2, "Start must not prepare providers twice");
+    assert.equal(translation.prepared.length, 4, "Start must refresh provider readiness before activation");
     const activeIndex = events.findIndex((event) => event.type === "session_state" && event.status === "active");
     assert.ok(activeIndex > readyIndex);
     await relay.command("session-1", { type: "end", commandId: "end-prepare" });
     await collector;
     assert.ok(translation.closedSessions.includes("session-1"));
+  });
+
+  it("does not activate on stale provider readiness when refresh fails", async () => {
+    const media = new FakeMedia();
+    const translation = new ReprepareFailureTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+
+    await assert.rejects(
+      relay.command("session-1", { type: "start", commandId: "start-stale-provider-readiness" }),
+    );
+    await waitUntil(() => relay.snapshot("session-1").status === "closed", "stale provider readiness did not fail closed");
+    assert.equal(
+      events.some((event) => event.type === "session_state" && event.status === "active"),
+      false,
+      "Start must not claim active with stale provider readiness",
+    );
+    assert.equal(
+      events.some((event) => event.type === "alert" && event.alert.code === "translation_prepare_failed"),
+      true,
+    );
+    await collector;
+  });
+
+  it("serializes start provider refresh with readiness events", async () => {
+    const media = new FakeMedia();
+    const translation = new DelayedRefreshTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+
+    const start = relay.command("session-1", { type: "start", commandId: "start-refresh-race" });
+    await translation.waitForRefreshStart();
+    media.push({
+      type: "participant_readiness",
+      sessionId: "session-1",
+      side: "A",
+      timestampMonoMs: performance.now(),
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+      source: "participant_browser_self_report",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    translation.releaseRefresh();
+    await start;
+
+    assert.equal(translation.prepared.length, 4, "readiness during refresh must not start a second provider pair");
+    assert.equal(events.filter((event) => event.type === "provider_readiness").length, 4);
+    assert.equal(relay.snapshot("session-1").status, "active");
+    await relay.command("session-1", { type: "end", commandId: "end-refresh-race" });
+    await collector;
+  });
+
+  it("rejects Start when readiness is lost during provider refresh", async () => {
+    const media = new FakeMedia();
+    const translation = new DelayedRefreshTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+
+    const start = relay.command("session-1", { type: "start", commandId: "start-refresh-disconnect" });
+    await translation.waitForRefreshStart();
+    media.push({
+      type: "participant_state",
+      sessionId: "session-1",
+      side: "A",
+      timestampMonoMs: performance.now(),
+      connected: false,
+    });
+    await waitUntil(
+      () => relay.snapshot("session-1").status === "waiting",
+      "disconnect during refresh did not return the session to waiting",
+    );
+    translation.releaseRefresh();
+
+    await assert.rejects(start);
+    assert.equal(relay.snapshot("session-1").status, "waiting");
+    assert.equal(
+      events.some((event) => event.type === "session_state" && event.status === "active"),
+      false,
+      "Start must not activate after its readiness prerequisites are lost",
+    );
+    await relay.command("session-1", { type: "end", commandId: "end-refresh-disconnect" });
+    await collector;
+  });
+
+  it("rejects Resume when a participant disconnects during provider refresh", async () => {
+    const media = new FakeMedia();
+    const translation = new DelayedRefreshTranslation(5);
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-before-resume-readiness-loss" });
+    await relay.command("session-1", { type: "pause", commandId: "pause-before-resume-readiness-loss" });
+    const activeEventsBeforeResume = events.filter(
+      (event) => event.type === "session_state" && event.status === "active",
+    ).length;
+
+    const resume = relay.command("session-1", { type: "resume", commandId: "resume-readiness-loss" });
+    await translation.waitForRefreshStart();
+    media.push({
+      type: "participant_state",
+      sessionId: "session-1",
+      side: "A",
+      timestampMonoMs: performance.now(),
+      connected: false,
+    });
+    await waitUntil(
+      () => relay.snapshot("session-1").status === "waiting",
+      "disconnect during resume refresh did not return the session to waiting",
+    );
+    translation.releaseRefresh();
+
+    await assert.rejects(resume);
+    assert.equal(relay.snapshot("session-1").status, "waiting");
+    assert.equal(
+      events.filter((event) => event.type === "session_state" && event.status === "active").length,
+      activeEventsBeforeResume,
+      "Resume must not activate after its readiness prerequisites are lost",
+    );
+    await relay.command("session-1", { type: "end", commandId: "end-resume-readiness-loss" });
+    await collector;
+  });
+
+  it("refreshes after prewarm readiness is published before its task tail clears", async () => {
+    const media = new FakeMedia();
+    const translation = new FakeTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    let start: Promise<void> | undefined;
+    const { events, collector } = await readySession(
+      relay,
+      media,
+      "fast",
+      undefined,
+      10,
+      false,
+      2_000,
+      (event) => {
+        if (event.type === "session_state" && event.status === "ready" && start === undefined) {
+          start = relay.command("session-1", {
+            type: "start",
+            commandId: "start-prewarm-tail-race",
+          });
+        }
+      },
+    );
+    assert.ok(start, "ready event must trigger start through the public event seam");
+    await assert.doesNotReject(start);
+    assert.equal(translation.prepared.length, 4, "start must perform one fresh provider pair");
+    assert.equal(relay.snapshot("session-1").status, "active");
+    await relay.command("session-1", { type: "end", commandId: "end-prewarm-tail-race" });
+    await collector;
+    assert.equal(events.some((event) => event.type === "session_state" && event.status === "closed"), true);
+  });
+
+  it("serializes resume provider refresh with readiness events", async () => {
+    const media = new FakeMedia();
+    const translation = new DelayedRefreshTranslation(5);
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-before-resume-refresh-race" });
+    await relay.command("session-1", { type: "pause", commandId: "pause-before-resume-refresh-race" });
+
+    const resume = relay.command("session-1", { type: "resume", commandId: "resume-refresh-race" });
+    await translation.waitForRefreshStart();
+    media.push({
+      type: "participant_readiness",
+      sessionId: "session-1",
+      side: "A",
+      timestampMonoMs: performance.now(),
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+      source: "participant_browser_self_report",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    translation.releaseRefresh();
+    await resume;
+
+    assert.equal(translation.prepared.length, 6, "readiness during resume refresh must not start a second provider pair");
+    assert.equal(events.filter((event) => event.type === "provider_readiness").length, 6);
+    assert.equal(relay.snapshot("session-1").status, "active");
+    await relay.command("session-1", { type: "end", commandId: "end-resume-refresh-race" });
+    await collector;
+  });
+
+  it("resumes after browser pause readiness reports stopped capture", async () => {
+    const media = new FakeMedia();
+    const translation = new FakeTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-browser-pause-readiness" });
+    await relay.command("session-1", { type: "pause", commandId: "pause-browser-pause-readiness" });
+    await waitUntil(() => media.clears.length === 2, "pause did not clear both playout lanes");
+    for (const clear of media.clears) {
+      media.push({
+        type: "playout_cleared",
+        sessionId: "session-1",
+        lane: clear.lane,
+        generation: clear.generation,
+        side: clear.side,
+        clearId: clear.clearId,
+        timestampMonoMs: performance.now(),
+      });
+    }
+
+    for (const side of ["A", "B"] as const) {
+      media.push({
+        type: "participant_readiness",
+        sessionId: "session-1",
+        side,
+        timestampMonoMs: performance.now(),
+        microphone: "stopped",
+        headphones: "not_attested",
+        source: "participant_browser_self_report",
+      });
+    }
+    await waitUntil(
+      () => (["A", "B"] as const).every((side) =>
+        relay.snapshot("session-1").participantReadiness[side]?.microphone === "stopped",
+      ),
+      "paused browser readiness was not recorded",
+    );
+
+    await relay.command("session-1", { type: "resume", commandId: "resume-browser-pause-readiness" });
+    await waitUntil(() => media.clears.length === 4, "resume did not issue fresh generation clears");
+    assert.deepEqual(
+      media.clears.slice(2).map((clear) => clear.generation),
+      [2, 2],
+      "resume clears must advance both lanes beyond the paused generation",
+    );
+    assert.equal(relay.snapshot("session-1").status, "active");
+    assert.equal(translation.prepared.length, 6, "Resume must refresh both provider lanes after paused readiness");
+    assert.equal(events.filter((event) => event.type === "session_state" && event.status === "active").length, 2);
+    await relay.command("session-1", { type: "end", commandId: "end-browser-pause-readiness" });
+    await collector;
   });
 
   it("fails closed when automatic lane preparation fails", async () => {
@@ -4048,7 +4364,7 @@ describe("ModularGuardedDuplexRelay", () => {
     await waitUntil(() => translation.captured.length === 1, "a current-generation source frame was not forwarded");
     assert.deepEqual(
       translation.captured.map((frame) => ({ generation: frame.generation, sequence: frame.sequence })),
-      [{ generation: 1, sequence: 1 }],
+      [{ generation: 2, sequence: 1 }],
     );
 
     await relay.command("session-1", { type: "end", commandId: "end-stale-source-persist" });
@@ -4495,6 +4811,53 @@ describe("ModularGuardedDuplexRelay", () => {
     assert.equal(translation.completedBatches[0]?.length, 26);
 
     await relay.command("session-1", { type: "end", commandId: "end-accurate-buffer" });
+    await collector;
+  });
+
+  it("preserves an accurate utterance beyond the continuous 2.4 second queue budget", async () => {
+    const media = new FakeMedia();
+    const translation = new BatchTranslation();
+    const evidence = new FakeEvidence();
+    const relay = makeRelay(media, translation, evidence);
+    const { collector } = await readySession(relay, media, "accurate", undefined, null);
+    await relay.command("session-1", { type: "start", commandId: "start-accurate-whole-utterance" });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    for (let sequence = 1; sequence <= 121; sequence += 1) {
+      media.push(audioEvent("A", sequence));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    media.push({ type: "speech_ended", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+
+    await waitUntil(() => translation.completedBatches.length === 1, "long accurate utterance was not committed");
+    assert.equal(translation.completedBatches[0]?.length, 121);
+    assert.equal(translation.completedBatches[0]?.[0]?.sequence, 1);
+    assert.equal(translation.completedBatches[0]?.at(-1)?.sequence, 121);
+
+    await relay.command("session-1", { type: "end", commandId: "end-accurate-whole-utterance" });
+    await collector;
+  });
+
+  it("fails explicitly when a bounded speech-end utterance exceeds its configured ceiling", async () => {
+    const media = new FakeMedia();
+    const translation = new BatchTranslation();
+    const relay = makeRelay(media, translation, new FakeEvidence());
+    const { events, collector } = await readySession(relay, media, "accurate", undefined, 2);
+    await relay.command("session-1", { type: "start", commandId: "start-accurate-overflow" });
+
+    media.push({ type: "speech_started", sessionId: "session-1", side: "A", timestampMonoMs: performance.now() });
+    media.push(audioEvent("A", 1));
+    media.push(audioEvent("A", 2));
+    media.push(audioEvent("A", 3));
+    await waitUntil(() => relay.snapshot("session-1").status === "closed", "oversized utterance did not fail closed");
+    assert.equal(
+      events.some((event) => event.type === "alert" && event.alert.code === "source_queue_overflow"),
+      true,
+    );
+    assert.equal(
+      events.some((event) => event.type === "alert" && event.alert.code === "source_queue_trimmed"),
+      false,
+    );
     await collector;
   });
 
@@ -5271,7 +5634,7 @@ describe("ModularGuardedDuplexRelay", () => {
       A_TO_B: { readiness: "fixture_local", remoteConnection: "not_applicable" },
       B_TO_A: { readiness: "fixture_local", remoteConnection: "not_applicable" },
     });
-    assert.equal(translation.prepared.length, 2, "disconnect must retain provider prewarm");
+    assert.equal(translation.prepared.length, 4, "disconnect must retain refreshed provider readiness");
     const capturedBeforeRestart = translation.captured.length;
     media.push(audioEvent("B", 1, 1));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -5406,7 +5769,7 @@ describe("ModularGuardedDuplexRelay", () => {
       "paused disconnect did not return the session to waiting",
     );
     assert.deepEqual(relay.snapshot("session-1").providerReadiness, providerReadiness);
-    assert.equal(translation.prepared.length, 2, "disconnect must retain provider prewarm");
+    assert.equal(translation.prepared.length, 4, "disconnect must retain refreshed provider readiness");
     media.push(audioEvent("A", 1, 1));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     assert.equal(translation.captured.length, capturedBeforeDisconnect, "waiting session forwarded paused source audio");
@@ -5436,7 +5799,7 @@ describe("ModularGuardedDuplexRelay", () => {
       (error: unknown) => error instanceof RelaySessionError && error.code === "invalid_command",
     );
     await relay.command("session-1", { type: "start", commandId: "restart-after-paused-disconnect" });
-    assert.equal(translation.prepared.length, 2, "restarting after reconnect must reuse provider prewarm");
+    assert.equal(translation.prepared.length, 6, "restarting after reconnect must refresh provider readiness");
 
     await relay.command("session-1", { type: "end", commandId: "end-paused-reconnect" });
     await collector;
@@ -5482,7 +5845,7 @@ describe("ModularGuardedDuplexRelay", () => {
           "active opposite-side disconnect did not fence both lanes",
         );
       }
-      assert.equal(translation.prepared.length, 2, "disconnect must retain provider prewarm");
+      assert.equal(translation.prepared.length, 4, "disconnect must retain refreshed provider readiness");
 
       const reconnectAtMonoMs = performance.now() + 10_000;
       media.push({
@@ -5563,7 +5926,7 @@ describe("ModularGuardedDuplexRelay", () => {
         commandId: "restart-opposite-" + scenario.status + "-" + scenario.side,
       });
       assert.equal(relay.snapshot("session-1").status, "active");
-      assert.equal(translation.prepared.length, 2, "restart must not prepare the opposite side twice");
+      assert.equal(translation.prepared.length, 6, "restart must refresh provider readiness");
 
       await relay.command("session-1", {
         type: "end",
@@ -6207,6 +6570,69 @@ describe("ModularGuardedDuplexRelay", () => {
     await collector;
   });
 
+  it("surfaces a non-barge playout clear failure and fails the session closed", async () => {
+    const media = new RejectingClearMedia();
+    const relay = makeRelay(media, new FakeTranslation(), new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-non-barge-clear-failure" });
+    await relay.command("session-1", { type: "pause", commandId: "pause-non-barge-clear-failure" });
+
+    await waitUntil(() => relay.snapshot("session-1").status === "closed", "non-barge clear failure did not fail closed");
+    assert.equal(
+      events.some((event) => event.type === "alert" && event.alert.code === "playout_clear_failed"),
+      true,
+    );
+    await collector;
+  });
+
+  it("ignores a late rejection from a discarded playout clear", async () => {
+    const media = new DeferredFirstClearRejectMedia();
+    const relay = makeRelay(media, new FakeTranslation(), new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-stale-clear-rejection" });
+    media.push(audioEvent("A", 0));
+    await waitUntil(() => media.played.B.length === 1, "initial audio did not reach playout");
+    media.push({ type: "speech_started", sessionId: "session-1", side: "B", timestampMonoMs: performance.now() });
+    await media.waitForFirstClear();
+    media.push({
+      type: "participant_state",
+      sessionId: "session-1",
+      side: "A",
+      timestampMonoMs: performance.now(),
+      connected: false,
+    });
+    await waitUntil(
+      () => relay.snapshot("session-1").status === "waiting" && media.clears.length >= 3,
+      "newer generation cut did not discard the first clear",
+    );
+    media.rejectFirstClear();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(relay.snapshot("session-1").status, "waiting");
+    assert.equal(
+      events.some((event) => event.type === "barge_lifecycle" && event.stage === "playout_clear_failed"),
+      false,
+      "a discarded clear rejection must not report failure for a newer cut",
+    );
+    await relay.command("session-1", { type: "end", commandId: "end-stale-clear-rejection" });
+    await collector;
+  });
+
+  it("surfaces a non-barge provider cancellation failure while fencing stale output", async () => {
+    const media = new FakeMedia();
+    const relay = makeRelay(media, new RejectingCancelTranslation(), new FakeEvidence());
+    const { events, collector } = await readySession(relay, media);
+    await relay.command("session-1", { type: "start", commandId: "start-non-barge-cancel-failure" });
+    await relay.command("session-1", { type: "pause", commandId: "pause-non-barge-cancel-failure" });
+
+    await waitUntil(
+      () => events.some((event) => event.type === "alert" && event.alert.code === "provider_cancel_failed"),
+      "non-barge cancellation failure was not surfaced",
+    );
+    assert.equal(relay.snapshot("session-1").status, "paused");
+    await relay.command("session-1", { type: "end", commandId: "end-non-barge-cancel-failure" });
+    await collector;
+  });
+
   it("fails closed when a barge playout clear is rejected", async () => {
     const media = new RejectingClearMedia();
     const relay = makeRelay(media, new FakeTranslation(), new FakeEvidence());
@@ -6421,6 +6847,80 @@ describe("ModularGuardedDuplexRelay", () => {
 
     await relay.command("session-1", { type: "end", commandId: "end-terminology-bypass" });
     await collector;
+  });
+
+  it("rejects a replay cursor that falls behind the retained event history", async () => {
+    const media = new FakeMedia();
+    const evidence = new FakeEvidence();
+    const relay = makeRelay(media, new FakeTranslation(), evidence, undefined, undefined, undefined, undefined, 100);
+    const { collector } = await readySession(relay, media);
+    const baseline = evidence.records.filter((record) => record.type === "session_event").length;
+    for (let index = 0; index < 110; index += 1) {
+      media.push({
+        type: "participant_state",
+        sessionId: "session-1",
+        side: "A",
+        connected: index % 2 === 0,
+        timestampMonoMs: performance.now(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    await waitUntil(
+      () => evidence.records.filter((record) => record.type === "session_event").length >= baseline + 110,
+      "event history did not advance beyond its retention limit",
+    );
+
+    assert.throws(
+      () => relay.events("session-1", 0),
+      (error: unknown) =>
+        error instanceof RelaySessionError && error.code === "event_cursor_gap",
+    );
+
+    await relay.command("session-1", { type: "end", commandId: "end-event-cursor-gap" });
+    await collector;
+  });
+
+  it("fails a live event subscriber explicitly when its bounded queue overflows", async () => {
+    const media = new FakeMedia();
+    const evidence = new FakeEvidence();
+    const relay = makeRelay(media, new FakeTranslation(), evidence, undefined, undefined, undefined, undefined, 100);
+    const snapshot = await relay.open(testSessionSpec({
+      sideA: { language: "en-US" },
+      sideB: { language: "zh-TW" },
+      provider: "openai_controlled",
+      mode: "fast",
+    }));
+    const iterator = relay.events(snapshot.sessionId)[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    assert.equal(first.value?.type, "session_opened");
+    for (const side of ["A", "B"] as const) {
+      await relay.command(snapshot.sessionId, {
+        type: "participant_consent",
+        commandId: "event-overflow-consent-" + side,
+        side,
+        consentId: "event-overflow-consent-id-" + side,
+        consentPolicyRef: snapshot.spec.processingManifest.consentPolicyRef,
+        recording: true,
+        processing: true,
+      });
+    }
+    for (let index = 0; index < 110; index += 1) {
+      media.push({
+        type: "participant_state",
+        sessionId: snapshot.sessionId,
+        side: "A",
+        connected: index % 2 === 0,
+        timestampMonoMs: performance.now(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    await assert.rejects(
+      iterator.next(),
+      (error: unknown) =>
+        error instanceof RelaySessionError && error.code === "event_stream_overflow",
+    );
+    await iterator.return?.();
+    await relay.command(snapshot.sessionId, { type: "end", commandId: "end-event-stream-overflow" });
   });
 
   it("bounds retained closed sessions while keeping the newest event history", async () => {

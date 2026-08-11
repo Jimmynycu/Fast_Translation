@@ -758,6 +758,40 @@ test("allowlist-projects only committed review metadata without leaking evidence
   assert.deepEqual(result.records[3], { kind: "alert", code: "unclassified_relay_alert" });
 });
 
+test("projects confirmed operational alert codes in evidence review metadata", async () => {
+  const codes = ["source_queue_overflow", "playout_clear_failed", "provider_cancel_failed"] as const;
+  const records: EvidenceRecord[] = codes.map((code, index) => ({
+    type: "session_event",
+    sessionId: SESSION_ID,
+    event: {
+      type: "alert",
+      cursor: index + 1,
+      sessionId: SESSION_ID,
+      timestampMonoMs: 1_000 + index * 20,
+      lane: "A_TO_B",
+      generation: 0,
+      alert: {
+        code,
+        message: "internal failure details must not cross the review boundary",
+        retryable: false,
+      },
+    },
+  } as unknown as EvidenceRecord));
+  const fixture = fakeReviewPort(records);
+  const review = new EvidenceReview({ artifacts: fixture.port, cursorKey: Buffer.alloc(32, 17) });
+
+  const result = await review.review({
+    kind: "metadata_page",
+    sessionId: SESSION_ID,
+    actor: { role: "evidence_reviewer", actorId: "bilingual-reviewer" },
+  });
+  assert.equal(result.status, "completed");
+  if (result.status !== "completed" || result.kind !== "metadata_page") {
+    throw new Error("Expected a completed metadata page");
+  }
+  assert.deepEqual(result.records, codes.map((code) => ({ kind: "alert", code })));
+});
+
 test("omits overlimit glossary provenance rather than releasing a partial entry-id projection", async () => {
   const sentinel = "GLOSSARY-PROVENANCE-SENTINEL";
   const glossaryRecord = (cursor: number, entryIds: readonly string[]): EvidenceRecord => ({

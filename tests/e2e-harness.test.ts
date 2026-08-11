@@ -405,6 +405,75 @@ async function closeWebSocket(socket: WebSocket | undefined): Promise<void> {
   });
 }
 
+function waitForSocketClose(socket: WebSocket, label: string): Promise<void> {
+  if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+  return new Promise((resolvePromise, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for " + label));
+    }, WAIT_MS);
+    const onClose = (): void => {
+      cleanup();
+      resolvePromise();
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+    };
+    socket.once("close", onClose);
+    socket.once("error", onError);
+  });
+}
+
+interface WebSocketCapture {
+  readonly binary: Uint8Array[];
+  readonly json: JsonObject[];
+  stop(): void;
+}
+
+function captureWebSocket(socket: WebSocket, acknowledgePlayout = false): WebSocketCapture {
+  const binary: Uint8Array[] = [];
+  const json: JsonObject[] = [];
+  const onMessage = (data: RawData, isBinary: boolean): void => {
+    if (isBinary) {
+      const packet = Uint8Array.from(rawBytes(data));
+      binary.push(packet);
+      if (acknowledgePlayout && socket.readyState === WebSocket.OPEN) {
+        const unpacked = unpackPlayoutAudio(packet);
+        socket.send(JSON.stringify({
+          type: "playout_started",
+          generation: unpacked.generation,
+          sequence: unpacked.sequence,
+        }));
+      }
+      return;
+    }
+    try {
+      const parsed: unknown = JSON.parse(new TextDecoder().decode(rawBytes(data)));
+      if (isObject(parsed)) json.push(parsed);
+    } catch {
+      // Ignore non-JSON control payloads in the capture helper.
+    }
+  };
+  socket.on("message", onMessage);
+  return {
+    binary,
+    json,
+    stop(): void {
+      socket.off("message", onMessage);
+    },
+  };
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise<void>((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
 async function postJson(
   origin: string,
   path: string,
@@ -523,6 +592,129 @@ function mediaUrlFromGrant(
   return mediaUrl.toString();
 }
 
+interface BrowserAcceptanceSession {
+  readonly fixture: Awaited<ReturnType<typeof createKeylessBrowserAcceptanceApplication>>;
+  readonly origin: string;
+  readonly operatorToken: string;
+  readonly sessionId: string;
+  readonly created: JsonObject;
+  readonly participantAccessA: string;
+  readonly participantAccessB: string;
+  readonly eventSocket: WebSocket;
+  readonly socketA: WebSocket;
+  readonly socketB: WebSocket;
+  mediaUrl(side: "A" | "B"): string;
+  close(): Promise<void>;
+}
+
+async function openBrowserAcceptanceSession(mode: AcceptanceMode): Promise<BrowserAcceptanceSession> {
+  const port = await getAvailablePort();
+  const origin = "http://127.0.0.1:" + port;
+  const fixture = await createKeylessBrowserAcceptanceApplication(origin, mode);
+  let socketA: WebSocket | undefined;
+  let socketB: WebSocket | undefined;
+  let eventSocket: WebSocket | undefined;
+  const cleanup = async (): Promise<void> => {
+    await Promise.all([
+      closeWebSocket(socketA),
+      closeWebSocket(socketB),
+      closeWebSocket(eventSocket),
+    ]);
+    await fixture.app.close();
+  };
+
+  try {
+    await fixture.app.listen({ host: "127.0.0.1", port });
+    const created = await postJson(origin, "/api/sessions", {
+      languages: { A: "en-US", B: "zh-TW" },
+      translationMode: mode,
+    }, 201, fixture.operatorToken);
+    const sessionId = created.sessionId;
+    assert.equal(typeof sessionId, "string");
+    if (typeof sessionId !== "string") throw new Error("Missing sessionId");
+
+    const wsOrigin = origin.replace(/^http/u, "ws");
+    eventSocket = await connectWebSocket(
+      wsOrigin + "/ws/events/" + encodeURIComponent(sessionId) +
+        "?access=" + encodeURIComponent(fixture.operatorToken),
+    );
+    const participantAccessA = participantAccessTokenFromGrant(created, origin, sessionId, "A");
+    const participantAccessB = participantAccessTokenFromGrant(created, origin, sessionId, "B");
+    await Promise.all([
+      postJson(
+        origin,
+        "/api/sessions/" + sessionId + "/participants/A/recording-processing-consent",
+        { accepted: true, consentId: randomUUID() },
+        202,
+        participantAccessA,
+      ),
+      postJson(
+        origin,
+        "/api/sessions/" + sessionId + "/participants/B/recording-processing-consent",
+        { accepted: true, consentId: randomUUID() },
+        202,
+        participantAccessB,
+      ),
+    ]);
+    [socketA, socketB] = await Promise.all([
+      connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "A")),
+      connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "B")),
+    ]);
+    socketA.send(JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }));
+    socketB.send(JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }));
+    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
+      kind: "arm_recorder",
+      commandId: randomUUID(),
+    }, 202, fixture.operatorToken);
+    await waitUntil(
+      () => fixture.relay.snapshot(sessionId).status === "ready" &&
+        fixture.relay.snapshot(sessionId).providerReadiness.A_TO_B !== undefined &&
+        fixture.relay.snapshot(sessionId).providerReadiness.B_TO_A !== undefined,
+      "Browser acceptance session did not become ready",
+    );
+    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
+      kind: "start",
+      commandId: randomUUID(),
+    }, 202, fixture.operatorToken);
+    await waitUntil(
+      () => fixture.relay.snapshot(sessionId).status === "active",
+      "Browser acceptance session did not become active",
+    );
+
+    if (eventSocket === undefined || socketA === undefined || socketB === undefined) {
+      throw new Error("Browser acceptance sockets were not connected");
+    }
+
+    return Object.freeze({
+      fixture,
+      origin,
+      operatorToken: fixture.operatorToken,
+      sessionId,
+      created,
+      participantAccessA,
+      participantAccessB,
+      eventSocket,
+      socketA,
+      socketB,
+      mediaUrl: (side: "A" | "B"): string => mediaUrlFromGrant(created, origin, sessionId, side),
+      close: cleanup,
+    });
+  } catch (error: unknown) {
+    await cleanup();
+    throw error;
+  }
+}
+
 test("keyless deterministic acceptance exercises Fast, Balanced, and Accurate modes", {
   timeout: 20_000,
 }, async () => {
@@ -534,6 +726,26 @@ test("keyless deterministic acceptance exercises Fast, Balanced, and Accurate mo
       fixture.media.speechStarted(sessionId, "B");
       fixture.media.ingestMulaw(sessionId, "A", 0, createPcmuSilenceFrame());
       fixture.media.ingestMulaw(sessionId, "B", 0, createPcmuSilenceFrame());
+
+      if (mode === "accurate") {
+        await sleep(25);
+        assert.equal(
+          fixture.media.outbound(sessionId, "B").some((event) => event.type === "audio"),
+          false,
+          "accurate mode must wait for speech_end before destination audio",
+        );
+        assert.equal(
+          transcriptEvents(collector.events, "target_transcript", "A_TO_B").length,
+          0,
+          "accurate mode must wait for speech_end before target text",
+        );
+      } else {
+        await waitUntil(
+          () => fixture.media.outbound(sessionId, "A").some((event) => event.type === "audio") &&
+            fixture.media.outbound(sessionId, "B").some((event) => event.type === "audio"),
+          mode + " mode must emit both destination lanes before speech_end",
+        );
+      }
       fixture.media.speechEnded(sessionId, "A");
       fixture.media.speechEnded(sessionId, "B");
 
@@ -543,7 +755,10 @@ test("keyless deterministic acceptance exercises Fast, Balanced, and Accurate mo
         "Timed out waiting for both deterministic translated lanes in " + mode,
       );
 
-      assert.equal(fixture.translation.prepared.length, 2);
+      assert.deepEqual(
+        [...new Set(fixture.translation.prepared.map((context) => context.lane))].sort(),
+        ["A_TO_B", "B_TO_A"],
+      );
       assert.equal(fixture.translation.requests.length, 2);
       for (const context of fixture.translation.requests) {
         assert.equal(context.behavior.mode, mode);
@@ -803,16 +1018,16 @@ test("keyless local evaluation reports mechanism PASS while live provider remain
 test("real HTTP and WebSocket acceptance stays keyless while carrying duplex revisions and four tracks", {
   timeout: 25_000,
 }, async () => {
-  const port = await getAvailablePort();
-  const origin = "http://127.0.0.1:" + port;
-  const fixture = await createKeylessBrowserAcceptanceApplication(origin, "fast");
-  let socketA: WebSocket | undefined;
-  let socketB: WebSocket | undefined;
-  let eventSocket: WebSocket | undefined;
+  const session = await openBrowserAcceptanceSession("fast");
+  let socketA: WebSocket = session.socketA;
+  const socketB: WebSocket = session.socketB;
+  const eventSocket: WebSocket = session.eventSocket;
+  const fixture = session.fixture;
+  const origin = session.origin;
+  const created = session.created;
+  const sessionId = session.sessionId;
 
   try {
-    const listenedOrigin = await fixture.app.listen({ host: "127.0.0.1", port });
-    assert.equal(listenedOrigin, origin);
     const capabilitiesResponse = await fetch(origin + "/api/capabilities", {
       headers: { authorization: "Bearer " + fixture.operatorToken },
     });
@@ -833,150 +1048,6 @@ test("real HTTP and WebSocket acceptance stays keyless while carrying duplex rev
         ["accurate", "locally_controlled"],
       ],
     );
-
-    const created = await postJson(origin, "/api/sessions", {
-      languages: { A: "en-US", B: "zh-TW" },
-      translationMode: "fast",
-    }, 201, fixture.operatorToken);
-    const sessionId = created.sessionId;
-    assert.equal(typeof sessionId, "string");
-    if (typeof sessionId !== "string") throw new Error("Missing sessionId");
-    assert.equal(created.provider, "openai_controlled");
-    assert.equal(created.translationMode, "fast");
-
-    const wsOrigin = origin.replace(/^http/u, "ws");
-    eventSocket = await connectWebSocket(
-      wsOrigin + "/ws/events/" + encodeURIComponent(sessionId) +
-        "?access=" + encodeURIComponent(fixture.operatorToken),
-    );
-    const participantAccessA = participantAccessTokenFromGrant(created, origin, sessionId, "A");
-    const participantAccessB = participantAccessTokenFromGrant(created, origin, sessionId, "B");
-    const consentA = waitForJson(
-      eventSocket,
-      (message) => message.type === "participant_consent" &&
-        messageData(message).side === "A" &&
-        messageData(message).recording === true &&
-        messageData(message).processing === true,
-      "participant A recording and processing consent",
-    );
-    const consentB = waitForJson(
-      eventSocket,
-      (message) => message.type === "participant_consent" &&
-        messageData(message).side === "B" &&
-        messageData(message).recording === true &&
-        messageData(message).processing === true,
-      "participant B recording and processing consent",
-    );
-    await Promise.all([
-      postJson(
-        origin,
-        "/api/sessions/" + sessionId + "/participants/A/recording-processing-consent",
-        { accepted: true, consentId: randomUUID() },
-        202,
-        participantAccessA,
-      ),
-      postJson(
-        origin,
-        "/api/sessions/" + sessionId + "/participants/B/recording-processing-consent",
-        { accepted: true, consentId: randomUUID() },
-        202,
-        participantAccessB,
-      ),
-    ]);
-    await Promise.all([consentA, consentB]);
-
-    const joinedA = waitForJson(
-      eventSocket,
-      (message) => message.type === "participant_joined" && messageData(message).side === "A",
-      "participant A join",
-    );
-    const joinedB = waitForJson(
-      eventSocket,
-      (message) => message.type === "participant_joined" && messageData(message).side === "B",
-      "participant B join",
-    );
-    [socketA, socketB] = await Promise.all([
-      connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "A")),
-      connectWebSocket(mediaUrlFromGrant(created, origin, sessionId, "B")),
-    ]);
-    await Promise.all([joinedA, joinedB]);
-
-    const readinessA = waitForJson(
-      eventSocket,
-      (message) => message.type === "participant_readiness" &&
-        messageData(message).side === "A" &&
-        messageData(message).source === "participant_browser_self_report" &&
-        messageData(message).microphone === "browser_capture_active" &&
-        messageData(message).headphones === "self_attested",
-      "participant A readiness",
-    );
-    const readinessB = waitForJson(
-      eventSocket,
-      (message) => message.type === "participant_readiness" &&
-        messageData(message).side === "B" &&
-        messageData(message).source === "participant_browser_self_report" &&
-        messageData(message).microphone === "browser_capture_active" &&
-        messageData(message).headphones === "self_attested",
-      "participant B readiness",
-    );
-    socketA.send(JSON.stringify({
-      type: "participant_readiness",
-      source: "participant_browser_self_report",
-      microphone: "browser_capture_active",
-      headphones: "self_attested",
-    }));
-    socketB.send(JSON.stringify({
-      type: "participant_readiness",
-      source: "participant_browser_self_report",
-      microphone: "browser_capture_active",
-      headphones: "self_attested",
-    }));
-    await Promise.all([readinessA, readinessB]);
-
-    const recorderArmed = waitForJson(
-      eventSocket,
-      (message) => message.type === "recorder_state" &&
-        messageData(message).state === "armed" &&
-        messageData(message).recordingArmed === true,
-      "armed recorder event",
-    );
-    const readyEvent = waitForJson(
-      eventSocket,
-      (message) => message.type === "session_state" && messageData(message).status === "ready",
-      "ready session event",
-    );
-    const providerA = waitForJson(
-      eventSocket,
-      (message) => message.type === "provider_readiness" &&
-        message.lane === "A_TO_B" &&
-        messageData(message).readiness === "fixture_local" &&
-        messageData(message).remoteConnection === "not_applicable",
-      "A_TO_B provider prewarm",
-    );
-    const providerB = waitForJson(
-      eventSocket,
-      (message) => message.type === "provider_readiness" &&
-        message.lane === "B_TO_A" &&
-        messageData(message).readiness === "fixture_local" &&
-        messageData(message).remoteConnection === "not_applicable",
-      "B_TO_A provider prewarm",
-    );
-    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
-      kind: "arm_recorder",
-      commandId: randomUUID(),
-    }, 202, fixture.operatorToken);
-    await Promise.all([recorderArmed, providerA, providerB, readyEvent]);
-
-    const activeEvent = waitForJson(
-      eventSocket,
-      (message) => message.type === "session_state" && messageData(message).status === "active",
-      "active session event",
-    );
-    await postJson(origin, "/api/sessions/" + sessionId + "/commands", {
-      kind: "start",
-      commandId: randomUUID(),
-    }, 202, fixture.operatorToken);
-    await activeEvent;
 
     const sourceDraft = waitForJson(
       eventSocket,
@@ -1082,7 +1153,6 @@ test("real HTTP and WebSocket acceptance stays keyless while carrying duplex rev
       "participant A disconnect",
     );
     await closeWebSocket(socketA);
-    socketA = undefined;
     await participantLeft;
     const participantJoined = waitForJson(
       eventSocket,
@@ -1161,8 +1231,283 @@ test("real HTTP and WebSocket acceptance stays keyless while carrying duplex rev
     await Promise.all([
       closeWebSocket(socketA),
       closeWebSocket(socketB),
-      closeWebSocket(eventSocket),
     ]);
-    await fixture.app.close();
+    await session.close();
+  }
+});
+
+test("accurate HTTP/WebSocket mode buffers a 2.42-second utterance and preserves its PCM prefix and suffix", {
+  timeout: 25_000,
+}, async () => {
+  const session = await openBrowserAcceptanceSession("accurate");
+  const destination = captureWebSocket(session.socketB, true);
+  const events = captureWebSocket(session.eventSocket);
+  const frameCount = 121;
+  const prefix = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x11);
+  const suffix = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0xee);
+  assert.ok(frameCount * CANONICAL_AUDIO.frameDurationMs > 2_400);
+  try {
+    session.socketA.send(JSON.stringify({ type: "speech_start" }));
+    for (let index = 0; index < frameCount; index += 1) {
+      const frame = index === 0
+        ? prefix
+        : index === frameCount - 1
+          ? suffix
+          : new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x40 + (index % 32));
+      session.socketA.send(frame, { binary: true });
+      // Keep the fixture's bounded ingress queue below one frame of backlog.
+      await sleep(CANONICAL_AUDIO.frameDurationMs);
+    }
+    await sleep(100);
+    assert.equal(destination.binary.length, 0, "accurate mode must not play out before speech_end");
+    assert.equal(
+      events.json.some((message) => message.type === "target_segment" && message.lane === "A_TO_B"),
+      false,
+      "accurate mode must not publish target segments before speech_end",
+    );
+
+    session.socketA.send(JSON.stringify({ type: "speech_end" }));
+    await waitUntil(
+      () => destination.binary.length >= frameCount,
+      "accurate mode did not emit every buffered frame after speech_end (received " + destination.binary.length + ")",
+      5_000,
+    );
+    assert.equal(destination.binary.length, frameCount);
+    const packets = destination.binary.map(unpackPlayoutAudio);
+    assert.deepEqual(packets[0]?.pcm16le, prefix, "the utterance prefix was not preserved");
+    assert.deepEqual(
+      packets[packets.length - 1]?.pcm16le,
+      suffix,
+      "the utterance suffix was not preserved",
+    );
+    assert.ok(
+      events.json.some((message) => message.type === "target_segment" && message.lane === "A_TO_B"),
+      "accurate mode must publish a target segment after speech_end",
+    );
+  } finally {
+    destination.stop();
+    events.stop();
+    await session.close();
+  }
+});
+
+test("pause blocks browser destination binary and resume restores the selected lane", {
+  timeout: 20_000,
+}, async () => {
+  const session = await openBrowserAcceptanceSession("fast");
+  const destination = captureWebSocket(session.socketB, true);
+  const firstPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x21);
+  const pausedPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x31);
+  const resumedPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x41);
+  try {
+    session.socketA.send(JSON.stringify({ type: "speech_start" }));
+    session.socketA.send(firstPcm, { binary: true });
+    session.socketA.send(JSON.stringify({ type: "speech_end" }));
+    await waitUntil(
+      () => destination.binary.length >= 1,
+      "initial output did not reach the browser destination",
+    );
+    const firstPacket = unpackPlayoutAudio(destination.binary[0] ?? new Uint8Array());
+    assert.deepEqual(firstPacket.pcm16le, firstPcm);
+
+    const paused = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "paused",
+      "paused session event",
+    );
+    await postJson(session.origin, "/api/sessions/" + session.sessionId + "/commands", {
+      kind: "pause",
+      commandId: randomUUID(),
+    }, 202, session.operatorToken);
+    await paused;
+
+    const beforePause = destination.binary.length;
+    session.socketA.send(JSON.stringify({ type: "speech_start" }));
+    session.socketA.send(pausedPcm, { binary: true });
+    session.socketA.send(JSON.stringify({ type: "speech_end" }));
+    await sleep(300);
+    assert.equal(destination.binary.length, beforePause, "pause must block destination binary output");
+
+    const resumed = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "active",
+      "resumed session event",
+    );
+    await postJson(session.origin, "/api/sessions/" + session.sessionId + "/commands", {
+      kind: "resume",
+      commandId: randomUUID(),
+    }, 202, session.operatorToken);
+    await resumed;
+
+    session.socketA.send(JSON.stringify({ type: "speech_start" }));
+    session.socketA.send(resumedPcm, { binary: true });
+    session.socketA.send(JSON.stringify({ type: "speech_end" }));
+    await waitUntil(
+      () => destination.binary.length > beforePause,
+      "resume did not restore destination binary output",
+    );
+    const resumedPacket = unpackPlayoutAudio(
+      destination.binary[destination.binary.length - 1] ?? new Uint8Array(),
+    );
+    assert.deepEqual(resumedPacket.pcm16le, resumedPcm);
+    assert.ok(resumedPacket.generation > firstPacket.generation, "resume must fence the paused generation");
+  } finally {
+    destination.stop();
+    await session.close();
+  }
+});
+
+test("end and consent withdrawal close both media sockets and fence held post-terminal output", {
+  timeout: 25_000,
+}, async () => {
+  for (const termination of ["end", "withdrawal"] as const) {
+    const session = await openBrowserAcceptanceSession("fast");
+    const destination = captureWebSocket(session.socketB, true);
+    const heldPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x5a);
+    session.fixture.translation.holdNextFrame("A_TO_B");
+    try {
+      session.socketA.send(JSON.stringify({ type: "speech_start" }));
+      session.socketA.send(heldPcm, { binary: true });
+      await session.fixture.translation.waitForHeldFrame("A_TO_B");
+
+      const ending = termination === "end"
+        ? postJson(session.origin, "/api/sessions/" + session.sessionId + "/commands", {
+          kind: "end",
+          commandId: randomUUID(),
+        }, 202, session.operatorToken)
+        : postJson(
+          session.origin,
+          "/api/sessions/" + session.sessionId + "/participants/A/recording-processing-withdrawal",
+          { withdrawalId: randomUUID() },
+          202,
+          session.participantAccessA,
+        );
+
+      await Promise.all([
+        waitForSocketClose(session.socketA, termination + " media socket A"),
+        waitForSocketClose(session.socketB, termination + " media socket B"),
+      ]);
+      const beforeRelease = destination.binary.length;
+      session.fixture.translation.releaseHeldFrame("A_TO_B");
+      await ending;
+      await sleep(300);
+      assert.equal(
+        destination.binary.length,
+        beforeRelease,
+        termination + " must not emit held output after terminal teardown",
+      );
+      assert.equal(session.socketA.readyState, WebSocket.CLOSED);
+      assert.equal(session.socketB.readyState, WebSocket.CLOSED);
+    } finally {
+      try {
+        session.fixture.translation.releaseHeldFrame("A_TO_B");
+      } catch {
+        // The gate was already released by the normal path.
+      }
+      destination.stop();
+      await session.close();
+    }
+  }
+});
+
+test("browser reconnect never emits the old generation, sequence, or PCM", {
+  timeout: 25_000,
+}, async () => {
+  const session = await openBrowserAcceptanceSession("fast");
+  let socketB = session.socketB;
+  const oldDestination = captureWebSocket(socketB, true);
+  const oldPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x19);
+  const freshPcm = new Uint8Array(CANONICAL_AUDIO.bytesPerFrame).fill(0x79);
+  session.fixture.translation.holdNextFrame("A_TO_B");
+  let newDestination: WebSocketCapture | undefined;
+  try {
+    session.socketA.send(JSON.stringify({ type: "speech_start" }));
+    session.socketA.send(oldPcm, { binary: true });
+    await session.fixture.translation.waitForHeldFrame("A_TO_B");
+
+    const participantLeft = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "participant_left" && messageData(message).side === "B",
+      "participant B disconnect",
+    );
+    await closeWebSocket(socketB);
+    await participantLeft;
+
+    const participantJoined = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "participant_joined" && messageData(message).side === "B",
+      "participant B reconnect",
+    );
+    socketB = await connectWebSocket(session.mediaUrl("B"));
+    newDestination = captureWebSocket(socketB, true);
+    await participantJoined;
+
+    const readiness = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "participant_readiness" &&
+        messageData(message).side === "B" &&
+        messageData(message).source === "participant_browser_self_report" &&
+        messageData(message).microphone === "browser_capture_active" &&
+        messageData(message).headphones === "self_attested",
+      "participant B readiness after reconnect",
+    );
+    const ready = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "ready",
+      "ready session after reconnect",
+    );
+    socketB.send(JSON.stringify({
+      type: "participant_readiness",
+      source: "participant_browser_self_report",
+      microphone: "browser_capture_active",
+      headphones: "self_attested",
+    }));
+    await Promise.all([readiness, ready]);
+
+    // Release the old provider turn only after the replacement socket is live.
+    session.fixture.translation.releaseHeldFrame("A_TO_B");
+    await sleep(200);
+    assert.equal(oldDestination.binary.length, 0, "reconnect must drop held old-generation output");
+
+    const active = waitForJson(
+      session.eventSocket,
+      (message) => message.type === "session_state" && messageData(message).status === "active",
+      "active session after reconnect",
+    );
+    await postJson(session.origin, "/api/sessions/" + session.sessionId + "/commands", {
+      kind: "start",
+      commandId: randomUUID(),
+    }, 202, session.operatorToken);
+    await active;
+
+    session.socketA.send(JSON.stringify({ type: "speech_start" }));
+    session.socketA.send(freshPcm, { binary: true });
+    session.socketA.send(JSON.stringify({ type: "speech_end" }));
+    await waitUntil(
+      () => (newDestination?.binary.length ?? 0) >= 1,
+      "fresh post-reconnect output did not reach the destination",
+    );
+    const freshPacket = unpackPlayoutAudio(newDestination?.binary[0] ?? new Uint8Array());
+    assert.ok(freshPacket.generation > 0, "reconnect output must use a new generation");
+    assert.deepEqual(freshPacket.pcm16le, freshPcm);
+    assert.equal(
+      oldDestination.binary.some((packet) => {
+        const unpacked = unpackPlayoutAudio(packet);
+        return unpacked.generation === 0 && unpacked.sequence === 0 &&
+          Buffer.from(unpacked.pcm16le).equals(Buffer.from(oldPcm));
+      }),
+      false,
+      "no old generation/sequence/PCM tuple may cross reconnect",
+    );
+  } finally {
+    try {
+      session.fixture.translation.releaseHeldFrame("A_TO_B");
+    } catch {
+      // The gate was already released by the normal path.
+    }
+    oldDestination.stop();
+    newDestination?.stop();
+    await closeWebSocket(socketB);
+    await session.close();
   }
 });

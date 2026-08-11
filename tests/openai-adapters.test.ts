@@ -567,11 +567,45 @@ test("native translation drops audio until an emitted target transcript identifi
 
   const output = await outputPromise;
   assert.equal(output.some((event) => event.kind === "audio"), false);
+  assert.equal(output.some((event) => event.kind === "completed"), false);
   assert.deepEqual(
     output.filter((event): event is Extract<TranslationEvent, { kind: "error" }> => event.kind === "error")
       .map((event) => event.error.code),
     ["OPENAI_REALTIME_AUDIO_TARGET_UNKNOWN"],
   );
+});
+
+test("native translation fails retryably when session.closed arrives before target output", async () => {
+  const socket = new FakeWebSocket();
+  let connected = false;
+  const adapter = new NativeRealtimeTranslateAdapter({
+    apiKey: "test-key",
+    webSocketFactory: () => {
+      connected = true;
+      return socket;
+    },
+  });
+  const source = heldFrames(1, 35);
+  const outputPromise = collect(
+    adapter.translate({
+      frames: source.frames,
+      context: context("fast", 35),
+      signal: new AbortController().signal,
+    }),
+  );
+  await waitUntil(() => connected);
+  socket.emitOpen();
+  await waitUntil(() => sentEvents(socket).some((event) => event.type === "session.update"));
+  socket.emitMessage({ type: "session.closed", event_id: "closed-before-output" });
+
+  const output = await outputPromise;
+  assert.equal(output.some((event) => event.kind === "completed"), false);
+  const errors = output.filter(
+    (event): event is Extract<TranslationEvent, { kind: "error" }> => event.kind === "error",
+  );
+  assert.deepEqual(errors.map((event) => event.error.code), ["OPENAI_REALTIME_NO_OUTPUT"]);
+  assert.equal(errors[0]?.error.retryable, true);
+  assert.equal(socket.closes.length, 1);
 });
 
 test("native cancellation uses the translation close primitive and fences late output", async () => {

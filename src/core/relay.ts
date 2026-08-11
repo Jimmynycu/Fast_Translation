@@ -52,7 +52,9 @@ export class RelaySessionError extends Error {
     | "invalid_command"
     | "invalid_session"
     | "invalid_spec"
-    | "session_exists";
+    | "session_exists"
+    | "event_cursor_gap"
+    | "event_stream_overflow";
 
   constructor(code: RelaySessionError["code"], message: string) {
     super(message);
@@ -184,6 +186,9 @@ const DEFAULT_FINALIZATION_TIMEOUT_MS = 30_000;
 const MIN_FINALIZATION_TIMEOUT_MS = 100;
 const MAX_FINALIZATION_TIMEOUT_MS = 120_000;
 const MAX_SESSION_OPENED_TERM_IDS = 4_096;
+// Speech-end turns need to retain a complete ordinary utterance. Keep that
+// bounded independently from the 2.4 s continuous relay queue budget.
+const DEFAULT_SPEECH_END_MAX_BUFFERED_AUDIO_MS = 30_000;
 
 interface AlertMetadata {
   readonly termId?: string;
@@ -358,6 +363,7 @@ interface SessionRuntime {
   readonly pendingPlayoutClearOrder: string[];
   readonly pendingBargeResumptions: Record<Lane, PendingBargeResumption | undefined>;
   status: SessionStatus;
+  pausedFromAcceptedReadiness: boolean;
   cursor: EventCursor;
   openedAtMs: number;
   closedAtMs: number | undefined;
@@ -449,6 +455,13 @@ function freezeSessionSpec(spec: SessionSpec): SessionSpec {
 
 function queueCapacity(spec: SessionSpec, behavior: TranslationBehavior): number {
   return spec.maxQueueFrames ?? Math.ceil(behavior.maxBufferedAudioMs / CANONICAL_AUDIO.frameDurationMs);
+}
+
+function inputQueueCapacity(spec: SessionSpec, behavior: TranslationBehavior): number {
+  if (behavior.inputCommit !== "speech_end") return queueCapacity(spec, behavior);
+  return spec.maxQueueFrames ?? Math.ceil(
+    DEFAULT_SPEECH_END_MAX_BUFFERED_AUDIO_MS / CANONICAL_AUDIO.frameDurationMs,
+  );
 }
 
 function laneLanguages(spec: SessionSpec, lane: Lane): Readonly<{
@@ -600,7 +613,13 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       );
     }
     const behavior = resolveTranslationBehavior(spec.mode);
-    const inputCapacity = queueCapacity(spec, behavior);
+    if (behavior.mode !== spec.mode) {
+      throw new RelaySessionError(
+        "invalid_spec",
+        "Resolved translation behavior mode does not match the session specification",
+      );
+    }
+    const playoutCapacity = queueCapacity(spec, behavior);
     this.#validateTranslationSpec(spec, behavior);
     const sessionId = this.#createSessionId();
     if (this.#sessions.has(sessionId)) {
@@ -642,8 +661,8 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       fences: { A_TO_B: new GenerationFence(), B_TO_A: new GenerationFence() },
       laneRuns: { A_TO_B: undefined, B_TO_A: undefined },
       playout: {
-        A: new AsyncQueue(inputCapacity),
-        B: new AsyncQueue(inputCapacity),
+        A: new AsyncQueue(playoutCapacity),
+        B: new AsyncQueue(playoutCapacity),
       },
       playoutEvidenceCursors: { A: undefined, B: undefined },
       playoutEvidenceTails: { A: new Map(), B: new Map() },
@@ -676,6 +695,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       pendingPlayoutClearOrder: [],
       pendingBargeResumptions: { A_TO_B: undefined, B_TO_A: undefined },
       status: "waiting",
+      pausedFromAcceptedReadiness: false,
       cursor: 0,
       openedAtMs,
       closedAtMs: undefined,
@@ -950,12 +970,20 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         if (runtime.status !== "ready" || !this.#hasReadyPrerequisites(runtime)) {
           throw this.#invalidState(runtime, "start");
         }
+        if (!await this.#refreshProviderPreparation(runtime) ||
+            runtime.status !== "ready" ||
+            !this.#hasReadyPrerequisites(runtime)) {
+          throw this.#invalidState(runtime, "start");
+        }
         await this.#setStatus(runtime, "active", command.commandId);
         return;
       case "pause":
         if (runtime.status !== "active") {
           throw this.#invalidState(runtime, "pause");
         }
+        runtime.pausedFromAcceptedReadiness =
+          this.#hasAcceptedParticipantReadiness(runtime, "A") &&
+          this.#hasAcceptedParticipantReadiness(runtime, "B");
         const pausedEvent = this.#beginControlStatus(runtime, "paused", command.commandId);
         this.#cutLane(runtime, "A_TO_B", "pause");
         this.#cutLane(runtime, "B_TO_A", "pause");
@@ -964,9 +992,16 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         }
         return;
       case "resume":
-        if (runtime.status !== "paused" || !this.#hasReadyPrerequisites(runtime)) {
+        if (runtime.status !== "paused" || !this.#hasResumePrerequisites(runtime)) {
           throw this.#invalidState(runtime, "resume");
         }
+        if (!await this.#refreshProviderPreparation(runtime, true) ||
+            runtime.status !== "paused" ||
+            !this.#hasResumePrerequisites(runtime)) {
+          throw this.#invalidState(runtime, "resume");
+        }
+        this.#cutLane(runtime, "A_TO_B", "operator");
+        this.#cutLane(runtime, "B_TO_A", "operator");
         const resumedEvent = this.#beginControlStatus(runtime, "active", command.commandId);
         if ((await resumedEvent) === undefined && !runtime.evidenceFailureStarted) {
           throw new Error("Evidence rejected session state event");
@@ -1246,6 +1281,13 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new RelaySessionError("invalid_command", "Event cursor must be a non-negative safe integer");
     }
+    const firstRetained = runtime.events[0];
+    if (firstRetained !== undefined && after < firstRetained.cursor - 1) {
+      throw new RelaySessionError(
+        "event_cursor_gap",
+        `Event cursor ${after} is older than retained history beginning at ${firstRetained.cursor}`,
+      );
+    }
     return this.#eventStream(runtime, after, signal);
   }
 
@@ -1264,7 +1306,13 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     try {
       for (const event of runtime.events) {
         if (signal?.aborted) return;
-        if (event.cursor > after && !queue.offer(event)) break;
+        if (event.cursor > after && !queue.offer(event)) {
+          queue.close(new RelaySessionError(
+            "event_stream_overflow",
+            "Event stream replay exceeded its bounded subscriber capacity; reconnect from a retained cursor",
+          ));
+          return;
+        }
       }
       if (runtime.status !== "closed" && !signal?.aborted) runtime.subscribers.add(queue);
       else queue.close();
@@ -1633,12 +1681,20 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       this.#hasProviderReadiness(runtime);
   }
 
-  #hasNonProviderReadyPrerequisites(runtime: SessionRuntime): boolean {
+  #hasResumePrerequisites(runtime: SessionRuntime): boolean {
+    return this.#hasNonProviderReadyPrerequisites(runtime, true) &&
+      this.#hasProviderReadiness(runtime);
+  }
+
+  #hasNonProviderReadyPrerequisites(runtime: SessionRuntime, allowPausedReadiness = false): boolean {
+    const hasParticipantReadiness = allowPausedReadiness
+      ? (side: Side) => this.#hasResumeParticipantReadiness(runtime, side)
+      : (side: Side) => this.#hasAcceptedParticipantReadiness(runtime, side);
     return this.#hasAllConsents(runtime) &&
       runtime.connected.A &&
       runtime.connected.B &&
-      this.#hasAcceptedParticipantReadiness(runtime, "A") &&
-      this.#hasAcceptedParticipantReadiness(runtime, "B") &&
+      hasParticipantReadiness("A") &&
+      hasParticipantReadiness("B") &&
       runtime.recorderArmState === "armed";
   }
 
@@ -1656,19 +1712,43 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     );
   }
 
+  #hasResumeParticipantReadiness(runtime: SessionRuntime, side: Side): boolean {
+    if (this.#hasAcceptedParticipantReadiness(runtime, side)) return true;
+    if (!runtime.pausedFromAcceptedReadiness) return false;
+    const readiness = runtime.participantReadiness[side];
+    return readiness?.source === "participant_browser_self_report" &&
+      readiness.microphone === "stopped" &&
+      readiness.headphones === "not_attested";
+  }
+
   #hasProviderReadiness(runtime: SessionRuntime): boolean {
     return runtime.providerReadiness.A_TO_B !== undefined &&
       runtime.providerReadiness.B_TO_A !== undefined;
+  }
+
+  async #refreshProviderPreparation(runtime: SessionRuntime, allowPausedReadiness = false): Promise<boolean> {
+    const existingPreparationTask = runtime.providerPreparationTask;
+    if (existingPreparationTask !== undefined) {
+      await existingPreparationTask;
+      if (this.#isTerminating(runtime)) return false;
+    }
+    runtime.providerReadiness.A_TO_B = undefined;
+    runtime.providerReadiness.B_TO_A = undefined;
+    this.#beginProviderPreparation(runtime, allowPausedReadiness);
+    const preparationTask = runtime.providerPreparationTask;
+    if (preparationTask === undefined) return false;
+    await preparationTask;
+    return !this.#isTerminating(runtime) && this.#hasProviderReadiness(runtime);
   }
 
   #isTerminating(runtime: SessionRuntime): boolean {
     return runtime.status === "closing" || runtime.status === "closed";
   }
 
-  #beginProviderPreparation(runtime: SessionRuntime): void {
+  #beginProviderPreparation(runtime: SessionRuntime, allowPausedReadiness = false): void {
     if (
       runtime.providerPreparationTask !== undefined ||
-      !this.#hasNonProviderReadyPrerequisites(runtime) ||
+      !this.#hasNonProviderReadyPrerequisites(runtime, allowPausedReadiness) ||
       this.#hasProviderReadiness(runtime)
     ) {
       return;
@@ -1843,12 +1923,21 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
 
     if (runtime.behavior.inputCommit === "speech_end") {
       const pending = runtime.pendingFrames[lane];
-      pending.push(frame);
-      const maxFrames = queueCapacity(runtime.spec, runtime.behavior);
-      if (pending.length > maxFrames) {
-        pending.shift();
-        this.#emitAlert(runtime, lane, generation, "source_queue_trimmed", "Dropped the oldest queued source frame to preserve the latency budget", true);
+      const maxFrames = inputQueueCapacity(runtime.spec, runtime.behavior);
+      if (pending.length >= maxFrames) {
+        if (runtime.endTask !== undefined) return;
+        this.#emitAlert(
+          runtime,
+          lane,
+          generation,
+          "source_queue_overflow",
+          "Source utterance exceeded the bounded buffer; ending the session without dropping its beginning",
+          false,
+        );
+        void this.#end(runtime, "source_queue_overflow", "source_queue_overflow").catch(() => {});
+        return;
       }
+      pending.push(frame);
       return;
     }
     this.#offerFrame(runtime, lane, frame);
@@ -1921,7 +2010,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     }
 
     const input = new AsyncQueue<import("./audio.js").AudioFrame>(
-      queueCapacity(runtime.spec, runtime.behavior),
+      inputQueueCapacity(runtime.spec, runtime.behavior),
     );
     const controller = new AbortController();
     const context = this.#laneContext(runtime, lane, generation);
@@ -2715,21 +2804,35 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       () => {
         const pending = runtime.pendingPlayoutClears.get(clearId);
         if (pending === undefined) return;
-        if (runtime.status === "closed" || runtime.status === "closing") return;
         runtime.pendingPlayoutClears.delete(clearId);
         const orderIndex = runtime.pendingPlayoutClearOrder.indexOf(clearId);
         if (orderIndex >= 0) runtime.pendingPlayoutClearOrder.splice(orderIndex, 1);
         runtime.pendingBargeResumptions[pending.lane] = undefined;
-        if (pending.bargeId === undefined || pending.sourceSide === undefined) return;
+        if (runtime.status === "closed") return;
+        const failedCut = pending;
+        runtime.pendingBargeResumptions[failedCut.lane] = undefined;
+        if (failedCut.bargeId === undefined || failedCut.sourceSide === undefined) {
+          this.#emitAlert(
+            runtime,
+            failedCut.lane,
+            failedCut.generation,
+            "playout_clear_failed",
+            "Playout clear failed; ending the session to prevent stale audio",
+            false,
+          );
+          void this.#end(runtime, "playout_clear_failed", "playout_clear_failed").catch(() => {});
+          return;
+        }
+        if (runtime.status === "closing") return;
         const failureStage = this.#emitBargeLifecycle(
           runtime,
-          pending.lane,
-          pending.generation,
+          failedCut.lane,
+          failedCut.generation,
           "playout_clear_failed",
-          pending.bargeId,
-          pending.clearId,
-          pending.sourceSide,
-          pending.side,
+          failedCut.bargeId,
+          failedCut.clearId,
+          failedCut.sourceSide,
+          failedCut.side,
           "Playout clear failed",
           true,
         );
@@ -2772,7 +2875,19 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
         );
       },
       () => {
-        if (barge === undefined || runtime.status === "closed" || runtime.status === "closing") return;
+        if (barge === undefined) {
+          if (runtime.status === "closed") return;
+          this.#emitAlert(
+            runtime,
+            lane,
+            nextGeneration,
+            "provider_cancel_failed",
+            "Translation cancellation failed; stale output remains fenced by the generation cut",
+            false,
+          );
+          return;
+        }
+        if (runtime.status === "closed" || runtime.status === "closing") return;
         this.#emitBargeLifecycle(
           runtime,
           lane,
@@ -3233,7 +3348,7 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
       runtime.cursor = event.cursor;
       runtime.events.push(event);
       if (runtime.events.length > this.#eventHistoryLimit) runtime.events.shift();
-      for (const subscriber of runtime.subscribers) subscriber.offer(event);
+      this.#publishToSubscribers(runtime, event);
       return event;
     }, emergency, priority, withdrawal, false, terminal);
     if (task === undefined) return Promise.resolve(undefined);
@@ -3263,8 +3378,19 @@ export class ModularGuardedDuplexRelay implements GuardedDuplexRelay {
     runtime.cursor = event.cursor;
     runtime.events.push(event);
     if (runtime.events.length > this.#eventHistoryLimit) runtime.events.shift();
-    for (const subscriber of runtime.subscribers) subscriber.offer(event);
+    this.#publishToSubscribers(runtime, event);
     return event;
+  }
+
+  #publishToSubscribers(runtime: SessionRuntime, event: SessionEvent): void {
+    for (const subscriber of runtime.subscribers) {
+      if (subscriber.offer(event)) continue;
+      subscriber.close(new RelaySessionError(
+        "event_stream_overflow",
+        "Event stream subscriber exceeded its bounded capacity; reconnect from a retained cursor",
+      ));
+      runtime.subscribers.delete(subscriber);
+    }
   }
 
   #enqueueEvidenceOperation<T>(

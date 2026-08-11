@@ -10,6 +10,7 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     this.current = null;
     this.position = 0;
     this.interrupted = false;
+    this.resetFence = false;
     this.lane = null;
     this.latestClear = null;
     this.clearReceipts = new Map();
@@ -33,6 +34,8 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
         this.clear(message);
       } else if (message.type === "interrupt") {
         this.interrupt(message);
+      } else if (message.type === "reset") {
+        this.reset(message);
       } else if (message.type === "push") {
         this.push(message);
       }
@@ -56,6 +59,7 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     this.current = null;
     this.position = 0;
     this.latestClear = null;
+    this.resetFence = false;
     return true;
   }
 
@@ -78,6 +82,11 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     const prior = this.clearReceipts.get(clearId);
     if (prior) {
       if (prior.lane === lane && prior.generation === generation) {
+        if (this.resetFence && this.generation === generation) {
+          this.interrupted = false;
+          this.resetFence = false;
+          this.reportQueueSample(true);
+        }
         this.port.postMessage({ type: "clear_applied", lane, generation, clearId });
       }
       return;
@@ -95,6 +104,7 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     this.rememberClear(clearId, lane, generation);
     this.latestClear = { lane, generation, clearId };
     this.interrupted = false;
+    this.resetFence = false;
     this.reportQueueSample(true);
     this.port.postMessage({ type: "clear_applied", lane, generation, clearId });
   }
@@ -105,9 +115,25 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     if (this.lane !== null && this.lane !== lane) return;
     this.lane = lane;
     this.interrupted = true;
+    this.resetFence = false;
     this.queue.length = 0;
     this.current = null;
     this.position = 0;
+    this.reportQueueSample(true);
+  }
+
+  reset(message) {
+    const lane = message.lane;
+    if (!this.isLane(lane) || (this.lane !== null && this.lane !== lane)) return;
+    this.lane = lane;
+    this.queue.length = 0;
+    this.current = null;
+    this.position = 0;
+    // A reconnect can deliver stale same-generation frames before relay's
+    // asynchronous generation cut reaches us. Stay fenced until the
+    // authoritative clear (or a newer generation) releases playback.
+    this.interrupted = true;
+    this.resetFence = true;
     this.reportQueueSample(true);
   }
 
@@ -197,16 +223,17 @@ class RelayPcmPlayoutProcessor extends AudioWorkletProcessor {
     ) {
       return;
     }
-    if (this.interrupted) return;
     if (generation < this.generation) return;
     if (generation > this.generation) {
       if (!this.advanceGeneration(generation)) return;
       this.lane = lane;
+      this.interrupted = false;
     } else if (this.lane !== null && this.lane !== lane) {
       return;
     } else if (this.lane === null) {
       this.lane = lane;
     }
+    if (this.interrupted) return;
     if (sequence <= this.lastSequence) return;
 
     this.lastSequence = sequence;
